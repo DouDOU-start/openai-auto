@@ -13,6 +13,7 @@ data/*
 !data/.gitkeep
 *.license
 !config/wenfxl.license
+config/protocol-reg.yaml
 
 # Native extension build artifacts
 utils/*.so
