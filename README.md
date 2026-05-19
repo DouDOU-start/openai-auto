@@ -1,6 +1,6 @@
 # 交互式协议注册/授权 CLI
 
-这是一个基于 Python 3.11 的命令行项目，用于执行 ChatGPT 账号注册、登录会话保存和 OAuth 授权流程。项目依赖外部 `utils.auth_core`，本仓库只保留 CLI 编排、HTTP 请求、会话存储和本地运行配置。
+这是一个基于 Python 3.11 的命令行项目，用于执行 ChatGPT 账号注册、登录会话保存和 OAuth 授权流程。项目已内置 `utils.auth_core` 运行依赖，不需要依赖其他本地项目目录。
 
 ## 项目结构
 
@@ -14,12 +14,14 @@ openai-auto/
 ├── data/                   # 运行输出目录，账号、token、会话和数据库默认放这里
 ├── scripts/
 │   └── register_cli.py     # 本地开发启动脚本
+├── vendor/
+│   └── openai_cpa/         # 最小内置 auth_core 运行依赖
 └── src/
     └── protocol_reg/
         ├── cli.py              # 命令行入口与交互输入
         ├── flow.py             # 注册、登录与授权主编排
         ├── openai_http.py      # OpenAI Auth HTTP 请求与重定向
-        ├── auth_core_client.py # 外部 auth_core 薄封装
+        ├── auth_core_client.py # 内置 auth_core 薄封装
         ├── oauth.py            # OAuth PKCE 与 token 交换
         ├── storage.py          # TXT/JSONL/JSON 输出
         ├── settings.py         # 运行配置
@@ -30,7 +32,7 @@ openai-auto/
 
 ## 运行条件
 
-必须使用 Python 3.11，因为外部 `auth_core` 依赖 CPython 3.11 运行环境。项目使用 `uv` 管理依赖。
+必须使用 Python 3.11，因为内置 `auth_core` 依赖 CPython 3.11 运行环境。项目使用 `uv` 管理依赖。
 
 首次同步依赖：
 
@@ -39,11 +41,7 @@ cd /mnt/e/code/openai-auto
 uv sync
 ```
 
-如果 `utils.auth_core` 不在本仓库父目录，需要通过 `--project-root` 指定它所在的项目根目录：
-
-```bash
-uv run protocol-reg --project-root /path/to/auth-core-project --mode register
-```
+项目已内置 `vendor/openai_cpa` 作为最小 `utils.auth_core` 运行依赖，运行时不会读取其他本地项目目录。
 
 ## 常用命令
 
@@ -148,4 +146,4 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - `login` 和 `authorize` 已拆开；`authorize` 优先使用已保存 cookies，没有 cookies 时会要求输入密码并即时登录。
 - `register` 和 `login` 不做 OAuth 授权，只获取 ChatGPT session 身份信息。
 - 当前版本不自动读邮箱；验证码由手动输入。
-- 授权、Sentinel token 生成和风控挑战依赖外部 `utils.auth_core`。
+- 授权、Sentinel token 生成和风控挑战依赖内置 `utils.auth_core`。

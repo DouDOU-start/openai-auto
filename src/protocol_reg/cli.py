@@ -24,9 +24,12 @@ def _default_license_file(repo_root: Path) -> Path | None:
     return None
 
 
+def _default_project_root(repo_root: Path) -> Path:
+    return repo_root / "vendor" / "openai_cpa"
+
+
 def build_parser() -> argparse.ArgumentParser:
     repo_root = _repo_root()
-    project_root = repo_root.parent
     default_license = _default_license_file(repo_root)
     parser = argparse.ArgumentParser(description="交互式协议注册/授权 CLI")
     parser.add_argument(
@@ -35,7 +38,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="register",
         help="运行模式：register 注册新账号，login 仅登录保存会话，authorize 单独授权",
     )
-    parser.add_argument("--project-root", default=str(project_root), help="包含 utils.auth_core 的项目根目录")
     parser.add_argument("--proxy", default="", help="注册代理，例如 http://127.0.0.1:7897")
     parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="注册账号 TXT 输出路径")
     parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
@@ -49,9 +51,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    repo_root = _repo_root()
     token_output = Path(args.token_output).resolve()
     settings = Settings(
-        project_root=Path(args.project_root).resolve(),
+        project_root=_default_project_root(repo_root).resolve(),
         proxy=args.proxy,
         output=Path(args.output).resolve(),
         session_file=Path(args.session_file).resolve(),
