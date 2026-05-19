@@ -8,6 +8,9 @@ import shutil
 import subprocess
 import webbrowser
 
+import yaml
+
+from .config import config_template, load_app_config
 from .flow import RegisterFlow
 from .settings import Settings
 from .storage import (
@@ -45,6 +48,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="register",
         help="运行模式：register 注册新账号，login 仅登录保存会话，authorize 单独授权",
     )
+    parser.add_argument(
+        "--config",
+        default=str(repo_root / "config" / "protocol-reg.yaml"),
+        help="配置文件路径（YAML），默认 config/protocol-reg.yaml",
+    )
+    parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="生成默认配置文件到 --config 路径后退出",
+    )
     parser.add_argument("--proxy", default="", help="注册代理，例如 http://127.0.0.1:7897")
     parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="注册账号 TXT 输出路径")
     parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
@@ -63,33 +76,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-ssl-verify", action="store_true", help="关闭 TLS 证书校验")
 
     # cloudflare-email email-code-api.md
-    parser.add_argument(
-        "--email-code-api",
-        default=os.environ.get("EMAIL_CODE_API", "").strip(),
-        help="cloudflare-email 验证码 API base，例如 https://mail.example.com",
-    )
-    parser.add_argument(
-        "--email-code-key",
-        default=os.environ.get("EMAIL_CODE_API_KEY", "").strip(),
-        help="cloudflare-email ADMIN_API_KEY（Authorization: Bearer ...）",
-    )
-    parser.add_argument(
-        "--email-code-sender-suffix",
-        default=os.environ.get("EMAIL_CODE_SENDER_SUFFIX", "openai.com").strip() or "openai.com",
-        help="验证码邮件发件人域名后缀，默认 openai.com",
-    )
-    parser.add_argument(
-        "--email-code-timeout",
-        type=int,
-        default=int(os.environ.get("EMAIL_CODE_TIMEOUT", "120")),
-        help="等待邮箱验证码超时秒数，默认 120",
-    )
-    parser.add_argument(
-        "--email-code-poll",
-        type=float,
-        default=float(os.environ.get("EMAIL_CODE_POLL", "2.0")),
-        help="邮箱验证码轮询间隔秒数，默认 2.0",
-    )
+    # Config file is the primary source; flags/env vars override.
+    parser.add_argument("--email-code-api", default="", help="cloudflare-email 验证码 API base，例如 https://mail.example.com")
+    parser.add_argument("--email-code-key", default="", help="cloudflare-email ADMIN_API_KEY（Authorization: Bearer ...）")
+    parser.add_argument("--email-code-sender-suffix", default="", help="验证码邮件发件人域名后缀，默认 openai.com")
+    parser.add_argument("--email-code-timeout", type=int, default=0, help="等待邮箱验证码超时秒数，默认 120")
+    parser.add_argument("--email-code-poll", type=float, default=0.0, help="邮箱验证码轮询间隔秒数，默认 2.0")
     parser.add_argument(
         "--no-checkout",
         action="store_true",
@@ -103,9 +95,48 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     repo_root = _repo_root()
+
+    config_path = Path(args.config).resolve()
+    if args.init_config:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            yaml.safe_dump(config_template(), allow_unicode=True, sort_keys=False),
+            encoding="utf-8",
+        )
+        raise SystemExit(f"[完成] 已生成配置文件: {config_path}")
+
+    cfg = load_app_config(config_path)
     token_output = Path(args.token_output).resolve()
     rt_output = Path(args.rt_output).resolve()
     checkout_output = Path(args.checkout_output).resolve()
+
+    # Precedence: CLI flag (non-empty / >0) > env var > config file.
+    email_code_api = (
+        str(args.email_code_api or "").strip()
+        or os.environ.get("EMAIL_CODE_API", "").strip()
+        or cfg.email_code_api
+    )
+    email_code_key = (
+        str(args.email_code_key or "").strip()
+        or os.environ.get("EMAIL_CODE_API_KEY", "").strip()
+        or cfg.email_code_key
+    )
+    email_code_sender_suffix = (
+        str(args.email_code_sender_suffix or "").strip()
+        or os.environ.get("EMAIL_CODE_SENDER_SUFFIX", "").strip()
+        or cfg.email_code_sender_suffix
+        or "openai.com"
+    )
+    email_code_timeout = (
+        int(args.email_code_timeout)
+        if int(args.email_code_timeout) > 0
+        else int(os.environ.get("EMAIL_CODE_TIMEOUT", "0") or 0) or cfg.email_code_timeout
+    )
+    email_code_poll = (
+        float(args.email_code_poll)
+        if float(args.email_code_poll) > 0
+        else float(os.environ.get("EMAIL_CODE_POLL", "0") or 0) or cfg.email_code_poll
+    )
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
         proxy=args.proxy,
@@ -116,11 +147,11 @@ def main() -> None:
         timeout=max(1, args.timeout),
         ssl_verify=not args.no_ssl_verify,
 
-        email_code_api_base=str(args.email_code_api or "").strip(),
-        email_code_api_key=str(args.email_code_key or "").strip(),
-        email_code_sender_suffix=str(args.email_code_sender_suffix or "openai.com").strip() or "openai.com",
-        email_code_poll_interval=max(0.5, float(args.email_code_poll)),
-        email_code_timeout=max(5, int(args.email_code_timeout)),
+        email_code_api_base=str(email_code_api or "").strip(),
+        email_code_api_key=str(email_code_key or "").strip(),
+        email_code_sender_suffix=str(email_code_sender_suffix or "openai.com").strip() or "openai.com",
+        email_code_poll_interval=max(0.5, float(email_code_poll)),
+        email_code_timeout=max(5, int(email_code_timeout)),
     )
 
     email = input("请输入邮箱: ").strip()
