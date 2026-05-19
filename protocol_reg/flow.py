@@ -7,6 +7,7 @@ from typing import Any, Callable
 from curl_cffi import requests
 
 from .auth_core_client import AuthCoreClient
+from .email_code_client import EmailCodeClient
 from .oauth import exchange_token, has_callback_code, jwt_claims_no_verify, start_oauth
 from .openai_http import DEFAULT_UA, OpenAIHTTP
 from .settings import Settings
@@ -23,6 +24,7 @@ class RegisterFlow:
         self.prompt = prompt
         self.auth_core = AuthCoreClient(settings.project_root, settings.license_file)
         self.http = OpenAIHTTP(settings, self.auth_core)
+        self.email_code = EmailCodeClient(settings)
         self._last_token_cookies: list[dict[str, Any]] | None = None
 
     def run(self, email: str, password: str) -> dict[str, Any]:
@@ -37,7 +39,7 @@ class RegisterFlow:
         if not did:
             raise RuntimeError("auth_core 未返回 oai-did")
         user_agent = user_agent or DEFAULT_UA
-        ctx: dict[str, Any] = {}
+        ctx: dict[str, Any] = {"email": email}
 
         print("[注册] 提交邮箱")
         signup_resp = self.http.post_json(
@@ -68,7 +70,7 @@ class RegisterFlow:
         pwd_json = pwd_resp.json()
         target_url = self._next_url(pwd_json)
         if self._needs_otp(pwd_json, target_url):
-            target_url = self._email_otp(did, user_agent, ctx)
+            target_url = self._email_otp(email, did, user_agent, ctx)
 
         if "/add-phone" in target_url:
             raise RuntimeError("注册触发手机号验证，第一阶段未实现接码")
@@ -109,7 +111,7 @@ class RegisterFlow:
         if not did:
             raise RuntimeError("auth_core 未返回 oai-did")
         user_agent = user_agent or DEFAULT_UA
-        ctx: dict[str, Any] = {}
+        ctx: dict[str, Any] = {"email": email}
 
         print("[登录] 打开登录链路")
         _, current = self.http.follow_redirects("https://auth.openai.com/log-in")
@@ -338,7 +340,7 @@ class RegisterFlow:
             current = self._authorize_email_otp(did, user_agent, ctx)
         return current
 
-    def _email_otp(self, did: str, user_agent: str, ctx: dict[str, Any]) -> str:
+    def _email_otp(self, email: str, did: str, user_agent: str, ctx: dict[str, Any]) -> str:
         print("[注册] 触发邮箱验证码发送")
         send_resp = self.http.post_json(
             url="https://auth.openai.com/api/accounts/email-otp/send",
@@ -352,7 +354,13 @@ class RegisterFlow:
         )
         if send_resp.status_code != 200:
             print(f"[警告] 发信接口返回 HTTP {send_resp.status_code}: {send_resp.text[:300]}")
-        code = self.prompt("请输入邮箱收到的 6 位验证码: ").strip()
+        code = ""
+        if self.email_code.enabled():
+            print("[注册] 等待邮箱验证码（cloudflare-email）")
+            code = self.email_code.wait_code(email).code
+            print(f"[注册] 已获取验证码: {code}")
+        else:
+            code = self.prompt("请输入邮箱收到的 6 位验证码: ").strip()
         if not code:
             raise RuntimeError("验证码不能为空")
         otp_resp = self.http.post_json(
@@ -369,7 +377,21 @@ class RegisterFlow:
         return self._next_url(otp_resp.json())
 
     def _authorize_email_otp(self, did: str, user_agent: str, ctx: dict[str, Any]) -> str:
-        code = self.prompt("请输入登录邮箱验证码；未收到可直接回车触发重发: ").strip()
+        # When cloudflare-email is enabled, we always poll for the latest unread OTP.
+        # The fallback interactive path keeps the old resend flow.
+        if self.email_code.enabled():
+            recipient = str(ctx.get("email") or "").strip()
+            if not recipient:
+                # ctx may not always carry email, fall back to interactive.
+                recipient = ""
+            if recipient:
+                print("[登录] 等待邮箱验证码（cloudflare-email）")
+                code = self.email_code.wait_code(recipient).code
+                print(f"[登录] 已获取验证码: {code}")
+            else:
+                code = self.prompt("请输入登录邮箱验证码: ").strip()
+        else:
+            code = self.prompt("请输入登录邮箱验证码；未收到可直接回车触发重发: ").strip()
         if not code:
             send_resp = self.http.post_json(
                 url="https://auth.openai.com/api/accounts/email-otp/send",
@@ -473,7 +495,12 @@ class RegisterFlow:
                 raise RuntimeError("密码登录后未返回下一步地址")
             _, current = login_http.follow_redirects(next_page)
             if current.endswith("/email-verification"):
-                code = self.prompt("登录二次验证：请输入邮箱验证码: ").strip()
+                if self.email_code.enabled():
+                    print("[登录] 等待邮箱验证码（cloudflare-email）")
+                    code = self.email_code.wait_code(email).code
+                    print(f"[登录] 已获取验证码: {code}")
+                else:
+                    code = self.prompt("登录二次验证：请输入邮箱验证码: ").strip()
                 if not code:
                     raise RuntimeError("登录二次验证码不能为空")
                 otp_resp = login_http.post_json(

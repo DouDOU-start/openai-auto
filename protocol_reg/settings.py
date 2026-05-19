@@ -15,6 +15,13 @@ class Settings:
     timeout: int
     ssl_verify: bool
 
+    # cloudflare-email 验证码 API
+    email_code_api_base: str
+    email_code_api_key: str
+    email_code_sender_suffix: str
+    email_code_poll_interval: float
+    email_code_timeout: int
+
     @property
     def proxies(self) -> dict[str, str] | None:
         proxy = self.proxy.strip()

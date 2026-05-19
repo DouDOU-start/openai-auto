@@ -61,6 +61,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--login-delay", type=int, default=20, help="注册成功后等待多少秒再获取 ChatGPT session")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP 超时时间，单位秒")
     parser.add_argument("--no-ssl-verify", action="store_true", help="关闭 TLS 证书校验")
+
+    # cloudflare-email email-code-api.md
+    parser.add_argument(
+        "--email-code-api",
+        default=os.environ.get("EMAIL_CODE_API", "").strip(),
+        help="cloudflare-email 验证码 API base，例如 https://mail.example.com",
+    )
+    parser.add_argument(
+        "--email-code-key",
+        default=os.environ.get("EMAIL_CODE_API_KEY", "").strip(),
+        help="cloudflare-email ADMIN_API_KEY（Authorization: Bearer ...）",
+    )
+    parser.add_argument(
+        "--email-code-sender-suffix",
+        default=os.environ.get("EMAIL_CODE_SENDER_SUFFIX", "openai.com").strip() or "openai.com",
+        help="验证码邮件发件人域名后缀，默认 openai.com",
+    )
+    parser.add_argument(
+        "--email-code-timeout",
+        type=int,
+        default=int(os.environ.get("EMAIL_CODE_TIMEOUT", "120")),
+        help="等待邮箱验证码超时秒数，默认 120",
+    )
+    parser.add_argument(
+        "--email-code-poll",
+        type=float,
+        default=float(os.environ.get("EMAIL_CODE_POLL", "2.0")),
+        help="邮箱验证码轮询间隔秒数，默认 2.0",
+    )
     parser.add_argument(
         "--no-checkout",
         action="store_true",
@@ -86,6 +115,12 @@ def main() -> None:
         login_delay=max(0, args.login_delay),
         timeout=max(1, args.timeout),
         ssl_verify=not args.no_ssl_verify,
+
+        email_code_api_base=str(args.email_code_api or "").strip(),
+        email_code_api_key=str(args.email_code_key or "").strip(),
+        email_code_sender_suffix=str(args.email_code_sender_suffix or "openai.com").strip() or "openai.com",
+        email_code_poll_interval=max(0.5, float(args.email_code_poll)),
+        email_code_timeout=max(5, int(args.email_code_timeout)),
     )
 
     email = input("请输入邮箱: ").strip()
