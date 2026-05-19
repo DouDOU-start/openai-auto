@@ -10,7 +10,13 @@ import webbrowser
 
 from .flow import RegisterFlow
 from .settings import Settings
-from .storage import save_account, save_credentials_txt, save_login_session, try_load_login_session
+from .storage import (
+    save_account,
+    save_credentials_rt_txt,
+    save_credentials_txt,
+    save_login_session,
+    try_load_login_session,
+)
 from .utils import make_password
 
 
@@ -42,12 +48,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy", default="", help="注册代理，例如 http://127.0.0.1:7897")
     parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="注册账号 TXT 输出路径")
     parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
+    # Always export a compact rt file by default; keep flag for overrides.
+    # Intentionally hidden from help: this is a core artifact we always produce.
+    parser.add_argument(
+        "--rt-output",
+        default=str(repo_root / "data" / "accounts_rt.txt"),
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--session-file", default=str(repo_root / "data" / "sessions.json"), help="登录会话 JSON 路径")
     parser.add_argument("--checkout-output", default=str(repo_root / "data" / "checkout_urls.jsonl"), help="支付链接 JSONL 输出路径")
     parser.add_argument("--license-file", default=str(default_license) if default_license else "", help="auth_core 授权文件路径")
     parser.add_argument("--login-delay", type=int, default=20, help="注册成功后等待多少秒再获取 ChatGPT session")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP 超时时间，单位秒")
     parser.add_argument("--no-ssl-verify", action="store_true", help="关闭 TLS 证书校验")
+    parser.add_argument(
+        "--no-checkout",
+        action="store_true",
+        help="跳过 Plus/Stripe checkout 链路（仅登录/授权，不生成支付链接）",
+    )
     parser.add_argument("--open-checkout", dest="open_checkout", action="store_true", default=True, help="拿到支付链接后自动用系统浏览器打开，默认开启")
     parser.add_argument("--no-open-checkout", dest="open_checkout", action="store_false", help="只保存支付长链接，不自动打开浏览器")
     return parser
@@ -57,6 +75,7 @@ def main() -> None:
     args = build_parser().parse_args()
     repo_root = _repo_root()
     token_output = Path(args.token_output).resolve()
+    rt_output = Path(args.rt_output).resolve()
     checkout_output = Path(args.checkout_output).resolve()
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
@@ -88,6 +107,7 @@ def main() -> None:
         if args.mode == "register":
             token_data = flow.run(email, password)
             save_credentials_txt(settings.output, email, password)
+            save_credentials_rt_txt(rt_output, email, password, str(token_data.get("refresh_token") or ""))
             account_saved = True
             _print_chatgpt_session(token_data.get("chatgpt_session"))
             checkout = flow.create_plus_trial_checkout(
@@ -99,7 +119,8 @@ def main() -> None:
             session_data = flow.login(email, password)
             save_login_session(settings.session_file, email, password, session_data)
             _print_chatgpt_session(session_data.get("chatgpt_session"))
-            _handle_checkout(session_data.get("plus_trial_checkout"), checkout_output, args.open_checkout)
+            if not args.no_checkout:
+                _handle_checkout(session_data.get("plus_trial_checkout"), checkout_output, args.open_checkout)
             token_data = {}
         else:
             session_data = try_load_login_session(settings.session_file, email)
@@ -114,6 +135,7 @@ def main() -> None:
                 password = str(session_data.get("password") or "")
             token_data = flow.authorize_from_session(email, session_data)
             save_account(token_output, email, password, token_data)
+            save_credentials_rt_txt(rt_output, email, password, str(token_data.get("refresh_token") or ""))
     except KeyboardInterrupt:
         raise SystemExit("\n[中断] 用户取消")
     except Exception as exc:

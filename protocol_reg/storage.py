@@ -28,6 +28,18 @@ def save_credentials_txt(output: Path, email: str, password: str) -> None:
         handle.write(f"{email}----{password}\n")
 
 
+def save_credentials_rt_txt(output: Path, email: str, password: str, refresh_token: str) -> None:
+    """Append a compact line format: email----password----rt.
+
+    This is intentionally a plain text file for easy copy/paste into other tools.
+    """
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rt = (refresh_token or "").strip()
+    with output.open("a", encoding="utf-8") as handle:
+        handle.write(f"{email}----{password}----{rt}\n")
+
+
 def dump_session_cookies(session: Any) -> list[dict[str, Any]]:
     cookies = []
     for cookie in session.cookies.jar:

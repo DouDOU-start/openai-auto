@@ -13,5 +13,8 @@ data/*
 !data/.gitkeep
 *.license
 !config/wenfxl.license
+
+# Native extension build artifacts
+utils/*.so
 .env
 .env.*

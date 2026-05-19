@@ -18,7 +18,24 @@ class AuthCoreClient:
         try:
             from utils.auth_core import generate_payload, init_auth
         except ModuleNotFoundError as exc:
-            raise RuntimeError(f"未能加载内置 utils.auth_core，请检查内置依赖目录是否完整: {project_root}") from exc
+            # Most commonly this happens when the bundled native extension was
+            # built for a different OS/arch (e.g. manylinux x86_64 on macOS).
+            ext_hint = None
+            try:
+                candidates = sorted((project_root / "utils").glob("auth_core*") )
+                ext_hint = ", ".join(p.name for p in candidates) if candidates else None
+            except Exception:
+                ext_hint = None
+            msg = f"未能加载内置 utils.auth_core: {project_root}"
+            if ext_hint:
+                msg += f" (发现文件: {ext_hint})"
+            msg += "。常见原因: 扩展文件与当前 Python/系统架构不匹配。"
+            raise RuntimeError(msg) from exc
+        except ImportError as exc:
+            # ImportError (not ModuleNotFoundError) is typical for ABI/ELF mismatch.
+            msg = f"未能导入内置 utils.auth_core: {project_root}。"
+            msg += "常见原因: 扩展文件与当前系统/架构不匹配(例如 Linux x86_64 .so 在 macOS/arm64 上)。"
+            raise RuntimeError(msg) from exc
 
         self._generate_payload = generate_payload
         self._init_auth = init_auth
