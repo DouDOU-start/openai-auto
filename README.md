@@ -52,10 +52,16 @@ uv sync
 uv run protocol-reg --mode register --proxy http://127.0.0.1:7897
 ```
 
-注册成功后自动打开支付页面：
+注册成功后会默认自动打开支付页面：
 
 ```bash
-uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --open-checkout
+uv run protocol-reg --mode register --proxy http://127.0.0.1:7897
+```
+
+只保存支付长链接、不打开浏览器：
+
+```bash
+uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --no-open-checkout
 ```
 
 仅登录并保存会话：
@@ -136,7 +142,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 成功后先把邮箱和密码按 `邮箱----密码` 写入 TXT 文件。
 - 程序调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 hosted checkout 链接。
 - 没有获取到支付长链接时，支付自动化直接失败，但已注册账号不会丢失。
-- 指定 `--open-checkout` 时，程序会自动用系统浏览器打开支付链接，可交给 Tampermonkey 脚本继续填写页面。
+- 程序默认会自动用系统浏览器打开支付链接，可交给 Tampermonkey 脚本继续填写页面；指定 `--no-open-checkout` 时只保存长链接。
 
 登录流程：
 

@@ -48,7 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--login-delay", type=int, default=20, help="注册成功后等待多少秒再获取 ChatGPT session")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP 超时时间，单位秒")
     parser.add_argument("--no-ssl-verify", action="store_true", help="关闭 TLS 证书校验")
-    parser.add_argument("--open-checkout", action="store_true", help="拿到支付链接后自动用系统浏览器打开")
+    parser.add_argument("--open-checkout", dest="open_checkout", action="store_true", default=True, help="拿到支付链接后自动用系统浏览器打开，默认开启")
+    parser.add_argument("--no-open-checkout", dest="open_checkout", action="store_false", help="只保存支付长链接，不自动打开浏览器")
     return parser
 
 
