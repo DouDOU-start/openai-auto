@@ -80,6 +80,7 @@ def main() -> None:
             token_data = flow.run(email, password)
             save_credentials_txt(settings.output, email, password)
             _print_chatgpt_session(token_data.get("chatgpt_session"))
+            _print_plus_trial_checkout(token_data.get("plus_trial_checkout"))
         elif args.mode == "login":
             session_data = flow.login(email, password)
             save_login_session(settings.session_file, email, password, session_data)
