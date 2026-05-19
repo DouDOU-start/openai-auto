@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import threading
 from pathlib import Path
@@ -50,7 +51,8 @@ def execute_sql(cursor: sqlite3.Cursor, sql: str, params: tuple[Any, ...] = ()) 
     return cursor.execute(sql, params)
 
 
-def set_sys_kv(key: str, value: str) -> None:
+def set_sys_kv(key: str, value: Any) -> None:
+    val_str = json.dumps(value, ensure_ascii=False)
     with get_db_conn(is_write=True) as conn:
         cursor = get_cursor(conn)
         execute_sql(
@@ -65,11 +67,11 @@ def set_sys_kv(key: str, value: str) -> None:
         execute_sql(
             cursor,
             "INSERT OR REPLACE INTO system_kv (`key`, value) VALUES (?, ?)",
-            (key, value),
+            (key, val_str),
         )
 
 
-def get_sys_kv(key: str, default: str = "") -> str:
+def get_sys_kv(key: str, default: Any = None) -> Any:
     with get_db_conn() as conn:
         cursor = get_cursor(conn)
         execute_sql(
@@ -84,4 +86,7 @@ def get_sys_kv(key: str, default: str = "") -> str:
         row = execute_sql(cursor, "SELECT value FROM system_kv WHERE `key` = ?", (key,)).fetchone()
     if not row:
         return default
-    return str(row[0])
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return default
