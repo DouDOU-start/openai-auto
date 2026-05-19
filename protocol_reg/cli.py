@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import webbrowser
 
 from .flow import RegisterFlow
 from .settings import Settings
@@ -39,10 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="注册账号 TXT 输出路径")
     parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
     parser.add_argument("--session-file", default=str(repo_root / "data" / "sessions.json"), help="登录会话 JSON 路径")
+    parser.add_argument("--checkout-output", default=str(repo_root / "data" / "checkout_urls.jsonl"), help="支付链接 JSONL 输出路径")
     parser.add_argument("--license-file", default=str(default_license) if default_license else "", help="auth_core 授权文件路径")
     parser.add_argument("--login-delay", type=int, default=20, help="注册成功后等待多少秒再获取 ChatGPT session")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP 超时时间，单位秒")
     parser.add_argument("--no-ssl-verify", action="store_true", help="关闭 TLS 证书校验")
+    parser.add_argument("--open-checkout", action="store_true", help="拿到支付链接后自动用系统浏览器打开")
     return parser
 
 
@@ -50,6 +56,7 @@ def main() -> None:
     args = build_parser().parse_args()
     repo_root = _repo_root()
     token_output = Path(args.token_output).resolve()
+    checkout_output = Path(args.checkout_output).resolve()
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
         proxy=args.proxy,
@@ -80,12 +87,12 @@ def main() -> None:
             token_data = flow.run(email, password)
             save_credentials_txt(settings.output, email, password)
             _print_chatgpt_session(token_data.get("chatgpt_session"))
-            _print_plus_trial_checkout(token_data.get("plus_trial_checkout"))
+            _handle_checkout(token_data.get("plus_trial_checkout"), checkout_output, args.open_checkout)
         elif args.mode == "login":
             session_data = flow.login(email, password)
             save_login_session(settings.session_file, email, password, session_data)
             _print_chatgpt_session(session_data.get("chatgpt_session"))
-            _print_plus_trial_checkout(session_data.get("plus_trial_checkout"))
+            _handle_checkout(session_data.get("plus_trial_checkout"), checkout_output, args.open_checkout)
             token_data = {}
         else:
             session_data = try_load_login_session(settings.session_file, email)
@@ -162,3 +169,90 @@ def _print_plus_trial_checkout(checkout: object) -> None:
     if raw is not None:
         print("[Plus] 原始响应:")
         print(json.dumps(raw, ensure_ascii=False, indent=2))
+
+
+def _handle_checkout(checkout: object, output: Path, open_checkout: bool) -> None:
+    _print_plus_trial_checkout(checkout)
+    _save_checkout_urls(checkout, output)
+    if open_checkout:
+        _open_checkout_url(checkout)
+
+
+def _checkout_urls(checkout: object) -> list[str]:
+    if not isinstance(checkout, dict):
+        return []
+    urls = []
+    for key in ("long_url", "hosted_url", "openai_payurl", "short_url", "chatgpt_checkout_url"):
+        url = str(checkout.get(key) or "").strip()
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _save_checkout_urls(checkout: object, output: Path) -> None:
+    urls = _checkout_urls(checkout)
+    if not urls:
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "long_url": urls[0],
+        "urls": urls,
+    }
+    with output.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    print(f"[Plus] 支付链接已写入: {output}")
+
+
+def _open_checkout_url(checkout: object) -> None:
+    urls = _checkout_urls(checkout)
+    if not urls:
+        print("[Plus] 没有可打开的支付链接")
+        return
+    url = urls[0]
+    print(f"[Plus] 正在打开支付链接: {url}")
+    if _open_with_system_browser(url):
+        return
+    try:
+        if webbrowser.open(url):
+            return
+    except Exception:
+        pass
+    print("[Plus] 自动打开浏览器失败，请手动复制上方支付链接")
+
+
+def _open_with_system_browser(url: str) -> bool:
+    commands: list[list[str]] = []
+    if _is_wsl():
+        commands.extend([
+            ["cmd.exe", "/c", "start", "", url],
+            ["wslview", url],
+        ])
+    commands.extend([
+        ["xdg-open", url],
+        ["open", url],
+    ])
+    for command in commands:
+        executable = command[0]
+        if executable not in {"cmd.exe"} and shutil.which(executable) is None:
+            continue
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            continue
+        if completed.returncode == 0:
+            return True
+    return False
+
+
+def _is_wsl() -> bool:
+    if os.environ.get("WSL_DISTRO_NAME"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower()
+    except Exception:
+        return False
