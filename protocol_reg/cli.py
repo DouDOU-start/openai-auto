@@ -11,10 +11,7 @@ from .utils import make_password
 
 
 def _repo_root() -> Path:
-    source_root = Path(__file__).resolve().parents[1]
-    if source_root.name == "src":
-        return source_root.parent
-    return source_root
+    return Path(__file__).resolve().parents[1]
 
 
 def _default_license_file(repo_root: Path) -> Path | None:
@@ -25,7 +22,7 @@ def _default_license_file(repo_root: Path) -> Path | None:
 
 
 def _default_project_root(repo_root: Path) -> Path:
-    return repo_root / "vendor" / "openai_cpa"
+    return repo_root
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -35,8 +35,9 @@ protocol-reg = "protocol_reg.cli:main"
 [tool.uv]
 package = true
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["protocol_reg*", "utils*"]
+
+[tool.setuptools.package-data]
+utils = ["auth_core*.so", "auth_core*.pyd"]

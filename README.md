@@ -12,20 +12,21 @@ openai-auto/
 ├── config/                 # 本地配置目录，授权文件默认放这里
 │   └── wenfxl.license      # 默认授权文件
 ├── data/                   # 运行输出目录，账号、token、会话和数据库默认放这里
+├── protocol_reg/           # 注册、登录和授权 CLI 主代码
+│   ├── cli.py              # 命令行入口与交互输入
+│   ├── flow.py             # 注册、登录与授权主编排
+│   ├── openai_http.py      # OpenAI Auth HTTP 请求与重定向
+│   ├── auth_core_client.py # 内置 auth_core 薄封装
+│   ├── oauth.py            # OAuth PKCE 与 token 交换
+│   ├── storage.py          # TXT/JSONL/JSON 输出
+│   ├── settings.py         # 运行配置
+│   └── utils.py            # 密码、资料、邮箱脱敏等工具
 ├── scripts/
 │   └── register_cli.py     # 本地开发启动脚本
-├── vendor/
-│   └── openai_cpa/         # 最小内置 auth_core 运行依赖
-└── src/
-    └── protocol_reg/
-        ├── cli.py              # 命令行入口与交互输入
-        ├── flow.py             # 注册、登录与授权主编排
-        ├── openai_http.py      # OpenAI Auth HTTP 请求与重定向
-        ├── auth_core_client.py # 内置 auth_core 薄封装
-        ├── oauth.py            # OAuth PKCE 与 token 交换
-        ├── storage.py          # TXT/JSONL/JSON 输出
-        ├── settings.py         # 运行配置
-        └── utils.py            # 密码、资料、邮箱脱敏等工具
+└── utils/                  # 最小内置 auth_core 兼容依赖
+    ├── auth_core*.so       # CPython 3.11 auth_core 扩展
+    ├── config.py           # auth_core 所需最小配置
+    └── db_manager.py       # auth_core 所需最小 KV 存储
 ```
 
 `data/*`、虚拟环境、缓存和构建产物不会提交到 Git。默认授权文件 `config/wenfxl.license` 会随项目提交。
@@ -41,7 +42,7 @@ cd /mnt/e/code/openai-auto
 uv sync
 ```
 
-项目已内置 `vendor/openai_cpa` 作为最小 `utils.auth_core` 运行依赖，运行时不会读取其他本地项目目录。
+项目已内置根目录 `utils` 作为最小 `utils.auth_core` 运行依赖，运行时不会读取其他本地项目目录。
 
 ## 常用命令
 

@@ -27,9 +27,9 @@ class AuthCoreClient:
     def _validate_project_root(project_root: Path) -> None:
         utils_dir = project_root / "utils"
         if not utils_dir.is_dir():
-            raise RuntimeError(f"未找到外部依赖目录: {utils_dir}")
+            raise RuntimeError(f"未找到内置依赖目录: {utils_dir}")
         if not (utils_dir / "db_manager.py").exists():
-            raise RuntimeError(f"未找到外部依赖文件: {utils_dir / 'db_manager.py'}")
+            raise RuntimeError(f"未找到内置依赖文件: {utils_dir / 'db_manager.py'}")
         if not any(utils_dir.glob("auth_core*")):
             raise RuntimeError(f"未找到 auth_core 扩展文件: {utils_dir}")
 
