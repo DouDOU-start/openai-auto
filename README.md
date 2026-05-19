@@ -133,9 +133,10 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 人工查看邮箱后在终端输入验证码。
 - 程序继续创建账号，不走 OAuth 授权。
 - 成功后请求 `https://chatgpt.com/api/auth/session` 获取身份信息。
+- 成功后先把邮箱和密码按 `邮箱----密码` 写入 TXT 文件。
 - 程序调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 hosted checkout 链接。
+- 没有获取到支付长链接时，支付自动化直接失败，但已注册账号不会丢失。
 - 指定 `--open-checkout` 时，程序会自动用系统浏览器打开支付链接，可交给 Tampermonkey 脚本继续填写页面。
-- 成功后把邮箱和密码按 `邮箱----密码` 写入 TXT 文件。
 
 登录流程：
 

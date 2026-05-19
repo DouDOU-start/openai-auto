@@ -82,12 +82,18 @@ def main() -> None:
         password = ""
 
     flow = RegisterFlow(settings, prompt=input)
+    account_saved = False
     try:
         if args.mode == "register":
             token_data = flow.run(email, password)
             save_credentials_txt(settings.output, email, password)
+            account_saved = True
             _print_chatgpt_session(token_data.get("chatgpt_session"))
-            _handle_checkout(token_data.get("plus_trial_checkout"), checkout_output, args.open_checkout)
+            checkout = flow.create_plus_trial_checkout(
+                flow.http.session,
+                token_data.get("chatgpt_session") if isinstance(token_data.get("chatgpt_session"), dict) else {},
+            )
+            _handle_checkout(checkout, checkout_output, args.open_checkout)
         elif args.mode == "login":
             session_data = flow.login(email, password)
             save_login_session(settings.session_file, email, password, session_data)
@@ -110,6 +116,8 @@ def main() -> None:
     except KeyboardInterrupt:
         raise SystemExit("\n[中断] 用户取消")
     except Exception as exc:
+        if args.mode == "register" and account_saved:
+            print(f"[完成] 账号密码已写入: {settings.output}")
         raise SystemExit(f"[错误] {exc}") from exc
     finally:
         flow.close()
@@ -173,47 +181,41 @@ def _print_plus_trial_checkout(checkout: object) -> None:
 
 def _handle_checkout(checkout: object, output: Path, open_checkout: bool) -> None:
     _print_plus_trial_checkout(checkout)
-    _save_checkout_urls(checkout, output)
+    long_url = _checkout_long_url(checkout)
+    if not long_url:
+        raise RuntimeError("未获取到支付长链接，停止处理")
+    _save_checkout_url(long_url, checkout, output)
     if open_checkout:
-        _open_checkout_url(checkout)
+        _open_checkout_url(long_url)
 
 
-def _checkout_urls(checkout: object) -> list[str]:
+def _checkout_long_url(checkout: object) -> str:
     if not isinstance(checkout, dict):
-        return []
-    urls = []
-    for key in ("long_url", "hosted_url", "openai_payurl", "short_url", "chatgpt_checkout_url"):
+        return ""
+    for key in ("long_url", "hosted_url", "openai_payurl"):
         url = str(checkout.get(key) or "").strip()
-        if url and url not in urls:
-            urls.append(url)
-    return urls
+        if url:
+            return url
+    return ""
 
 
-def _save_checkout_urls(checkout: object, output: Path) -> None:
-    urls = _checkout_urls(checkout)
-    if not urls:
-        return
+def _save_checkout_url(long_url: str, checkout: object, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     record = {
-        "long_url": urls[0],
-        "urls": urls,
+        "long_url": long_url,
+        "status_code": checkout.get("status_code") if isinstance(checkout, dict) else None,
     }
     with output.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
     print(f"[Plus] 支付链接已写入: {output}")
 
 
-def _open_checkout_url(checkout: object) -> None:
-    urls = _checkout_urls(checkout)
-    if not urls:
-        print("[Plus] 没有可打开的支付链接")
-        return
-    url = urls[0]
-    print(f"[Plus] 正在打开支付链接: {url}")
-    if _open_with_system_browser(url):
+def _open_checkout_url(long_url: str) -> None:
+    print(f"[Plus] 正在打开支付长链接: {long_url}")
+    if _open_with_system_browser(long_url):
         return
     try:
-        if webbrowser.open(url):
+        if webbrowser.open(long_url):
             return
     except Exception:
         pass

@@ -94,12 +94,7 @@ class RegisterFlow:
             print(f"[注册] 等待 {self.settings.login_delay} 秒后获取 ChatGPT session")
             time.sleep(self.settings.login_delay)
 
-        session_data = self._account_session_data(email, password, did, user_agent, target_url, "注册")
-        session_data["plus_trial_checkout"] = self.create_plus_trial_checkout(
-            self.http.session,
-            session_data["chatgpt_session"],
-        )
-        return session_data
+        return self._account_session_data(email, password, did, user_agent, target_url, "注册")
 
     def login(self, email: str, password: str) -> dict[str, Any]:
         """仅登录已有账号并返回可持久化的登录会话。"""
