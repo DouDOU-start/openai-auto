@@ -379,10 +379,32 @@ class JobManager:
                 if flow is not None:
                     flow.close()
                 writer.flush()
+        if job.status == "failed":
+            self._archive_failed_job(job)
         with self._lock:
             self._running_ids.discard(job.id)
+            self._jobs.pop(job.id, None)
             to_start = self._schedule_locked()
         self._start_workers(to_start)
+
+    def _archive_failed_job(self, job: WebJob) -> None:
+        try:
+            log_path = self.runtime.repo_root / "data" / "failed_jobs.log"
+            entry = {
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(job.updated_at)),
+                "job_id": job.id,
+                "mode": job.mode,
+                "email": job.email,
+                "error": job.error,
+                "logs": list(job.logs[-20:]),
+            }
+            with _web_file_lock:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(entry, ensure_ascii=False))
+                    handle.write("\n")
+        except Exception as exc:
+            print(f"[任务] 失败记录写入失败: {exc}", file=sys.stderr)
 
 
 class AutoRegisterScheduler:
