@@ -18,10 +18,13 @@ from .config import config_template, load_app_config
 from .flow import RegisterFlow
 from .settings import Settings
 from .storage import (
+    NULL_VALUE,
+    load_compact_accounts,
+    merge_legacy_rt_txt,
     save_account,
-    save_credentials_rt_txt,
-    save_credentials_txt,
+    save_compact_account,
     save_login_session,
+    sync_compact_accounts_from_sessions,
     try_load_login_session,
 )
 from .utils import make_password
@@ -73,8 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy", default="", help="注册代理，例如 http://127.0.0.1:7897")
     parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="注册账号 TXT 输出路径")
     parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
-    # Always export a compact rt file by default; keep flag for overrides.
-    # Intentionally hidden from help: this is a core artifact we always produce.
+    # 兼容旧 accounts_rt.txt：启动时自动合并到 accounts.txt，不再单独写入。
     parser.add_argument(
         "--rt-output",
         default=str(repo_root / "data" / "accounts_rt.txt"),
@@ -136,6 +138,11 @@ def _prompt_mode_number(prompt=input) -> str:
 
 
 def _select_mode_with_keys() -> str | None:
+    options = [(value, f"{value:<9} {label}", "") for value, label in _MODE_OPTIONS]
+    return _select_with_keys("请选择运行模式", options)
+
+
+def _select_with_keys(title: str, options: list[tuple[str, str, str]]) -> str | None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return None
     try:
@@ -151,17 +158,21 @@ def _select_mode_with_keys() -> str | None:
     except termios.error:
         return None
 
+    if not options:
+        return None
+
     index = 0
-    line_count = len(_MODE_OPTIONS) + 1
+    line_count = len(options) + 1
 
     def render(first: bool = False) -> None:
         if not first:
             sys.stdout.write(f"\x1b[{line_count}A")
         sys.stdout.write("\x1b[J")
-        sys.stdout.write("请选择运行模式（↑/↓ 切换，Enter 确认，1/2/3 直接选择）：\n")
-        for option_index, (value, label) in enumerate(_MODE_OPTIONS):
+        sys.stdout.write(f"{title}（↑/↓ 切换，Enter 确认，数字直接选择）：\n")
+        for option_index, (_, label, detail) in enumerate(options):
             marker = ">" if option_index == index else " "
-            sys.stdout.write(f" {marker} {option_index + 1}. {value:<9} {label}\n")
+            suffix = f" {detail}" if detail else ""
+            sys.stdout.write(f" {marker} {option_index + 1}. {label}{suffix}\n")
         sys.stdout.flush()
 
     def read_key() -> str:
@@ -183,19 +194,21 @@ def _select_mode_with_keys() -> str | None:
             if key in ("\r", "\n"):
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                return _MODE_OPTIONS[index][0]
+                return options[index][0]
             if key == "\x03":
                 raise KeyboardInterrupt
-            if key in {"1", "2", "3"}:
+            if key.isdigit() and key != "0":
                 chosen = int(key) - 1
+                if chosen >= len(options):
+                    continue
                 sys.stdout.write("\n")
                 sys.stdout.flush()
-                return _MODE_OPTIONS[chosen][0]
+                return options[chosen][0]
             if key in ("\x1b[A", "\x1bOA"):
-                index = (index - 1) % len(_MODE_OPTIONS)
+                index = (index - 1) % len(options)
                 render()
             elif key in ("\x1b[B", "\x1bOB"):
-                index = (index + 1) % len(_MODE_OPTIONS)
+                index = (index + 1) % len(options)
                 render()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -228,6 +241,64 @@ def _random_email(suffixes: tuple[str, ...], existing_emails: set[str]) -> str:
     raise SystemExit("[错误] 随机邮箱生成失败：配置后缀下的候选邮箱均与已有记录冲突")
 
 
+def _choose_authorize_account(accounts_path: Path) -> tuple[str, str] | None:
+    accounts = [account for account in load_compact_accounts(accounts_path) if _usable_saved_account(account)]
+    if not accounts:
+        return None
+
+    options: list[tuple[str, str, str]] = []
+    for index, account in enumerate(accounts):
+        email = account["email"]
+        plan = _display_field(account.get("subscription_type", ""))
+        rt_state = "有 RT" if _has_value(account.get("refresh_token", "")) else "无 RT"
+        options.append((str(index), email, f"[{plan} / {rt_state}]"))
+    options.append(("manual", "手动输入邮箱", ""))
+
+    selected = _select_with_keys("请选择要授权的账号", options)
+    if selected is None:
+        return _prompt_authorize_account_number(accounts)
+    if selected == "manual":
+        return None
+    account = accounts[int(selected)]
+    print(f"[授权] 使用已保存账号: {account['email']}")
+    return account["email"], account["password"]
+
+
+def _prompt_authorize_account_number(accounts: list[dict[str, str]], prompt=input) -> tuple[str, str] | None:
+    print("请选择要授权的账号：")
+    for index, account in enumerate(accounts, 1):
+        plan = _display_field(account.get("subscription_type", ""))
+        rt_state = "有 RT" if _has_value(account.get("refresh_token", "")) else "无 RT"
+        print(f"  {index}. {account['email']} [{plan} / {rt_state}]")
+    print(f"  {len(accounts) + 1}. 手动输入邮箱")
+    while True:
+        raw = prompt(f"请输入 1/{len(accounts) + 1}: ").strip()
+        if not raw.isdigit():
+            print("[错误] 无效选择，请重新输入")
+            continue
+        index = int(raw)
+        if 1 <= index <= len(accounts):
+            account = accounts[index - 1]
+            print(f"[授权] 使用已保存账号: {account['email']}")
+            return account["email"], account["password"]
+        if index == len(accounts) + 1:
+            return None
+        print("[错误] 无效选择，请重新输入")
+
+
+def _usable_saved_account(account: dict[str, str]) -> bool:
+    return _has_value(account.get("email", "")) and _has_value(account.get("password", ""))
+
+
+def _has_value(value: object) -> bool:
+    text = str(value or "").strip()
+    return bool(text and text.lower() != NULL_VALUE)
+
+
+def _display_field(value: object) -> str:
+    return str(value).strip() if _has_value(value) else NULL_VALUE
+
+
 def main() -> None:
     args = build_parser().parse_args()
     repo_root = _repo_root()
@@ -247,6 +318,7 @@ def main() -> None:
     token_output = Path(args.token_output).resolve()
     rt_output = Path(args.rt_output).resolve()
     checkout_output = Path(args.checkout_output).resolve()
+    merge_legacy_rt_txt(Path(args.output).resolve(), rt_output)
 
     # 优先级：命令行参数（非空 / >0）> 环境变量 > 配置文件。
     proxy = (
@@ -296,34 +368,38 @@ def main() -> None:
         email_code_poll_interval=max(0.5, float(email_code_poll)),
         email_code_timeout=max(5, int(email_code_timeout)),
     )
+    sync_compact_accounts_from_sessions(settings.output, settings.session_file)
 
     existing_emails = _collect_existing_emails(settings.output, rt_output, token_output, settings.session_file)
-    email_prompt = "请输入邮箱，留空随机生成: " if mode == "register" else "请输入邮箱: "
-    email = input(email_prompt).strip().lower()
-    if mode == "register" and not email:
-        email = _random_email(cfg.email_suffixes, existing_emails)
-        print(f"[注册] 随机生成邮箱: {email}")
-    if not email:
-        raise SystemExit("[错误] 邮箱不能为空")
-    if mode == "register" and email in existing_emails:
-        raise SystemExit(f"[错误] 邮箱已存在于本地记录，避免重复注册: {email}")
-    if mode == "register":
-        password = input("请输入密码，留空自动生成: ").strip() or make_password()
-        print(f"[注册] 使用密码: {password}")
-    elif mode == "login":
-        password = input("请输入已有账号密码: ").strip()
-        if not password:
-            raise SystemExit("[错误] 登录模式必须输入已有账号密码")
+    selected_account = _choose_authorize_account(settings.output) if mode == "authorize" else None
+    if selected_account is not None:
+        email, password = selected_account
     else:
-        password = ""
+        email_prompt = "请输入邮箱，留空随机生成: " if mode == "register" else "请输入邮箱: "
+        email = input(email_prompt).strip().lower()
+        if mode == "register" and not email:
+            email = _random_email(cfg.email_suffixes, existing_emails)
+            print(f"[注册] 随机生成邮箱: {email}")
+        if not email:
+            raise SystemExit("[错误] 邮箱不能为空")
+        if mode == "register" and email in existing_emails:
+            raise SystemExit(f"[错误] 邮箱已存在于本地记录，避免重复注册: {email}")
+        if mode == "register":
+            password = input("请输入密码，留空自动生成: ").strip() or make_password()
+            print(f"[注册] 使用密码: {password}")
+        elif mode == "login":
+            password = input("请输入已有账号密码: ").strip()
+            if not password:
+                raise SystemExit("[错误] 登录模式必须输入已有账号密码")
+        else:
+            password = ""
 
     flow = RegisterFlow(settings, prompt=input)
     account_saved = False
     try:
         if mode == "register":
             token_data = flow.run(email, password)
-            save_credentials_txt(settings.output, email, password)
-            save_credentials_rt_txt(rt_output, email, password, str(token_data.get("refresh_token") or ""))
+            save_compact_account(settings.output, email, password, token_data)
             account_saved = True
             _print_chatgpt_session(token_data.get("chatgpt_session"))
             checkout = flow.create_plus_trial_checkout(
@@ -341,8 +417,9 @@ def main() -> None:
         else:
             session_data = try_load_login_session(settings.session_file, email)
             if session_data is None:
-                print("[授权] 未找到可用登录会话，改为输入密码并即时登录")
-                password = input("请输入已有账号密码: ").strip()
+                print("[授权] 未找到可用登录会话，改为使用密码即时登录")
+                if not password:
+                    password = input("请输入已有账号密码: ").strip()
                 if not password:
                     raise SystemExit("[错误] 单独授权必须有登录会话或输入已有账号密码")
                 session_data = flow.login(email, password)
@@ -351,12 +428,12 @@ def main() -> None:
                 password = str(session_data.get("password") or "")
             token_data = flow.authorize_from_session(email, session_data)
             save_account(token_output, email, password, token_data)
-            save_credentials_rt_txt(rt_output, email, password, str(token_data.get("refresh_token") or ""))
+            save_compact_account(settings.output, email, password, token_data)
     except KeyboardInterrupt:
         raise SystemExit("\n[中断] 用户取消")
     except Exception as exc:
         if mode == "register" and account_saved:
-            print(f"[完成] 账号密码已写入: {settings.output}")
+            print(f"[完成] 账号数据已写入: {settings.output}")
         raise SystemExit(f"[错误] {exc}") from exc
     finally:
         flow.close()
@@ -367,9 +444,10 @@ def main() -> None:
     action = "注册" if mode == "register" else "授权"
     print(f"[完成] {action}成功: {token_data.get('email') or email}")
     if mode == "register":
-        print(f"[完成] 账号密码已写入: {settings.output}")
+        print(f"[完成] 账号数据已写入: {settings.output}")
     else:
         print(f"[完成] 授权数据已写入: {token_output}")
+        print(f"[完成] 账号数据已写入: {settings.output}")
         print(f"[完成] 登录会话文件: {settings.session_file}")
 
 

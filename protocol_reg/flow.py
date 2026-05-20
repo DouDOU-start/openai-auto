@@ -177,11 +177,51 @@ class RegisterFlow:
             return {"status_code": 0, "error": str(exc)}
         result: dict[str, Any] = {"status_code": resp.status_code}
         try:
-            result["data"] = resp.json()
+            data = resp.json()
+            result["data"] = data
+            account_type = self._extract_account_type(data)
+            account_check = self.fetch_account_check(session, data) if not account_type else {}
+            if account_check:
+                result["account_check"] = account_check
+                account_type = self._extract_account_type(account_check) or account_type
+            if account_type:
+                result["account_type"] = account_type
+                result["subscription_type"] = account_type
         except Exception:
             result["text"] = resp.text[:1000]
         if resp.status_code != 200:
             print(f"[警告] ChatGPT session 身份信息返回 HTTP {resp.status_code}")
+        return result
+
+    def fetch_account_check(self, session: requests.Session, session_data: dict[str, Any]) -> dict[str, Any]:
+        access_token = str(session_data.get("accessToken") or "").strip()
+        if not access_token:
+            return {}
+        print("[身份] 获取账号类型")
+        try:
+            resp = session.get(
+                "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/json",
+                    "Referer": "https://chatgpt.com/",
+                    "User-Agent": DEFAULT_UA,
+                },
+                proxies=self.settings.proxies,
+                verify=self.settings.ssl_verify,
+                timeout=self.settings.timeout,
+            )
+        except Exception as exc:
+            print(f"[警告] 账号类型获取失败: {exc}")
+            return {"status_code": 0, "error": str(exc)}
+
+        result: dict[str, Any] = {"status_code": resp.status_code}
+        try:
+            result["data"] = resp.json()
+        except Exception:
+            result["text"] = resp.text[:500]
+        if resp.status_code != 200:
+            print(f"[警告] 账号类型接口返回 HTTP {resp.status_code}")
         return result
 
     def create_plus_trial_checkout(
@@ -670,6 +710,50 @@ class RegisterFlow:
                 return str(item.get("id") or "")
         if sessions:
             return str(sessions[0].get("id") or "")
+        return ""
+
+    @staticmethod
+    def _extract_account_type(payload: object) -> str:
+        key_names = {
+            "account_type",
+            "accountType",
+            "subscription_type",
+            "subscriptionType",
+            "subscription_plan",
+            "subscriptionPlan",
+            "chatgpt_plan_type",
+            "plan_type",
+            "planType",
+            "plan_name",
+            "planName",
+            "account_plan",
+            "accountPlan",
+            "billing_plan",
+            "billingPlan",
+            "product_name",
+            "productName",
+            "sku",
+        }
+        if isinstance(payload, dict):
+            for key in key_names:
+                value = payload.get(key)
+                if isinstance(value, (str, int, float)) and str(value).strip():
+                    return str(value).strip()
+                if isinstance(value, dict):
+                    nested = RegisterFlow._extract_account_type(value)
+                    if nested:
+                        return nested
+            if isinstance(payload.get("is_paid_subscription_active"), bool):
+                return "paid" if payload["is_paid_subscription_active"] else "free"
+            for value in payload.values():
+                nested = RegisterFlow._extract_account_type(value)
+                if nested:
+                    return nested
+        elif isinstance(payload, list):
+            for item in payload:
+                nested = RegisterFlow._extract_account_type(item)
+                if nested:
+                    return nested
         return ""
 
     @staticmethod

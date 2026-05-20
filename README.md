@@ -141,6 +141,14 @@ email_suffixes:
 data/accounts.txt
 ```
 
+账号文件格式：
+
+```text
+账号----密码----订阅类型----rt----at
+```
+
+订阅类型优先来自 `https://chatgpt.com/api/auth/session` 返回的 `account.planType`，OAuth `id_token` 中的 `chatgpt_plan_type` 会作为兜底。缺失字段会写为 `null`。旧的 `data/accounts_rt.txt` 会在启动时自动合并到 `data/accounts.txt`，后续不再单独写入。
+
 授权 token 输出：
 
 ```text
@@ -181,7 +189,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 人工查看邮箱后在终端输入验证码。
 - 程序继续创建账号，不走 OAuth 授权。
 - 成功后请求 `https://chatgpt.com/api/auth/session` 获取身份信息。
-- 成功后先把邮箱和密码按 `邮箱----密码` 写入 TXT 文件。
+- 成功后先把账号数据按 `账号----密码----订阅类型----rt----at` 写入 TXT 文件，缺失字段写 `null`。
 - 程序调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 hosted checkout 链接。
 - 没有获取到支付长链接时，支付自动化直接失败，但已注册账号不会丢失。
 - 程序默认会自动用系统浏览器打开支付链接，可交给 Tampermonkey 脚本继续填写页面；指定 `--no-open-checkout` 时只保存长链接。
@@ -196,13 +204,14 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 
 授权流程：
 
-- 交互式输入已有账号邮箱。
+- 从 `data/accounts.txt` 选择已有账号，自动读取邮箱和密码；也可以选择手动输入邮箱。
 - 程序优先读取 `login` 模式保存的 cookies。
-- 没有可用 cookies 时，交互式输入已有账号密码并即时登录。
+- 没有可用 cookies 时，已选择账号会直接使用保存的密码即时登录；手动输入邮箱时会再要求输入密码。
 - 遇到账号选择页时，程序会自动选择当前输入邮箱。
 - 程序走 OAuth PKCE 换取 token。
 - 成功后请求 `https://chatgpt.com/api/auth/session` 获取身份信息。
 - 成功后把邮箱、密码、token 和身份信息写入 JSONL 文件。
+- 成功后同步更新 `data/accounts.txt` 中该账号的 RT 和 AT 字段。
 
 ## 边界
 

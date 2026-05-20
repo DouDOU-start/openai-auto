@@ -101,9 +101,19 @@ def exchange_token(session: Any, callback_url: str, oauth: OAuthStart, proxies: 
     data = resp.json()
     claims = jwt_claims_no_verify(data.get("id_token", ""))
     auth_claims = claims.get("https://api.openai.com/auth") or {}
+    plan_type = str(
+        auth_claims.get("chatgpt_plan_type")
+        or claims.get("chatgpt_plan_type")
+        or ""
+    ).strip()
+    subscription_active_until = str(
+        auth_claims.get("chatgpt_subscription_active_until")
+        or claims.get("chatgpt_subscription_active_until")
+        or ""
+    ).strip()
     now = int(time.time())
     expires_in = int(data.get("expires_in") or 3600)
-    return {
+    result = {
         "id_token": data.get("id_token", ""),
         "client_id": CLIENT_ID,
         "access_token": data.get("access_token", ""),
@@ -114,3 +124,8 @@ def exchange_token(session: Any, callback_url: str, oauth: OAuthStart, proxies: 
         "type": "codex",
         "expired": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + expires_in)),
     }
+    if plan_type:
+        result["plan_type"] = plan_type
+    if subscription_active_until:
+        result["subscription_active_until"] = subscription_active_until
+    return result
