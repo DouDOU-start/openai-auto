@@ -10,6 +10,7 @@ openai-auto/
 ├── uv.lock                 # uv 锁定文件
 ├── README.md               # 使用说明
 ├── config/                 # 本地配置目录，授权文件默认放这里
+│   ├── protocol-reg.example.yaml # protocol-reg 配置示例
 │   └── wenfxl.license      # 默认授权文件
 ├── data/                   # 运行输出目录，账号、token、会话和数据库默认放这里
 ├── protocol_reg/           # 注册、登录和授权 CLI 主代码
@@ -30,6 +31,7 @@ openai-auto/
 ```
 
 `data/*`、虚拟环境、缓存和构建产物不会提交到 Git。默认授权文件 `config/wenfxl.license` 会随项目提交。
+实际运行配置文件 `config/protocol-reg.yaml` 默认不提交，避免泄露邮箱验证码 API 密钥。
 
 ## 运行条件
 
@@ -45,6 +47,14 @@ uv sync
 项目已内置根目录 `utils` 作为最小 `utils.auth_core` 运行依赖，运行时不会读取其他本地项目目录。
 
 ## 常用命令
+
+直接运行，用上下键选择注册、登录或授权模式，回车确认；也可以直接按 `1/2/3`：
+
+```bash
+uv run protocol-reg
+```
+
+也可以继续用 `--mode` 指定模式，指定后不会出现模式选择提示。
 
 注册新账号：
 
@@ -87,11 +97,43 @@ uv run protocol-reg --mode authorize
 也可以使用模块或开发脚本运行：
 
 ```bash
-uv run python -m protocol_reg --mode register
-uv run python scripts/register_cli.py --mode register
+uv run python -m protocol_reg
+uv run python scripts/register_cli.py
 ```
 
 ## 默认文件
+
+运行配置默认路径：
+
+```text
+config/protocol-reg.yaml
+```
+
+生成默认运行配置：
+
+```bash
+uv run protocol-reg --init-config
+```
+
+也可以从示例配置复制：
+
+```bash
+cp config/protocol-reg.example.yaml config/protocol-reg.yaml
+```
+
+配置文件支持直接设置代理，命令行 `--proxy` 会覆盖配置文件：
+
+```yaml
+proxy: "http://用户名:密码@主机:端口"
+```
+
+配置文件支持设置注册邮箱随机后缀。注册模式下邮箱留空时，会从这些后缀中随机生成邮箱，并避开本地已有记录：
+
+```yaml
+email_suffixes:
+  - "example.com"
+  - "example.net"
+```
 
 注册账号输出：
 

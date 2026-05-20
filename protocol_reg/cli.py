@@ -4,8 +4,12 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
+import secrets
 import shutil
+import string
 import subprocess
+import sys
 import webbrowser
 
 import yaml
@@ -21,6 +25,14 @@ from .storage import (
     try_load_login_session,
 )
 from .utils import make_password
+
+
+_MODE_OPTIONS = (
+    ("register", "注册新账号"),
+    ("login", "仅登录保存会话"),
+    ("authorize", "使用已保存会话授权"),
+)
+_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 
 
 def _repo_root() -> Path:
@@ -45,8 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mode",
         choices=("register", "login", "authorize"),
-        default="register",
-        help="运行模式：register 注册新账号，login 仅登录保存会话，authorize 单独授权",
+        default=None,
+        help="运行模式：register 注册新账号，login 仅登录保存会话，authorize 单独授权；不传时用上下键交互式选择",
     )
     parser.add_argument(
         "--config",
@@ -92,6 +104,130 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _resolve_mode(mode: str | None, prompt=input) -> str:
+    if mode:
+        return mode
+
+    selected = _select_mode_with_keys()
+    if selected:
+        return selected
+
+    return _prompt_mode_number(prompt)
+
+
+def _prompt_mode_number(prompt=input) -> str:
+    choices = {
+        "1": "register",
+        "2": "login",
+        "3": "authorize",
+    }
+    print("请选择运行模式：")
+    for index, (value, label) in enumerate(_MODE_OPTIONS, 1):
+        print(f"  {index}. {value:<9} {label}")
+    while True:
+        try:
+            raw = prompt("请输入 1/2/3: ").strip()
+        except EOFError as exc:
+            raise SystemExit("[错误] 未指定 --mode 且无法读取交互输入") from exc
+        selected = choices.get(raw)
+        if selected:
+            return selected
+        print("[错误] 无效运行模式，请重新输入")
+
+
+def _select_mode_with_keys() -> str | None:
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        return None
+
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+    except termios.error:
+        return None
+
+    index = 0
+    line_count = len(_MODE_OPTIONS) + 1
+
+    def render(first: bool = False) -> None:
+        if not first:
+            sys.stdout.write(f"\x1b[{line_count}A")
+        sys.stdout.write("\x1b[J")
+        sys.stdout.write("请选择运行模式（↑/↓ 切换，Enter 确认，1/2/3 直接选择）：\n")
+        for option_index, (value, label) in enumerate(_MODE_OPTIONS):
+            marker = ">" if option_index == index else " "
+            sys.stdout.write(f" {marker} {option_index + 1}. {value:<9} {label}\n")
+        sys.stdout.flush()
+
+    def read_key() -> str:
+        key = os.read(fd, 1).decode("utf-8", errors="ignore")
+        if key != "\x1b":
+            return key
+        sequence = key
+        while select.select([fd], [], [], 0.1)[0]:
+            sequence += os.read(fd, 1).decode("utf-8", errors="ignore")
+            if len(sequence) >= 3:
+                break
+        return sequence
+
+    try:
+        tty.setcbreak(fd)
+        render(first=True)
+        while True:
+            key = read_key()
+            if key in ("\r", "\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return _MODE_OPTIONS[index][0]
+            if key == "\x03":
+                raise KeyboardInterrupt
+            if key in {"1", "2", "3"}:
+                chosen = int(key) - 1
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return _MODE_OPTIONS[chosen][0]
+            if key in ("\x1b[A", "\x1bOA"):
+                index = (index - 1) % len(_MODE_OPTIONS)
+                render()
+            elif key in ("\x1b[B", "\x1bOB"):
+                index = (index + 1) % len(_MODE_OPTIONS)
+                render()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def _collect_existing_emails(*paths: Path) -> set[str]:
+    emails: set[str] = set()
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        for match in _EMAIL_RE.findall(text):
+            emails.add(match.lower())
+    return emails
+
+
+def _random_email(suffixes: tuple[str, ...], existing_emails: set[str]) -> str:
+    if not suffixes:
+        raise SystemExit("[错误] 邮箱留空随机生成时，必须先在配置文件设置 email_suffixes")
+    alphabet = string.ascii_lowercase + string.digits
+    for _ in range(1000):
+        suffix = secrets.choice(suffixes)
+        local = "oa" + "".join(secrets.choice(alphabet) for _ in range(12))
+        email = f"{local}@{suffix}".lower()
+        if email not in existing_emails:
+            return email
+    raise SystemExit("[错误] 随机邮箱生成失败：配置后缀下的候选邮箱均与已有记录冲突")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     repo_root = _repo_root()
@@ -103,14 +239,21 @@ def main() -> None:
             yaml.safe_dump(config_template(), allow_unicode=True, sort_keys=False),
             encoding="utf-8",
         )
-        raise SystemExit(f"[完成] 已生成配置文件: {config_path}")
+        print(f"[完成] 已生成配置文件: {config_path}")
+        return
 
     cfg = load_app_config(config_path)
+    mode = _resolve_mode(args.mode)
     token_output = Path(args.token_output).resolve()
     rt_output = Path(args.rt_output).resolve()
     checkout_output = Path(args.checkout_output).resolve()
 
-    # Precedence: CLI flag (non-empty / >0) > env var > config file.
+    # 优先级：命令行参数（非空 / >0）> 环境变量 > 配置文件。
+    proxy = (
+        str(args.proxy or "").strip()
+        or os.environ.get("PROTOCOL_REG_PROXY", "").strip()
+        or cfg.proxy
+    )
     email_code_api = (
         str(args.email_code_api or "").strip()
         or os.environ.get("EMAIL_CODE_API", "").strip()
@@ -139,7 +282,7 @@ def main() -> None:
     )
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
-        proxy=args.proxy,
+        proxy=str(proxy or "").strip(),
         output=Path(args.output).resolve(),
         session_file=Path(args.session_file).resolve(),
         license_file=Path(args.license_file).resolve() if args.license_file else None,
@@ -154,13 +297,20 @@ def main() -> None:
         email_code_timeout=max(5, int(email_code_timeout)),
     )
 
-    email = input("请输入邮箱: ").strip()
+    existing_emails = _collect_existing_emails(settings.output, rt_output, token_output, settings.session_file)
+    email_prompt = "请输入邮箱，留空随机生成: " if mode == "register" else "请输入邮箱: "
+    email = input(email_prompt).strip().lower()
+    if mode == "register" and not email:
+        email = _random_email(cfg.email_suffixes, existing_emails)
+        print(f"[注册] 随机生成邮箱: {email}")
     if not email:
         raise SystemExit("[错误] 邮箱不能为空")
-    if args.mode == "register":
+    if mode == "register" and email in existing_emails:
+        raise SystemExit(f"[错误] 邮箱已存在于本地记录，避免重复注册: {email}")
+    if mode == "register":
         password = input("请输入密码，留空自动生成: ").strip() or make_password()
         print(f"[注册] 使用密码: {password}")
-    elif args.mode == "login":
+    elif mode == "login":
         password = input("请输入已有账号密码: ").strip()
         if not password:
             raise SystemExit("[错误] 登录模式必须输入已有账号密码")
@@ -170,7 +320,7 @@ def main() -> None:
     flow = RegisterFlow(settings, prompt=input)
     account_saved = False
     try:
-        if args.mode == "register":
+        if mode == "register":
             token_data = flow.run(email, password)
             save_credentials_txt(settings.output, email, password)
             save_credentials_rt_txt(rt_output, email, password, str(token_data.get("refresh_token") or ""))
@@ -181,7 +331,7 @@ def main() -> None:
                 token_data.get("chatgpt_session") if isinstance(token_data.get("chatgpt_session"), dict) else {},
             )
             _handle_checkout(checkout, checkout_output, args.open_checkout)
-        elif args.mode == "login":
+        elif mode == "login":
             session_data = flow.login(email, password)
             save_login_session(settings.session_file, email, password, session_data)
             _print_chatgpt_session(session_data.get("chatgpt_session"))
@@ -205,18 +355,18 @@ def main() -> None:
     except KeyboardInterrupt:
         raise SystemExit("\n[中断] 用户取消")
     except Exception as exc:
-        if args.mode == "register" and account_saved:
+        if mode == "register" and account_saved:
             print(f"[完成] 账号密码已写入: {settings.output}")
         raise SystemExit(f"[错误] {exc}") from exc
     finally:
         flow.close()
 
-    if args.mode == "login":
+    if mode == "login":
         print(f"[完成] 登录会话已保存: {settings.session_file}")
         return
-    action = "注册" if args.mode == "register" else "授权"
+    action = "注册" if mode == "register" else "授权"
     print(f"[完成] {action}成功: {token_data.get('email') or email}")
-    if args.mode == "register":
+    if mode == "register":
         print(f"[完成] 账号密码已写入: {settings.output}")
     else:
         print(f"[完成] 授权数据已写入: {token_output}")

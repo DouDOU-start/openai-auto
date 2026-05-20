@@ -9,7 +9,11 @@ import yaml
 
 @dataclass(frozen=True)
 class AppConfig:
-    # Cloudflare-email OTP API
+    # 协议请求代理
+    proxy: str = ""
+    # 注册邮箱随机生成后缀
+    email_suffixes: tuple[str, ...] = ()
+    # Cloudflare-email 验证码 API
     email_code_api: str = ""
     email_code_key: str = ""
     email_code_sender_suffix: str = "openai.com"
@@ -23,6 +27,9 @@ def load_app_config(path: Path) -> AppConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         return AppConfig()
+
+    proxy = str(raw.get("proxy") or "").strip()
+    email_suffixes = _load_email_suffixes(raw.get("email_suffixes"))
 
     mail = raw.get("email_code")
     if not isinstance(mail, dict):
@@ -55,6 +62,8 @@ def load_app_config(path: Path) -> AppConfig:
         timeout = 5
 
     return AppConfig(
+        proxy=proxy,
+        email_suffixes=email_suffixes,
         email_code_api=_s("api", ""),
         email_code_key=_s("key", ""),
         email_code_sender_suffix=sender,
@@ -65,12 +74,36 @@ def load_app_config(path: Path) -> AppConfig:
 
 def config_template() -> dict[str, Any]:
     return {
+        "proxy": "",
+        "email_suffixes": [],
         "email_code": {
-            "api": "https://your-domain.example",
-            "key": "your-admin-api-key",
+            "api": "",
+            "key": "",
             "sender_suffix": "openai.com",
             "timeout": 120,
             "poll": 2.0,
         }
     }
 
+
+def _load_email_suffixes(value: object) -> tuple[str, ...]:
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, list):
+        items = value
+    else:
+        return ()
+
+    suffixes: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        suffix = str(item or "").strip().lower()
+        if suffix.startswith("@"):
+            suffix = suffix[1:]
+        if not suffix or "@" in suffix or "." not in suffix:
+            continue
+        if suffix in seen:
+            continue
+        seen.add(suffix)
+        suffixes.append(suffix)
+    return tuple(suffixes)
