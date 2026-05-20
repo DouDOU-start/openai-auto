@@ -190,7 +190,11 @@ def _session_field(value: object) -> str:
     if text == NULL_VALUE:
         return NULL_VALUE
     if text.startswith(("{", "[")):
-        return text
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return NULL_VALUE
+        return _session_json(data)
     return NULL_VALUE
 
 
@@ -201,10 +205,18 @@ def _extract_refresh_token(token_data: dict[str, Any]) -> str:
 def _extract_session(token_data: dict[str, Any]) -> str:
     session = token_data.get("chatgpt_session")
     if isinstance(session, dict):
-        return json.dumps(session, ensure_ascii=False, separators=(",", ":"))
+        return _session_json(session)
     if isinstance(token_data.get("data"), dict) and ("accessToken" in token_data["data"] or "user" in token_data["data"]):
-        return json.dumps(token_data, ensure_ascii=False, separators=(",", ":"))
+        return _session_json(token_data)
     return ""
+
+
+def _session_json(session: object) -> str:
+    if isinstance(session, dict) and isinstance(session.get("data"), dict):
+        session = session["data"]
+    if not isinstance(session, (dict, list)):
+        return NULL_VALUE
+    return json.dumps(session, ensure_ascii=False, separators=(",", ":"))
 
 
 def _extract_subscription_type(token_data: dict[str, Any]) -> str:

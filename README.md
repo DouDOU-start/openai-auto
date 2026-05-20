@@ -147,7 +147,7 @@ data/accounts.txt
 账号----密码----订阅类型----rt----session
 ```
 
-订阅类型优先来自 `https://chatgpt.com/api/auth/session` 返回的 `account.planType`，OAuth `id_token` 中的 `chatgpt_plan_type` 会作为兜底。`session` 字段保存 `https://chatgpt.com/api/auth/session` 的完整单行 JSON 返回；缺失字段会写为 `null`。旧的 `data/accounts_rt.txt` 会在启动时自动合并到 `data/accounts.txt`，后续不再单独写入。
+订阅类型优先来自 `https://chatgpt.com/api/auth/session` 返回的 `account.planType`，OAuth `id_token` 中的 `chatgpt_plan_type` 会作为兜底。`session` 字段保存 `https://chatgpt.com/api/auth/session` 返回中的 `data` 对象单行 JSON；缺失字段会写为 `null`。旧的 `data/accounts_rt.txt` 会在启动时自动合并到 `data/accounts.txt`，后续不再单独写入。
 
 授权 token 输出：
 
