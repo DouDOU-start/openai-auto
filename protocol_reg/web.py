@@ -226,7 +226,13 @@ class _ThreadBoundStream:
         writer = getattr(self._local, "writer", None)
         if writer is None:
             return self._fallback.write(data)
-        return writer.write(data)
+        written = writer.write(data)
+        try:
+            self._fallback.write(data)
+            self._fallback.flush()
+        except Exception:
+            pass
+        return written
 
     def flush(self) -> None:
         writer = getattr(self._local, "writer", None)
@@ -234,6 +240,10 @@ class _ThreadBoundStream:
             self._fallback.flush()
             return
         writer.flush()
+        try:
+            self._fallback.flush()
+        except Exception:
+            pass
 
     def isatty(self) -> bool:
         return bool(getattr(self._fallback, "isatty", lambda: False)())
@@ -383,9 +393,20 @@ class JobManager:
             self._archive_failed_job(job)
         with self._lock:
             self._running_ids.discard(job.id)
-            self._jobs.pop(job.id, None)
+            self._prune_jobs_locked()
             to_start = self._schedule_locked()
         self._start_workers(to_start)
+
+    def _prune_jobs_locked(self) -> None:
+        completed = [
+            job
+            for job in self._jobs.values()
+            if job.status in {"succeeded", "failed"}
+        ]
+        if len(self._jobs) <= 120:
+            return
+        for job in sorted(completed, key=lambda item: item.updated_at)[: len(self._jobs) - 120]:
+            self._jobs.pop(job.id, None)
 
     def _archive_failed_job(self, job: WebJob) -> None:
         try:
@@ -980,6 +1001,33 @@ def _resolve_operation_account(
     return email, password
 
 
+def _chatgpt_session_payload(session_data: dict[str, Any]) -> dict[str, Any] | None:
+    chatgpt_session = session_data.get("chatgpt_session")
+    if not isinstance(chatgpt_session, dict):
+        return None
+    data = chatgpt_session.get("data")
+    if isinstance(data, dict):
+        return data
+    if "accessToken" in chatgpt_session or "user" in chatgpt_session:
+        return chatgpt_session
+    return None
+
+
+def _require_chatgpt_session_payload(session_data: dict[str, Any]) -> dict[str, Any]:
+    payload = _chatgpt_session_payload(session_data)
+    if isinstance(payload, dict) and _session_access_token(payload):
+        return payload
+    chatgpt_session = session_data.get("chatgpt_session")
+    if isinstance(chatgpt_session, dict):
+        status_code = chatgpt_session.get("status_code")
+        error = str(chatgpt_session.get("error") or "").strip()
+        if error:
+            raise RuntimeError(f"登录完成但未获取到有效 ChatGPT Session: {error}")
+        if status_code:
+            raise RuntimeError(f"登录完成但 ChatGPT Session 接口返回 HTTP {status_code}")
+    raise RuntimeError("登录完成但未获取到有效 ChatGPT Session accessToken")
+
+
 def _execute_operation(
     job: WebJob,
     payload: OperationPayload,
@@ -1004,11 +1052,18 @@ def _execute_operation(
 
     if mode == "login":
         session_data = flow.login(email, password, create_checkout=payload.create_checkout)
+        session_payload = _require_chatgpt_session_payload(session_data)
         save_login_session(settings.session_file, email, password, session_data)
         save_account_storage(settings.output, email, password, session_data, source="login")
         checkout = session_data.get("plus_trial_checkout") if payload.create_checkout else None
         checkout_url = _store_checkout_for_account(email, checkout, runtime)
-        return {"email": email, "checkout_url": checkout_url}
+        plan_type = _extract_session_subscription_type(session_payload)
+        return {
+            "email": email,
+            "checkout_url": checkout_url,
+            "session_saved": True,
+            "subscription_type": plan_type or NULL_VALUE,
+        }
 
     session_data = try_load_login_session(settings.session_file, email)
     if session_data is None:
@@ -1079,6 +1134,34 @@ def _session_access_token(session_json: object) -> str:
     if not isinstance(session, dict):
         return ""
     return str(session.get("accessToken") or session.get("access_token") or "").strip()
+
+
+def _extract_session_subscription_type(session_json: object) -> str:
+    if isinstance(session_json, dict):
+        session = session_json
+    else:
+        text = str(session_json or "").strip()
+        if not text or text.lower() == NULL_VALUE:
+            return ""
+        try:
+            session = json.loads(text)
+        except json.JSONDecodeError:
+            return ""
+    if isinstance(session, dict) and isinstance(session.get("data"), dict):
+        session = session["data"]
+    if not isinstance(session, dict):
+        return ""
+    for key in ("subscription_type", "subscriptionType", "planType", "plan_type"):
+        value = str(session.get(key) or "").strip()
+        if value:
+            return value
+    account = session.get("account")
+    if isinstance(account, dict):
+        for key in ("planType", "plan_type", "subscription_type", "subscriptionType"):
+            value = str(account.get(key) or "").strip()
+            if value:
+                return value
+    return ""
 
 
 def _fetch_subscription_type_by_access_token(access_token: str, runtime: WebRuntime) -> str:
@@ -1781,7 +1864,10 @@ HTML_PAGE = r"""
     .list {
       padding: 14px;
       display: grid;
-      gap: 12px;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      grid-auto-rows: max-content;
+      align-content: start;
+      gap: 14px;
       max-height: calc(100vh - 278px);
       overflow: auto;
     }
@@ -1808,16 +1894,22 @@ HTML_PAGE = r"""
     .pagination button:disabled { opacity: .45; cursor: not-allowed; }
 
     .account-card {
-      display: grid;
-      grid-template-columns: auto 1fr auto;
-      gap: 14px;
-      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px;
       border: 1px solid rgba(17,16,13,.11);
-      border-radius: 24px;
+      border-radius: 18px;
       background: rgba(255, 252, 246, .58);
       cursor: pointer;
       transition: transform .18s ease, border-color .18s ease, background .18s ease;
       animation: cardIn .28s ease both;
+    }
+
+    .account-head {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
     }
 
     .select-box {
@@ -1839,15 +1931,14 @@ HTML_PAGE = r"""
 
     .email {
       font-family: var(--mono);
-      font-size: 15px;
+      font-size: 14px;
       word-break: break-all;
     }
 
     .meta {
-      margin-top: 10px;
       display: flex;
       flex-wrap: wrap;
-      gap: 8px;
+      gap: 6px;
       color: var(--muted);
       font-size: 12px;
     }
@@ -1858,9 +1949,10 @@ HTML_PAGE = r"""
       gap: 6px;
       border: 1px solid rgba(17,16,13,.12);
       border-radius: 999px;
-      padding: 6px 9px;
+      padding: 4px 8px;
       background: rgba(255,255,255,.42);
       font-family: var(--mono);
+      font-size: 11px;
     }
 
     .pill.good { color: var(--good); }
@@ -1868,10 +1960,10 @@ HTML_PAGE = r"""
     .pill.bad { color: var(--bad); }
 
     .card-actions {
-      display: grid;
-      gap: 8px;
-      justify-items: end;
-      align-self: center;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
     }
 
     .stock-action {
@@ -1886,6 +1978,19 @@ HTML_PAGE = r"""
       color: var(--ink);
       background: rgba(17,16,13,.08);
       box-shadow: none;
+    }
+
+    .card-actions .updated {
+      margin: 0;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: rgba(17,16,13,.58);
+      white-space: nowrap;
+    }
+
+    .card-actions .updated strong {
+      color: rgba(17,16,13,.78);
+      font-weight: 700;
     }
 
     .updated {
@@ -2264,9 +2369,8 @@ HTML_PAGE = r"""
       .ops-row { grid-template-columns: 1fr; }
       .auto-controls { grid-template-columns: 1fr; }
       .auto-head { align-items: flex-start; flex-direction: column; }
-      .account-card { grid-template-columns: auto 1fr; }
-      .card-actions { justify-items: start; }
-      .updated { text-align: left; }
+      .list { grid-template-columns: 1fr; }
+      .card-actions { justify-content: flex-start; flex-wrap: wrap; }
     }
   </style>
 </head>
@@ -2371,6 +2475,7 @@ HTML_PAGE = r"""
           <div class="field">
             <label>
               <span>Session JSON</span>
+              <button class="label-icon" type="button" id="refreshSessionBtn" title="重新获取 Session JSON" aria-label="刷新">↻</button>
               <button class="label-icon" type="button" id="copySessionBtn" title="复制 Session JSON" aria-label="复制">⧉</button>
             </label>
             <textarea id="sessionJson" readonly spellcheck="false" placeholder="/api/auth/session 返回 data 对象"></textarea>
@@ -2467,7 +2572,10 @@ HTML_PAGE = r"""
       auto: {},
       currentJobId: null,
       initialJobId: new URLSearchParams(window.location.search).get('job') || '',
+      initialAccountId: new URLSearchParams(window.location.search).get('account') || '',
       initialJobApplied: false,
+      initialAccountApplied: false,
+      returnAccountId: '',
       jobTimer: null,
       refreshAccountIdAfterJob: null,
       page: 1,
@@ -2582,23 +2690,25 @@ HTML_PAGE = r"""
         const stockButtonDisabled = accountStatus === STATUS_ABANDONED && stockStatus !== STOCK_OUT;
         return `
           <article class="account-card${active}" data-id="${item.id}" style="animation-delay:${Math.min(index * 18, 180)}ms">
-            <label class="select-box" title="选择账号">
-              <input type="checkbox" data-select-id="${item.id}"${checked} />
-            </label>
-            <div>
-              <div class="email">${escapeHtml(item.email)}</div>
-              <div class="meta">
-                <span class="pill">${escapeHtml(item.subscription_type || 'null')}</span>
-                <span class="pill">${escapeHtml(item.status || 'null')}</span>
-                <span class="pill ${stockClass}">库存 · ${escapeHtml(stockStatus)}</span>
-                <span class="pill ${checkoutClass}">Checkout · ${item.has_checkout_url ? '有' : '无'}</span>
-                <span class="pill ${rtClass}">RT · ${item.has_refresh_token ? '有' : '无'}</span>
-                <span class="pill ${sessionClass}">Session · ${item.has_session ? '有' : '无'}</span>
+            <div class="account-head">
+              <label class="select-box" title="选择账号">
+                <input type="checkbox" data-select-id="${item.id}"${checked} />
+              </label>
+              <div style="min-width:0; flex: 1">
+                <div class="email">${escapeHtml(item.email)}</div>
               </div>
             </div>
+            <div class="meta">
+              <span class="pill">${escapeHtml(item.subscription_type || 'null')}</span>
+              <span class="pill">${escapeHtml(item.status || 'null')}</span>
+              <span class="pill ${stockClass}">库存 · ${escapeHtml(stockStatus)}</span>
+              <span class="pill ${checkoutClass}">Checkout · ${item.has_checkout_url ? '有' : '无'}</span>
+              <span class="pill ${rtClass}">RT · ${item.has_refresh_token ? '有' : '无'}</span>
+              <span class="pill ${sessionClass}">Session · ${item.has_session ? '有' : '无'}</span>
+            </div>
             <div class="card-actions">
+              <div class="updated"><strong>创建</strong> ${escapeHtml(fmtDate(item.created_at))}</div>
               <button class="stock-action ${stockStatus === STOCK_OUT ? 'out' : ''}" type="button" data-stock-id="${item.id}" ${stockButtonDisabled ? 'disabled' : ''}>${escapeHtml(stockButtonText)}</button>
-              <div class="updated">创建 ${escapeHtml(fmtDate(item.created_at))}</div>
             </div>
           </article>
         `;
@@ -2680,6 +2790,13 @@ HTML_PAGE = r"""
       renderFilters(state.stats);
       renderList(state.items);
       renderPagination();
+      if (!state.initialAccountApplied && state.initialAccountId) {
+        state.initialAccountApplied = true;
+        const accountId = Number(state.initialAccountId);
+        if (Number.isFinite(accountId) && accountId > 0) {
+          selectAccount(accountId).catch((err) => toast(err.message));
+        }
+      }
     }
 
     function renderPagination() {
@@ -2738,6 +2855,7 @@ HTML_PAGE = r"""
       $('editorHint').textContent = `创建 ${fmtDate(item.created_at)} · 更新 ${fmtDate(item.updated_at)}`;
       updateStockButton(item.stock_status || STOCK_IN, item.id, item.status);
       updateCheckoutButton(item.id);
+      updateSessionButton(item.id);
       updatePlanButton(item.id);
       updateMarkSubscribedButton(item.id);
       updateAbandonButton(item.id, item.subscription_type, item.status);
@@ -2781,6 +2899,10 @@ HTML_PAGE = r"""
       $('regenCheckoutBtn').disabled = !id;
     }
 
+    function updateSessionButton(id = $('accountId').value) {
+      $('refreshSessionBtn').disabled = !id;
+    }
+
     function updatePlanButton(id = $('accountId').value) {
       $('refreshPlanBtn').disabled = !id;
     }
@@ -2814,6 +2936,7 @@ HTML_PAGE = r"""
       $('editorHint').textContent = '仅查看，不可编辑';
       updateStockButton(STOCK_IN, '', 'active');
       updateCheckoutButton('');
+      updateSessionButton('');
       updatePlanButton('');
       updateMarkSubscribedButton('');
       updateAbandonButton('', '', 'active');
@@ -3153,7 +3276,15 @@ HTML_PAGE = r"""
         if (pageMode === 'accounts') await loadAccounts();
         if (pageMode === 'accounts' && selected.status === 'succeeded' && refreshId) {
           closeOpsModal();
-          await selectAccount(refreshId);
+          window.location.href = `/?account=${encodeURIComponent(refreshId)}`;
+          return;
+        }
+        if (pageMode === 'tasks' && selected.status === 'succeeded') {
+          const returnId = state.returnAccountId || refreshId;
+          if (returnId) {
+            window.location.href = `/?account=${encodeURIComponent(returnId)}`;
+            return;
+          }
         }
         return;
       }
@@ -3244,7 +3375,8 @@ HTML_PAGE = r"""
       state.jobs = jobs.concat(state.jobs.filter((job) => !jobs.some((item) => String(item.id) === String(job.id))));
       state.queue = data.queue || state.queue;
       if (!renderInPage) {
-        window.location.href = `/tasks?job=${encodeURIComponent(jobs[0].id)}`;
+        const returnQuery = refreshAccountId ? `&returnAccount=${encodeURIComponent(refreshAccountId)}` : '';
+        window.location.href = `/tasks?job=${encodeURIComponent(jobs[0].id)}${returnQuery}`;
         return;
       }
       renderQueueSummary();
@@ -3301,6 +3433,28 @@ HTML_PAGE = r"""
         create_checkout: true,
       }, accountId);
       toast('已开始重新生成 checkout');
+    }
+
+    async function refreshSession() {
+      const accountId = Number($('accountId').value || 0);
+      if (!accountId) return toast('请先选择账号');
+      const email = $('email').value.trim();
+      const password = $('password').value;
+      if (!email || !password) return toast('当前账号缺少邮箱或密码，无法重新获取 Session');
+      $('opMode').value = 'login';
+      $('opEmail').value = email;
+      $('opPassword').value = password;
+      closeAccountModal();
+      await startJob({
+        mode: 'login',
+        email,
+        password,
+        account_id: accountId,
+        generate_email: false,
+        generate_password: false,
+        create_checkout: false,
+      }, accountId);
+      toast('已开始重新获取 Session');
     }
 
     async function submitPrompt() {
@@ -3390,6 +3544,7 @@ HTML_PAGE = r"""
     $('copyLineBtn').addEventListener('click', () => copyText(compactLine(), '账号行已复制'));
     $('refreshPlanBtn').addEventListener('click', () => refreshSubscriptionType().catch((err) => toast(err.message)));
     $('regenCheckoutBtn').addEventListener('click', () => regenerateCheckout().catch((err) => toast(err.message)));
+    $('refreshSessionBtn').addEventListener('click', () => refreshSession().catch((err) => toast(err.message)));
     $('startJobBtn').addEventListener('click', () => startJob().catch((err) => toast(err.message)));
     $('autoStartBtn').addEventListener('click', () => startAutoRegister().catch((err) => toast(err.message)));
     $('autoStopBtn').addEventListener('click', () => stopAutoRegister().catch((err) => toast(err.message)));
@@ -3456,6 +3611,7 @@ HTML_PAGE = r"""
 
     setupPageChrome();
     if (pageMode === 'tasks') {
+      state.returnAccountId = new URLSearchParams(window.location.search).get('returnAccount') || '';
       syncOperationControls();
       loadJobBoard().catch((err) => toast(err.message));
     } else {
