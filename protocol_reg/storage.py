@@ -22,7 +22,7 @@ def load_compact_accounts(path: Path) -> list[dict[str, str]]:
                 "password": fields[1],
                 "subscription_type": fields[2],
                 "refresh_token": fields[3],
-                "access_token": fields[4],
+                "session": fields[4],
             }
         )
     return accounts
@@ -65,7 +65,7 @@ def save_credentials_rt_txt(output: Path, email: str, password: str, refresh_tok
 
 
 def save_compact_account(output: Path, email: str, password: str, token_data: dict[str, Any] | None = None) -> None:
-    """写入账号紧凑格式：账号----密码----订阅类型----rt----at。"""
+    """写入账号紧凑格式：账号----密码----订阅类型----rt----session。"""
 
     fields = _compact_account_fields(email, password, token_data or {})
     _upsert_compact_account(output, fields)
@@ -86,7 +86,7 @@ def merge_legacy_rt_txt(accounts_output: Path, rt_output: Path) -> None:
 
 
 def normalize_compact_accounts_txt(output: Path) -> None:
-    """把旧账号行统一整理为账号----密码----订阅类型----rt----at。"""
+    """把旧账号行统一整理为账号----密码----订阅类型----rt----session。"""
 
     lines = _read_lines(output)
     if not lines:
@@ -121,7 +121,7 @@ def _compact_account_fields(email: str, password: str, token_data: dict[str, Any
         _field(password),
         _field(_extract_subscription_type(token_data)),
         _field(_extract_refresh_token(token_data)),
-        _field(_extract_access_token(token_data)),
+        _field(_extract_session(token_data)),
     ]
 
 
@@ -161,7 +161,9 @@ def _parse_compact_account_line(line: str) -> list[str] | None:
     if email == NULL_VALUE or password == NULL_VALUE:
         return None
     if len(parts) >= ACCOUNT_FIELD_COUNT:
-        return [_field(parts[index]) for index in range(ACCOUNT_FIELD_COUNT)]
+        fields = [_field(parts[index]) for index in range(ACCOUNT_FIELD_COUNT)]
+        fields[4] = _session_field(fields[4])
+        return fields
     if len(parts) >= 3:
         return [email, password, NULL_VALUE, _field(parts[2]), NULL_VALUE]
     return [email, password, NULL_VALUE, NULL_VALUE, NULL_VALUE]
@@ -183,17 +185,25 @@ def _field(value: object) -> str:
     return text.replace("\r", "").replace("\n", "").replace("----", "__")
 
 
+def _session_field(value: object) -> str:
+    text = _field(value)
+    if text == NULL_VALUE:
+        return NULL_VALUE
+    if text.startswith(("{", "[")):
+        return text
+    return NULL_VALUE
+
+
 def _extract_refresh_token(token_data: dict[str, Any]) -> str:
     return str(token_data.get("refresh_token") or token_data.get("refreshToken") or "")
 
 
-def _extract_access_token(token_data: dict[str, Any]) -> str:
-    direct = str(token_data.get("access_token") or token_data.get("accessToken") or "").strip()
-    if direct:
-        return direct
-    session_data = _chatgpt_session_data(token_data)
-    if isinstance(session_data, dict):
-        return str(session_data.get("accessToken") or session_data.get("access_token") or "")
+def _extract_session(token_data: dict[str, Any]) -> str:
+    session = token_data.get("chatgpt_session")
+    if isinstance(session, dict):
+        return json.dumps(session, ensure_ascii=False, separators=(",", ":"))
+    if isinstance(token_data.get("data"), dict) and ("accessToken" in token_data["data"] or "user" in token_data["data"]):
+        return json.dumps(token_data, ensure_ascii=False, separators=(",", ":"))
     return ""
 
 
