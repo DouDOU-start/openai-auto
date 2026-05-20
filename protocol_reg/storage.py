@@ -9,6 +9,139 @@ NULL_VALUE = "null"
 ACCOUNT_FIELD_COUNT = 5
 
 
+def init_accounts_db() -> None:
+    """初始化账号数据库表，不影响 auth_core 已使用的 system_kv 表。"""
+
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            """
+            CREATE TABLE IF NOT EXISTS accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password TEXT NOT NULL,
+                subscription_type TEXT DEFAULT 'null',
+                refresh_token TEXT DEFAULT 'null',
+                session_json TEXT DEFAULT 'null',
+                status TEXT DEFAULT 'active',
+                source TEXT DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_login_at TEXT,
+                last_authorized_at TEXT
+            )
+            """,
+        )
+        db_manager.execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)",
+        )
+        db_manager.execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_accounts_updated_at ON accounts(updated_at)",
+        )
+
+
+def sync_account_storage(accounts_output: Path, session_file: Path) -> None:
+    """启动时把 TXT 和会话文件导入数据库，再从数据库导出兼容 TXT。"""
+
+    init_accounts_db()
+    import_compact_accounts_to_db(accounts_output)
+    import_sessions_to_db(session_file)
+    export_accounts_db_to_txt(accounts_output)
+
+
+def save_account_storage(
+    accounts_output: Path,
+    email: str,
+    password: str,
+    token_data: dict[str, Any] | None = None,
+    *,
+    source: str = "manual",
+) -> None:
+    """把账号写入数据库，并同步导出 accounts.txt。"""
+
+    init_accounts_db()
+    fields = _compact_account_fields(email, password, token_data or {})
+    _upsert_account_db(fields, source)
+    export_accounts_db_to_txt(accounts_output)
+
+
+def load_account_records(accounts_output: Path | None = None) -> list[dict[str, str]]:
+    """读取数据库账号；数据库为空时可回退读取 TXT。"""
+
+    accounts = load_accounts_db()
+    if accounts or accounts_output is None:
+        return accounts
+    return load_compact_accounts(accounts_output)
+
+
+def load_accounts_db() -> list[dict[str, str]]:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        rows = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT email, password, subscription_type, refresh_token, session_json,
+                   status, source, created_at, updated_at, last_login_at, last_authorized_at
+            FROM accounts
+            ORDER BY id ASC
+            """,
+        ).fetchall()
+    return [_account_from_row(row) for row in rows]
+
+
+def import_compact_accounts_to_db(path: Path) -> None:
+    init_accounts_db()
+    for account in load_compact_accounts(path):
+        fields = [
+            account["email"],
+            account["password"],
+            account.get("subscription_type", NULL_VALUE),
+            account.get("refresh_token", NULL_VALUE),
+            account.get("session", NULL_VALUE),
+        ]
+        _upsert_account_db(fields, "import")
+
+
+def import_sessions_to_db(path: Path) -> None:
+    init_accounts_db()
+    sessions = _read_json_obj(path)
+    for key, record in sessions.items():
+        if not isinstance(record, dict):
+            continue
+        email = str(record.get("email") or key or "").strip().lower()
+        password = str(record.get("password") or "").strip()
+        if not email or not password or password.lower() == NULL_VALUE:
+            continue
+        fields = _compact_account_fields(email, password, record)
+        _upsert_account_db(fields, "import")
+
+
+def export_accounts_db_to_txt(output: Path) -> None:
+    accounts = load_accounts_db()
+    if not accounts:
+        return
+    output.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "----".join(
+            [
+                account["email"],
+                account["password"],
+                account["subscription_type"],
+                account["refresh_token"],
+                account["session"],
+            ]
+        )
+        for account in accounts
+    ]
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def load_compact_accounts(path: Path) -> list[dict[str, str]]:
     normalize_compact_accounts_txt(path)
     accounts: list[dict[str, str]] = []
@@ -29,15 +162,7 @@ def load_compact_accounts(path: Path) -> list[dict[str, str]]:
 
 
 def sync_compact_accounts_from_sessions(accounts_output: Path, session_file: Path) -> None:
-    sessions = _read_json_obj(session_file)
-    for key, record in sessions.items():
-        if not isinstance(record, dict):
-            continue
-        email = str(record.get("email") or key or "").strip().lower()
-        password = str(record.get("password") or "").strip()
-        if not email or not password or password.lower() == NULL_VALUE:
-            continue
-        save_compact_account(accounts_output, email, password, record)
+    sync_account_storage(accounts_output, session_file)
 
 
 def utc_now() -> str:
@@ -144,6 +269,131 @@ def _upsert_compact_account(output: Path, fields: list[str]) -> None:
     output.write_text("\n".join(updated) + "\n", encoding="utf-8")
 
 
+def _upsert_account_db(fields: list[str], source: str) -> None:
+    normalized = _normalize_account_fields(fields)
+    if normalized is None:
+        return
+
+    db_manager = _db_manager()
+    now = utc_now()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        existing = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT email, password, subscription_type, refresh_token, session_json,
+                   status, source, created_at, last_login_at, last_authorized_at
+            FROM accounts
+            WHERE email = ?
+            """,
+            (normalized[0],),
+        ).fetchone()
+        if existing is None:
+            last_login_at = now if source in {"register", "login"} else None
+            last_authorized_at = now if source == "authorize" else None
+            db_manager.execute_sql(
+                cursor,
+                """
+                INSERT INTO accounts (
+                    email, password, subscription_type, refresh_token, session_json,
+                    status, source, created_at, updated_at, last_login_at, last_authorized_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    *normalized,
+                    "active",
+                    _field(source) if _field(source) != NULL_VALUE else "manual",
+                    now,
+                    now,
+                    last_login_at,
+                    last_authorized_at,
+                ),
+            )
+            return
+
+        old_fields = [
+            _field(existing["email"]).lower(),
+            _field(existing["password"]),
+            _field(existing["subscription_type"]),
+            _field(existing["refresh_token"]),
+            _session_field(existing["session_json"]),
+        ]
+        merged = _merge_compact_fields(old_fields, normalized)
+        last_login_at = existing["last_login_at"]
+        last_authorized_at = existing["last_authorized_at"]
+        if source in {"register", "login"}:
+            last_login_at = now
+        if source == "authorize":
+            last_authorized_at = now
+
+        db_manager.execute_sql(
+            cursor,
+            """
+            UPDATE accounts
+            SET email = ?,
+                password = ?,
+                subscription_type = ?,
+                refresh_token = ?,
+                session_json = ?,
+                status = ?,
+                source = ?,
+                updated_at = ?,
+                last_login_at = ?,
+                last_authorized_at = ?
+            WHERE email = ?
+            """,
+            (
+                *merged,
+                _field(existing["status"]) if _field(existing["status"]) != NULL_VALUE else "active",
+                _merge_source(str(existing["source"] or ""), source),
+                now,
+                last_login_at,
+                last_authorized_at,
+                old_fields[0],
+            ),
+        )
+
+
+def _normalize_account_fields(fields: list[str]) -> list[str] | None:
+    if len(fields) < ACCOUNT_FIELD_COUNT:
+        return None
+    normalized = [_field(fields[index]) for index in range(ACCOUNT_FIELD_COUNT)]
+    normalized[0] = normalized[0].lower()
+    normalized[4] = _session_field(normalized[4])
+    if normalized[2] == NULL_VALUE:
+        normalized[2] = _field(_subscription_from_session_field(normalized[4]))
+    if normalized[0] == NULL_VALUE or normalized[1] == NULL_VALUE:
+        return None
+    return normalized
+
+
+def _account_from_row(row: Any) -> dict[str, str]:
+    return {
+        "email": _field(row["email"]).lower(),
+        "password": _field(row["password"]),
+        "subscription_type": _field(row["subscription_type"]),
+        "refresh_token": _field(row["refresh_token"]),
+        "session": _session_field(row["session_json"]),
+        "status": _field(row["status"]),
+        "source": _field(row["source"]),
+        "created_at": _field(row["created_at"]),
+        "updated_at": _field(row["updated_at"]),
+        "last_login_at": _field(row["last_login_at"]),
+        "last_authorized_at": _field(row["last_authorized_at"]),
+    }
+
+
+def _merge_source(old_source: str, new_source: str) -> str:
+    old_value = _field(old_source)
+    new_value = _field(new_source)
+    if new_value == NULL_VALUE:
+        return old_value if old_value != NULL_VALUE else "manual"
+    if new_value == "import" and old_value not in {NULL_VALUE, "manual", "import"}:
+        return old_value
+    return new_value
+
+
 def _merge_compact_fields(old: list[str], new: list[str]) -> list[str]:
     merged = old[:ACCOUNT_FIELD_COUNT]
     for index, value in enumerate(new[:ACCOUNT_FIELD_COUNT]):
@@ -217,6 +467,18 @@ def _session_json(session: object) -> str:
     if not isinstance(session, (dict, list)):
         return NULL_VALUE
     return json.dumps(session, ensure_ascii=False, separators=(",", ":"))
+
+
+def _subscription_from_session_field(session_field: str) -> str:
+    if session_field == NULL_VALUE:
+        return ""
+    try:
+        session = json.loads(session_field)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(session, (dict, list)):
+        return ""
+    return _extract_subscription_type({"chatgpt_session": {"data": session}})
 
 
 def _extract_subscription_type(token_data: dict[str, Any]) -> str:
@@ -352,3 +614,9 @@ def _read_json_obj(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"会话文件格式错误: {path}")
     return data
+
+
+def _db_manager() -> Any:
+    from utils import db_manager
+
+    return db_manager

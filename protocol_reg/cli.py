@@ -19,12 +19,12 @@ from .flow import RegisterFlow
 from .settings import Settings
 from .storage import (
     NULL_VALUE,
-    load_compact_accounts,
+    load_account_records,
     merge_legacy_rt_txt,
     save_account,
-    save_compact_account,
+    save_account_storage,
     save_login_session,
-    sync_compact_accounts_from_sessions,
+    sync_account_storage,
     try_load_login_session,
 )
 from .utils import make_password
@@ -242,7 +242,7 @@ def _random_email(suffixes: tuple[str, ...], existing_emails: set[str]) -> str:
 
 
 def _choose_authorize_account(accounts_path: Path) -> tuple[str, str] | None:
-    accounts = [account for account in load_compact_accounts(accounts_path) if _usable_saved_account(account)]
+    accounts = [account for account in load_account_records(accounts_path) if _usable_saved_account(account)]
     if not accounts:
         return None
 
@@ -318,7 +318,9 @@ def main() -> None:
     token_output = Path(args.token_output).resolve()
     rt_output = Path(args.rt_output).resolve()
     checkout_output = Path(args.checkout_output).resolve()
-    merge_legacy_rt_txt(Path(args.output).resolve(), rt_output)
+    accounts_output = Path(args.output).resolve()
+    session_file = Path(args.session_file).resolve()
+    merge_legacy_rt_txt(accounts_output, rt_output)
 
     # 优先级：命令行参数（非空 / >0）> 环境变量 > 配置文件。
     proxy = (
@@ -355,8 +357,8 @@ def main() -> None:
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
         proxy=str(proxy or "").strip(),
-        output=Path(args.output).resolve(),
-        session_file=Path(args.session_file).resolve(),
+        output=accounts_output,
+        session_file=session_file,
         license_file=Path(args.license_file).resolve() if args.license_file else None,
         login_delay=max(0, args.login_delay),
         timeout=max(1, args.timeout),
@@ -368,7 +370,7 @@ def main() -> None:
         email_code_poll_interval=max(0.5, float(email_code_poll)),
         email_code_timeout=max(5, int(email_code_timeout)),
     )
-    sync_compact_accounts_from_sessions(settings.output, settings.session_file)
+    sync_account_storage(settings.output, settings.session_file)
 
     existing_emails = _collect_existing_emails(settings.output, rt_output, token_output, settings.session_file)
     selected_account = _choose_authorize_account(settings.output) if mode == "authorize" else None
@@ -399,7 +401,7 @@ def main() -> None:
     try:
         if mode == "register":
             token_data = flow.run(email, password)
-            save_compact_account(settings.output, email, password, token_data)
+            save_account_storage(settings.output, email, password, token_data, source="register")
             account_saved = True
             _print_chatgpt_session(token_data.get("chatgpt_session"))
             checkout = flow.create_plus_trial_checkout(
@@ -410,6 +412,7 @@ def main() -> None:
         elif mode == "login":
             session_data = flow.login(email, password)
             save_login_session(settings.session_file, email, password, session_data)
+            save_account_storage(settings.output, email, password, session_data, source="login")
             _print_chatgpt_session(session_data.get("chatgpt_session"))
             if not args.no_checkout:
                 _handle_checkout(session_data.get("plus_trial_checkout"), checkout_output, args.open_checkout)
@@ -424,11 +427,12 @@ def main() -> None:
                     raise SystemExit("[错误] 单独授权必须有登录会话或输入已有账号密码")
                 session_data = flow.login(email, password)
                 save_login_session(settings.session_file, email, password, session_data)
+                save_account_storage(settings.output, email, password, session_data, source="login")
             else:
                 password = str(session_data.get("password") or "")
             token_data = flow.authorize_from_session(email, session_data)
             save_account(token_output, email, password, token_data)
-            save_compact_account(settings.output, email, password, token_data)
+            save_account_storage(settings.output, email, password, token_data, source="authorize")
     except KeyboardInterrupt:
         raise SystemExit("\n[中断] 用户取消")
     except Exception as exc:
