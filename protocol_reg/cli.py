@@ -103,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--open-checkout", dest="open_checkout", action="store_true", default=True, help="拿到支付链接后自动用系统浏览器打开，默认开启")
     parser.add_argument("--no-open-checkout", dest="open_checkout", action="store_false", help="只保存支付长链接，不自动打开浏览器")
+    parser.add_argument("--incognito-checkout", action="store_true", help="自动打开支付链接时优先使用浏览器无痕模式")
     return parser
 
 
@@ -408,14 +409,14 @@ def main() -> None:
                 flow.http.session,
                 token_data.get("chatgpt_session") if isinstance(token_data.get("chatgpt_session"), dict) else {},
             )
-            _handle_checkout(checkout, checkout_output, args.open_checkout)
+            _handle_checkout(checkout, checkout_output, args.open_checkout, args.incognito_checkout)
         elif mode == "login":
-            session_data = flow.login(email, password)
+            session_data = flow.login(email, password, create_checkout=not args.no_checkout)
             save_login_session(settings.session_file, email, password, session_data)
             save_account_storage(settings.output, email, password, session_data, source="login")
             _print_chatgpt_session(session_data.get("chatgpt_session"))
             if not args.no_checkout:
-                _handle_checkout(session_data.get("plus_trial_checkout"), checkout_output, args.open_checkout)
+                _handle_checkout(session_data.get("plus_trial_checkout"), checkout_output, args.open_checkout, args.incognito_checkout)
             token_data = {}
         else:
             session_data = try_load_login_session(settings.session_file, email)
@@ -425,7 +426,7 @@ def main() -> None:
                     password = input("请输入已有账号密码: ").strip()
                 if not password:
                     raise SystemExit("[错误] 单独授权必须有登录会话或输入已有账号密码")
-                session_data = flow.login(email, password)
+                session_data = flow.login(email, password, create_checkout=False)
                 save_login_session(settings.session_file, email, password, session_data)
                 save_account_storage(settings.output, email, password, session_data, source="login")
             else:
@@ -500,14 +501,14 @@ def _print_plus_trial_checkout(checkout: object) -> None:
         print(json.dumps(raw, ensure_ascii=False, indent=2))
 
 
-def _handle_checkout(checkout: object, output: Path, open_checkout: bool) -> None:
+def _handle_checkout(checkout: object, output: Path, open_checkout: bool, incognito: bool = False) -> None:
     _print_plus_trial_checkout(checkout)
     long_url = _checkout_long_url(checkout)
     if not long_url:
         raise RuntimeError("未获取到支付长链接，停止处理")
     _save_checkout_url(long_url, checkout, output)
     if open_checkout:
-        _open_checkout_url(long_url)
+        _open_checkout_url(long_url, incognito=incognito)
 
 
 def _checkout_long_url(checkout: object) -> str:
@@ -531,8 +532,13 @@ def _save_checkout_url(long_url: str, checkout: object, output: Path) -> None:
     print(f"[Plus] 支付链接已写入: {output}")
 
 
-def _open_checkout_url(long_url: str) -> None:
-    print(f"[Plus] 正在打开支付长链接: {long_url}")
+def _open_checkout_url(long_url: str, *, incognito: bool = False) -> None:
+    mode = "无痕模式" if incognito else "默认浏览器"
+    print(f"[Plus] 正在使用{mode}打开支付长链接: {long_url}")
+    if incognito and _open_with_incognito_browser(long_url):
+        return
+    if incognito:
+        print("[Plus] 无痕模式打开失败，回退到系统默认浏览器")
     if _open_with_system_browser(long_url):
         return
     try:
@@ -541,6 +547,40 @@ def _open_checkout_url(long_url: str) -> None:
     except Exception:
         pass
     print("[Plus] 自动打开浏览器失败，请手动复制上方支付链接")
+
+
+def _open_with_incognito_browser(url: str) -> bool:
+    for command in _incognito_browser_commands(url):
+        if not _command_available(command):
+            continue
+        if _run_open_command(command):
+            return True
+    return False
+
+
+def _incognito_browser_commands(url: str) -> list[list[str]]:
+    if _is_wsl():
+        return [
+            ["cmd.exe", "/c", "start", "", "msedge", "--inprivate", url],
+            ["cmd.exe", "/c", "start", "", "chrome", "--incognito", url],
+            ["cmd.exe", "/c", "start", "", "brave", "--incognito", url],
+        ]
+    commands = [
+        ["google-chrome", "--incognito", url],
+        ["google-chrome-stable", "--incognito", url],
+        ["chromium", "--incognito", url],
+        ["chromium-browser", "--incognito", url],
+        ["brave-browser", "--incognito", url],
+        ["microsoft-edge", "--inprivate", url],
+        ["msedge", "--inprivate", url],
+    ]
+    if sys.platform == "darwin":
+        commands = [
+            ["open", "-na", "Google Chrome", "--args", "--incognito", url],
+            ["open", "-na", "Microsoft Edge", "--args", "--inprivate", url],
+            ["open", "-na", "Brave Browser", "--args", "--incognito", url],
+        ]
+    return commands
 
 
 def _open_with_system_browser(url: str) -> bool:
@@ -555,21 +595,29 @@ def _open_with_system_browser(url: str) -> bool:
         ["open", url],
     ])
     for command in commands:
-        executable = command[0]
-        if executable not in {"cmd.exe"} and shutil.which(executable) is None:
+        if not _command_available(command):
             continue
-        try:
-            completed = subprocess.run(
-                command,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except Exception:
-            continue
-        if completed.returncode == 0:
+        if _run_open_command(command):
             return True
     return False
+
+
+def _command_available(command: list[str]) -> bool:
+    executable = command[0]
+    return executable in {"cmd.exe"} or shutil.which(executable) is not None
+
+
+def _run_open_command(command: list[str]) -> bool:
+    try:
+        completed = subprocess.run(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
 
 
 def _is_wsl() -> bool:

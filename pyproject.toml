@@ -31,6 +31,7 @@ dependencies = [
 
 [project.scripts]
 protocol-reg = "protocol_reg.cli:main"
+protocol-reg-web = "protocol_reg.web:main"
 
 [tool.uv]
 package = true

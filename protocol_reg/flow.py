@@ -98,7 +98,7 @@ class RegisterFlow:
 
         return self._account_session_data(email, password, did, user_agent, target_url, "注册")
 
-    def login(self, email: str, password: str) -> dict[str, Any]:
+    def login(self, email: str, password: str, *, create_checkout: bool = True) -> dict[str, Any]:
         """仅登录已有账号并返回可持久化的登录会话。"""
         print(f"[登录] 初始化 auth_core 环境: {mask_email(email)}")
         did, user_agent = self.auth_core.init_auth(
@@ -124,10 +124,11 @@ class RegisterFlow:
         print("[登录] 登录完成，已保存当前会话 cookies")
         session_data = self._session_snapshot(email, password, did, user_agent, current)
         session_data["chatgpt_session"] = self.fetch_chatgpt_session(self.http.session)
-        session_data["plus_trial_checkout"] = self.create_plus_trial_checkout(
-            self.http.session,
-            session_data["chatgpt_session"],
-        )
+        if create_checkout:
+            session_data["plus_trial_checkout"] = self.create_plus_trial_checkout(
+                self.http.session,
+                session_data["chatgpt_session"],
+            )
         return session_data
 
     def authorize_from_session(self, email: str, session_data: dict[str, Any]) -> dict[str, Any]:

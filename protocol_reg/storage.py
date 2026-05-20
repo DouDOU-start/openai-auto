@@ -95,6 +95,191 @@ def load_accounts_db() -> list[dict[str, str]]:
     return [_account_from_row(row) for row in rows]
 
 
+def list_account_rows(search: str = "", status: str = "", plan: str = "") -> list[dict[str, str]]:
+    """按条件读取账号管理页列表。"""
+
+    init_accounts_db()
+    where: list[str] = []
+    params: list[str] = []
+    search_value = search.strip()
+    if search_value:
+        like = f"%{search_value}%"
+        where.append("(email LIKE ? OR subscription_type LIKE ? OR source LIKE ? OR status LIKE ?)")
+        params.extend([like, like, like, like])
+    if status and status != "all":
+        where.append("status = ?")
+        params.append(status)
+    if plan and plan != "all":
+        where.append("subscription_type = ?")
+        params.append(plan)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        rows = db_manager.execute_sql(
+            cursor,
+            f"""
+            SELECT id, email, password, subscription_type, refresh_token, session_json,
+                   status, source, created_at, updated_at, last_login_at, last_authorized_at
+            FROM accounts
+            {where_sql}
+            ORDER BY updated_at DESC, id DESC
+            """,
+            tuple(params),
+        ).fetchall()
+    return [_account_from_row(row) for row in rows]
+
+
+def get_account_db(account_id: int) -> dict[str, str] | None:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, email, password, subscription_type, refresh_token, session_json,
+                   status, source, created_at, updated_at, last_login_at, last_authorized_at
+            FROM accounts
+            WHERE id = ?
+            """,
+            (account_id,),
+        ).fetchone()
+    return _account_from_row(row) if row is not None else None
+
+
+def save_account_db_record(data: dict[str, Any], account_id: int | None = None) -> dict[str, str]:
+    """保存管理页账号表单，空的可选字段会明确写为 null。"""
+
+    fields = _normalize_account_fields(
+        [
+            str(data.get("email") or ""),
+            str(data.get("password") or ""),
+            str(data.get("subscription_type") or ""),
+            str(data.get("refresh_token") or ""),
+            str(data.get("session") or data.get("session_json") or ""),
+        ]
+    )
+    if fields is None:
+        raise ValueError("邮箱和密码不能为空")
+
+    status = _field(data.get("status") or "active")
+    if status == NULL_VALUE:
+        status = "active"
+    source = _field(data.get("source") or "manual")
+    if source == NULL_VALUE:
+        source = "manual"
+
+    init_accounts_db()
+    db_manager = _db_manager()
+    now = utc_now()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        if account_id is not None:
+            existing = db_manager.execute_sql(
+                cursor,
+                "SELECT id, created_at, last_login_at, last_authorized_at FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(f"账号不存在: {account_id}")
+            db_manager.execute_sql(
+                cursor,
+                """
+                UPDATE accounts
+                SET email = ?,
+                    password = ?,
+                    subscription_type = ?,
+                    refresh_token = ?,
+                    session_json = ?,
+                    status = ?,
+                    source = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (*fields, status, source, now, account_id),
+            )
+            saved_id = account_id
+        else:
+            existing = db_manager.execute_sql(
+                cursor,
+                "SELECT id FROM accounts WHERE email = ?",
+                (fields[0],),
+            ).fetchone()
+            if existing is None:
+                db_manager.execute_sql(
+                    cursor,
+                    """
+                    INSERT INTO accounts (
+                        email, password, subscription_type, refresh_token, session_json,
+                        status, source, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (*fields, status, source, now, now),
+                )
+                saved_id = int(cursor.lastrowid)
+            else:
+                saved_id = int(existing["id"])
+                db_manager.execute_sql(
+                    cursor,
+                    """
+                    UPDATE accounts
+                    SET password = ?,
+                        subscription_type = ?,
+                        refresh_token = ?,
+                        session_json = ?,
+                        status = ?,
+                        source = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (fields[1], fields[2], fields[3], fields[4], status, source, now, saved_id),
+                )
+
+    saved = get_account_db(saved_id)
+    if saved is None:
+        raise RuntimeError("账号保存后读取失败")
+    return saved
+
+
+def delete_account_db(account_id: int) -> bool:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(cursor, "DELETE FROM accounts WHERE id = ?", (account_id,))
+        return cursor.rowcount > 0
+
+
+def account_stats_db() -> dict[str, Any]:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn() as conn:
+        cursor = db_manager.get_cursor(conn)
+        total = cursor.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        with_rt = cursor.execute(
+            "SELECT COUNT(*) FROM accounts WHERE refresh_token IS NOT NULL AND refresh_token != 'null' AND refresh_token != ''"
+        ).fetchone()[0]
+        with_session = cursor.execute(
+            "SELECT COUNT(*) FROM accounts WHERE session_json IS NOT NULL AND session_json != 'null' AND session_json != ''"
+        ).fetchone()[0]
+        plans = cursor.execute(
+            "SELECT subscription_type, COUNT(*) FROM accounts GROUP BY subscription_type ORDER BY COUNT(*) DESC"
+        ).fetchall()
+        statuses = cursor.execute(
+            "SELECT status, COUNT(*) FROM accounts GROUP BY status ORDER BY COUNT(*) DESC"
+        ).fetchall()
+    return {
+        "total": total,
+        "with_rt": with_rt,
+        "with_session": with_session,
+        "plans": {str(plan or NULL_VALUE): count for plan, count in plans},
+        "statuses": {str(item_status or NULL_VALUE): count for item_status, count in statuses},
+    }
+
+
 def import_compact_accounts_to_db(path: Path) -> None:
     init_accounts_db()
     for account in load_compact_accounts(path):
@@ -369,7 +554,7 @@ def _normalize_account_fields(fields: list[str]) -> list[str] | None:
 
 
 def _account_from_row(row: Any) -> dict[str, str]:
-    return {
+    account = {
         "email": _field(row["email"]).lower(),
         "password": _field(row["password"]),
         "subscription_type": _field(row["subscription_type"]),
@@ -382,6 +567,9 @@ def _account_from_row(row: Any) -> dict[str, str]:
         "last_login_at": _field(row["last_login_at"]),
         "last_authorized_at": _field(row["last_authorized_at"]),
     }
+    if "id" in row.keys():
+        account["id"] = str(row["id"])
+    return account
 
 
 def _merge_source(old_source: str, new_source: str) -> str:

@@ -74,6 +74,12 @@ uv run protocol-reg --mode register --proxy http://127.0.0.1:7897
 uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --no-open-checkout
 ```
 
+自动打开支付链接时使用无痕模式：
+
+```bash
+uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --incognito-checkout
+```
+
 仅登录并保存会话：
 
 ```bash
@@ -149,6 +155,20 @@ data/data.db
 
 账号数据库表为 `accounts`，字段包含 `email`、`password`、`subscription_type`、`refresh_token`、`session_json`、`status`、`source`、`created_at`、`updated_at`、`last_login_at`、`last_authorized_at`。程序启动时会把 `data/accounts.txt` 和 `data/sessions.json` 导入数据库，再从数据库导出兼容的 `data/accounts.txt`。
 
+启动本地账号管理 Web 页面：
+
+```bash
+uv run protocol-reg-web
+```
+
+默认监听 `0.0.0.0:8765`，会读取 `config/protocol-reg.yaml`，同一局域网设备可以访问 `http://本机局域网IP:8765`。页面支持搜索、筛选、新建、编辑、删除账号记录，以及手动同步导入和导出 `data/accounts.txt`。页面里的“执行任务”面板可以直接执行 `register`、`login` 和 `authorize`；遇到邮箱验证码时任务会暂停并等待页面提交验证码，配置了 cloudflare-email 时仍会自动读取验证码。
+
+需要指定数据库、配置文件、代理或端口时：
+
+```bash
+uv run protocol-reg-web --host 0.0.0.0 --port 8765 --db data/data.db --config config/protocol-reg.yaml --proxy http://127.0.0.1:7897 --output data/accounts.txt
+```
+
 账号文件格式：
 
 ```text
@@ -200,7 +220,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 成功后把账号数据写入 `data/data.db` 的 `accounts` 表，并同步导出 `data/accounts.txt`，缺失字段写 `null`。
 - 程序调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 hosted checkout 链接。
 - 没有获取到支付长链接时，支付自动化直接失败，但已注册账号不会丢失。
-- 程序默认会自动用系统浏览器打开支付链接，可交给 Tampermonkey 脚本继续填写页面；指定 `--no-open-checkout` 时只保存长链接。
+- 程序默认会自动用系统浏览器打开支付链接，可交给 Tampermonkey 脚本继续填写页面；指定 `--incognito-checkout` 时优先使用 Chrome/Edge/Brave/Chromium 无痕模式打开，指定 `--no-open-checkout` 时只保存长链接。
 
 登录流程：
 
@@ -208,7 +228,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 如触发邮箱二次验证，人工查看邮箱后在终端输入验证码。
 - 程序请求 `https://chatgpt.com/api/auth/session` 获取身份信息。
 - 程序更新 `data/data.db` 的 `accounts` 表，并同步导出 `data/accounts.txt`。
-- 程序调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 hosted checkout 链接。
+- 默认调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 hosted checkout 链接；指定 `--no-checkout` 时不请求 checkout。
 - 程序保存登录 cookies，不换 token。
 
 授权流程：
@@ -216,6 +236,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 从账号数据库选择已有账号，自动读取邮箱和密码；也可以选择手动输入邮箱。
 - 程序优先读取 `login` 模式保存的 cookies。
 - 没有可用 cookies 时，已选择账号会直接使用保存的密码即时登录；手动输入邮箱时会再要求输入密码。
+- 授权模式下的即时登录只用于获取 cookies，不请求 Stripe/checkout。
 - 遇到账号选择页时，程序会自动选择当前输入邮箱。
 - 程序走 OAuth PKCE 换取 token。
 - 成功后请求 `https://chatgpt.com/api/auth/session` 获取身份信息。
