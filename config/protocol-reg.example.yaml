@@ -2,6 +2,8 @@
 # 复制为 config/protocol-reg.yaml 后按需填写；实际配置文件默认不提交，避免泄露密钥。
 # 注册、登录和授权请求代理；支持 http://用户名:密码@主机:端口 这类格式，留空则不使用代理。
 proxy: ""
+# Web 端任务最大并发数；多余任务会排队等待。
+max_concurrency: 3
 # 注册模式邮箱留空时，会从这些后缀中随机生成邮箱；可写多个后缀。
 email_suffixes:
   - "example.com"

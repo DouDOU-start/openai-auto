@@ -62,22 +62,22 @@ uv run protocol-reg
 uv run protocol-reg --mode register --proxy http://127.0.0.1:7897
 ```
 
-注册成功后会默认自动打开支付页面：
+注册成功后默认只显示并保存支付长链接，不自动打开浏览器：
 
 ```bash
 uv run protocol-reg --mode register --proxy http://127.0.0.1:7897
 ```
 
-只保存支付长链接、不打开浏览器：
+需要自动打开支付页面时：
 
 ```bash
-uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --no-open-checkout
+uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --open-checkout
 ```
 
 自动打开支付链接时使用无痕模式：
 
 ```bash
-uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --incognito-checkout
+uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --open-checkout --incognito-checkout
 ```
 
 仅登录并保存会话：
@@ -133,6 +133,12 @@ cp config/protocol-reg.example.yaml config/protocol-reg.yaml
 proxy: "http://用户名:密码@主机:端口"
 ```
 
+配置文件还支持设置 Web 端任务最大并发数，超出的任务会自动排队：
+
+```yaml
+max_concurrency: 3
+```
+
 配置文件支持设置注册邮箱随机后缀。注册模式下邮箱留空时，会从这些后缀中随机生成邮箱，并避开本地已有记录：
 
 ```yaml
@@ -153,7 +159,7 @@ data/accounts.txt
 data/data.db
 ```
 
-账号数据库表为 `accounts`，字段包含 `email`、`password`、`subscription_type`、`refresh_token`、`session_json`、`status`、`source`、`created_at`、`updated_at`、`last_login_at`、`last_authorized_at`。程序启动时会把 `data/accounts.txt` 和 `data/sessions.json` 导入数据库，再从数据库导出兼容的 `data/accounts.txt`。
+账号数据库表为 `accounts`，字段包含 `email`、`password`、`subscription_type`、`refresh_token`、`session_json`、`checkout_url`、`stock_status`、`status`、`created_at`、`updated_at`、`last_login_at`、`last_authorized_at`。程序启动时会把 `data/accounts.txt` 和 `data/sessions.json` 导入数据库，再从数据库导出兼容的 `data/accounts.txt`。
 
 启动本地账号管理 Web 页面：
 
@@ -161,12 +167,12 @@ data/data.db
 uv run protocol-reg-web
 ```
 
-默认监听 `0.0.0.0:8765`，会读取 `config/protocol-reg.yaml`，同一局域网设备可以访问 `http://本机局域网IP:8765`。页面支持搜索、筛选、新建、编辑、删除账号记录，以及手动同步导入和导出 `data/accounts.txt`。页面里的“执行任务”面板可以直接执行 `register`、`login` 和 `authorize`；遇到邮箱验证码时任务会暂停并等待页面提交验证码，配置了 cloudflare-email 时仍会自动读取验证码。
+默认监听 `0.0.0.0:8765`，会读取 `config/protocol-reg.yaml`，同一局域网设备可以访问 `http://本机局域网IP:8765`。页面支持搜索、筛选、新建、编辑、删除账号记录，可以直接把账号标记为“出库”或恢复为“未出库”，也支持多选后批量出库、批量恢复未出库、批量自动获取订阅类型和批量删除。页面也可以查看和复制账号的 checkout 长链接，以及手动同步导入和导出 `data/accounts.txt`。页面里的“执行任务”面板可以直接执行 `register`、`login` 和 `authorize`；注册模式默认勾选随机邮箱、随机密码和生成 checkout，可填写任务数一次启动多个注册任务，多余任务会按 `max_concurrency` 排队。执行任务面板里的“自动注册”可以设置间隔秒数和每轮注册数，启动后会立即投放第一轮，之后按间隔继续投放注册任务。遇到邮箱验证码时任务会暂停并等待页面提交验证码，配置了 cloudflare-email 时仍会自动读取验证码。
 
 需要指定数据库、配置文件、代理或端口时：
 
 ```bash
-uv run protocol-reg-web --host 0.0.0.0 --port 8765 --db data/data.db --config config/protocol-reg.yaml --proxy http://127.0.0.1:7897 --output data/accounts.txt
+uv run protocol-reg-web --host 0.0.0.0 --port 8765 --db data/data.db --config config/protocol-reg.yaml --proxy http://127.0.0.1:7897 --max-concurrency 3 --output data/accounts.txt
 ```
 
 账号文件格式：
@@ -188,6 +194,8 @@ data/tokens.jsonl
 ```text
 data/checkout_urls.jsonl
 ```
+
+Web 或 CLI 生成 checkout 后会继续追加写入 `data/checkout_urls.jsonl`，并把长链接同步写入账号数据库的 `checkout_url` 字段；`data/accounts.txt` 仍保持五段兼容格式，不额外追加 checkout 字段。账号详情里可以点击“生成/重新生成”重新获取 checkout 长链接，适合原本没有链接或需要刷新链接的账号；也可以点击订阅类型旁边的“自动获取”，使用已保存 session 的 `accessToken` 请求 ChatGPT accounts/check 接口并更新 `subscription_type`。
 
 登录会话输出：
 
@@ -220,7 +228,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 成功后把账号数据写入 `data/data.db` 的 `accounts` 表，并同步导出 `data/accounts.txt`，缺失字段写 `null`。
 - 程序调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 hosted checkout 链接。
 - 没有获取到支付长链接时，支付自动化直接失败，但已注册账号不会丢失。
-- 程序默认会自动用系统浏览器打开支付链接，可交给 Tampermonkey 脚本继续填写页面；指定 `--incognito-checkout` 时优先使用 Chrome/Edge/Brave/Chromium 无痕模式打开，指定 `--no-open-checkout` 时只保存长链接。
+- 程序默认只显示并保存支付长链接，不自动打开浏览器；指定 `--open-checkout` 时才自动打开，配合 `--incognito-checkout` 会优先使用 Chrome/Edge/Brave/Chromium 无痕模式打开。
 
 登录流程：
 

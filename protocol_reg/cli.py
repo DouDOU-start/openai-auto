@@ -26,6 +26,7 @@ from .storage import (
     save_login_session,
     sync_account_storage,
     try_load_login_session,
+    update_account_checkout_url_db,
 )
 from .utils import make_password
 
@@ -101,8 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过 Plus/Stripe checkout 链路（仅登录/授权，不生成支付链接）",
     )
-    parser.add_argument("--open-checkout", dest="open_checkout", action="store_true", default=True, help="拿到支付链接后自动用系统浏览器打开，默认开启")
-    parser.add_argument("--no-open-checkout", dest="open_checkout", action="store_false", help="只保存支付长链接，不自动打开浏览器")
+    parser.add_argument("--open-checkout", dest="open_checkout", action="store_true", default=False, help="拿到支付链接后自动用系统浏览器打开，默认关闭")
+    parser.add_argument("--no-open-checkout", dest="open_checkout", action="store_false", help="只保存并显示支付长链接，不自动打开浏览器")
     parser.add_argument("--incognito-checkout", action="store_true", help="自动打开支付链接时优先使用浏览器无痕模式")
     return parser
 
@@ -409,14 +410,20 @@ def main() -> None:
                 flow.http.session,
                 token_data.get("chatgpt_session") if isinstance(token_data.get("chatgpt_session"), dict) else {},
             )
-            _handle_checkout(checkout, checkout_output, args.open_checkout, args.incognito_checkout)
+            _handle_checkout(checkout, checkout_output, args.open_checkout, args.incognito_checkout, email=email)
         elif mode == "login":
             session_data = flow.login(email, password, create_checkout=not args.no_checkout)
             save_login_session(settings.session_file, email, password, session_data)
             save_account_storage(settings.output, email, password, session_data, source="login")
             _print_chatgpt_session(session_data.get("chatgpt_session"))
             if not args.no_checkout:
-                _handle_checkout(session_data.get("plus_trial_checkout"), checkout_output, args.open_checkout, args.incognito_checkout)
+                _handle_checkout(
+                    session_data.get("plus_trial_checkout"),
+                    checkout_output,
+                    args.open_checkout,
+                    args.incognito_checkout,
+                    email=email,
+                )
             token_data = {}
         else:
             session_data = try_load_login_session(settings.session_file, email)
@@ -501,14 +508,24 @@ def _print_plus_trial_checkout(checkout: object) -> None:
         print(json.dumps(raw, ensure_ascii=False, indent=2))
 
 
-def _handle_checkout(checkout: object, output: Path, open_checkout: bool, incognito: bool = False) -> None:
+def _handle_checkout(
+    checkout: object,
+    output: Path,
+    open_checkout: bool,
+    incognito: bool = False,
+    *,
+    email: str = "",
+) -> str:
     _print_plus_trial_checkout(checkout)
     long_url = _checkout_long_url(checkout)
     if not long_url:
         raise RuntimeError("未获取到支付长链接，停止处理")
-    _save_checkout_url(long_url, checkout, output)
+    _save_checkout_url(long_url, checkout, output, email=email)
+    if email:
+        update_account_checkout_url_db(email, long_url)
     if open_checkout:
         _open_checkout_url(long_url, incognito=incognito)
+    return long_url
 
 
 def _checkout_long_url(checkout: object) -> str:
@@ -521,9 +538,10 @@ def _checkout_long_url(checkout: object) -> str:
     return ""
 
 
-def _save_checkout_url(long_url: str, checkout: object, output: Path) -> None:
+def _save_checkout_url(long_url: str, checkout: object, output: Path, *, email: str = "") -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     record = {
+        "email": email.strip().lower() or None,
         "long_url": long_url,
         "status_code": checkout.get("status_code") if isinstance(checkout, dict) else None,
     }

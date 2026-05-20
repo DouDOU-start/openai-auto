@@ -11,6 +11,8 @@ import yaml
 class AppConfig:
     # 协议请求代理
     proxy: str = ""
+    # Web 端任务最大并发数
+    max_concurrency: int = 3
     # 注册邮箱随机生成后缀
     email_suffixes: tuple[str, ...] = ()
     # Cloudflare-email 验证码 API
@@ -29,6 +31,7 @@ def load_app_config(path: Path) -> AppConfig:
         return AppConfig()
 
     proxy = str(raw.get("proxy") or "").strip()
+    max_concurrency = _positive_int(raw.get("max_concurrency"), 3)
     email_suffixes = _load_email_suffixes(raw.get("email_suffixes"))
 
     mail = raw.get("email_code")
@@ -63,6 +66,7 @@ def load_app_config(path: Path) -> AppConfig:
 
     return AppConfig(
         proxy=proxy,
+        max_concurrency=max_concurrency,
         email_suffixes=email_suffixes,
         email_code_api=_s("api", ""),
         email_code_key=_s("key", ""),
@@ -75,6 +79,7 @@ def load_app_config(path: Path) -> AppConfig:
 def config_template() -> dict[str, Any]:
     return {
         "proxy": "",
+        "max_concurrency": 3,
         "email_suffixes": [],
         "email_code": {
             "api": "",
@@ -107,3 +112,11 @@ def _load_email_suffixes(value: object) -> tuple[str, ...]:
         seen.add(suffix)
         suffixes.append(suffix)
     return tuple(suffixes)
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
