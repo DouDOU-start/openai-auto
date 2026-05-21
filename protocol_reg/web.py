@@ -496,6 +496,19 @@ class AutoRegisterScheduler:
                 self._wake.set()
             return self.status()
 
+    def configure(self, payload: AutoRegisterPayload) -> dict[str, Any]:
+        interval = max(1, int(payload.interval_seconds or 1))
+        batch_count = max(1, min(20, int(payload.batch_count or 1)))
+        with self._lock:
+            self._interval_seconds = interval
+            self._batch_count = batch_count
+            self._create_checkout = bool(payload.create_checkout)
+            self._last_error = ""
+            if self._enabled:
+                self._next_run_at = time.time() + interval
+                self._wake.set()
+            return self.status()
+
     def stop(self) -> dict[str, Any]:
         with self._lock:
             self._enabled = False
@@ -604,6 +617,10 @@ def create_app(
     @app.get("/tasks", response_class=HTMLResponse)
     def tasks_page() -> str:
         return _render_html_page("tasks")
+
+    @app.get("/settings", response_class=HTMLResponse)
+    def settings_page() -> str:
+        return _render_html_page("settings")
 
     @app.get("/api/accounts")
     def api_accounts(
@@ -859,6 +876,10 @@ def create_app(
     def api_auto_register_start(payload: AutoRegisterPayload) -> dict[str, Any]:
         return {"auto": auto_scheduler.start(payload), "queue": manager.stats()}
 
+    @app.post("/api/ops/auto-register/config")
+    def api_auto_register_config(payload: AutoRegisterPayload) -> dict[str, Any]:
+        return {"auto": auto_scheduler.configure(payload), "queue": manager.stats()}
+
     @app.post("/api/ops/auto-register/stop")
     def api_auto_register_stop() -> dict[str, Any]:
         return {"auto": auto_scheduler.stop(), "queue": manager.stats()}
@@ -881,12 +902,16 @@ def _payload_data(payload: AccountPayload) -> dict[str, str]:
 
 
 def _render_html_page(page: str) -> str:
-    mode = "tasks" if str(page).strip().lower() == "tasks" else "accounts"
+    requested = str(page).strip().lower()
+    mode = requested if requested in {"accounts", "tasks", "settings"} else "accounts"
+    titles = {
+        "accounts": "Protocol Reg 账号管理",
+        "tasks": "Protocol Reg 任务控制台",
+        "settings": "Protocol Reg 设置",
+    }
     html = HTML_PAGE.replace("<body>", f'<body data-page="{mode}">', 1)
-    if mode == "tasks":
-        html = html.replace("<title>Protocol Reg 账号管理</title>", "<title>Protocol Reg 任务控制台</title>", 1)
-        html = html.replace('id="pageNavLink" href="/tasks">任务页面', 'id="pageNavLink" href="/">账号管理', 1)
-        html = html.replace('id="runBtn" href="/tasks">任务页面', 'id="runBtn" href="/">账号管理', 1)
+    if mode != "accounts":
+        html = html.replace("<title>Protocol Reg 账号管理</title>", f"<title>{titles[mode]}</title>", 1)
     return html
 
 
@@ -1415,6 +1440,7 @@ def main() -> None:
     print(f"[Web] 配置文件: {runtime.config_path}")
     print(f"[Web] accounts.txt 导出: {accounts_output}")
     print(f"[Web] 任务最大并发: {runtime.max_concurrency}")
+    print("[Web] 页面路径: / 账号管理 · /tasks 任务控制台 · /settings 自动注册设置")
     proxy_pool = _resolve_runtime_proxy_pool(runtime, app_cfg)
     if len(proxy_pool) > 1:
         print(f"[Web] 代理池: {len(proxy_pool)} 个，任务按轮询分配")
@@ -1604,9 +1630,22 @@ HTML_PAGE = r"""
       z-index: 1;
     }
 
+    .page-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
     .page-nav {
       min-height: 42px;
       padding-inline: 16px;
+    }
+
+    .page-nav.is-active {
+      background: var(--ink);
+      color: #fff;
+      box-shadow: 0 12px 28px rgba(17,16,13,.18);
     }
 
     .stat-card {
@@ -1642,19 +1681,27 @@ HTML_PAGE = r"""
       display: block;
     }
 
-    body[data-page="tasks"] {
+    body[data-page="tasks"],
+    body[data-page="settings"] {
       overflow: auto;
     }
 
-    body[data-page="tasks"] .shell {
+    body[data-page="tasks"] .shell,
+    body[data-page="settings"] .shell {
       height: auto;
       min-height: 0;
       padding-bottom: 0;
     }
 
     body[data-page="tasks"] .workspace,
+    body[data-page="settings"] .workspace,
     body[data-page="tasks"] #accountModalBackdrop,
+    body[data-page="settings"] #accountModalBackdrop,
     body[data-page="tasks"] #stats {
+      display: none !important;
+    }
+
+    body[data-page="settings"] #stats {
       display: none !important;
     }
 
@@ -1662,7 +1709,8 @@ HTML_PAGE = r"""
       display: none !important;
     }
 
-    body[data-page="tasks"] #opsModalBackdrop {
+    body[data-page="tasks"] #opsModalBackdrop,
+    body[data-page="settings"] #opsModalBackdrop {
       position: static;
       inset: auto;
       z-index: auto;
@@ -1676,7 +1724,8 @@ HTML_PAGE = r"""
       margin: 0 auto 24px;
     }
 
-    body[data-page="tasks"] #opsModalBackdrop .modal {
+    body[data-page="tasks"] #opsModalBackdrop .modal,
+    body[data-page="settings"] #opsModalBackdrop .modal {
       width: 100%;
       max-width: none;
       max-height: none;
@@ -1685,7 +1734,99 @@ HTML_PAGE = r"""
       animation: rise .35s ease both;
     }
 
-    body[data-page="tasks"] #opsModalCloseBtn {
+    body[data-page="tasks"] #opsModalCloseBtn,
+    body[data-page="settings"] #opsModalCloseBtn {
+      display: none;
+    }
+
+    body[data-page="tasks"] .auto-panel {
+      display: none;
+    }
+
+    body[data-page="tasks"] .ops {
+      grid-template-columns: minmax(340px, 430px) minmax(0, 1fr);
+      align-items: start;
+      align-content: start;
+      min-height: calc(100vh - 164px);
+    }
+
+    body[data-page="tasks"] .ops-stack {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
+
+    body[data-page="tasks"] .ops-row {
+      padding: 14px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 20px;
+      background: rgba(255,255,255,.34);
+    }
+
+    body[data-page="tasks"] .op-credentials {
+      padding: 14px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 20px;
+      background: rgba(255,255,255,.28);
+    }
+
+    body[data-page="tasks"] .prompt-box {
+      padding: 14px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 18px;
+      background: rgba(255,255,255,.28);
+    }
+
+    body[data-page="tasks"] .ops-meta {
+      min-height: 0;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 20px;
+      background: rgba(255,255,255,.26);
+    }
+
+    body[data-page="tasks"] .job-list {
+      max-height: none;
+      min-height: 220px;
+      flex: 1;
+    }
+
+    body[data-page="tasks"] .job-console {
+      min-height: 240px;
+    }
+
+    body[data-page="settings"] .ops {
+      grid-template-columns: minmax(0, 1fr);
+      max-width: 920px;
+      margin: 0 auto;
+      align-content: start;
+      min-height: calc(100vh - 164px);
+    }
+
+    body[data-page="settings"] .ops-stack {
+      display: none;
+    }
+
+    body[data-page="settings"] .ops-meta {
+      display: grid;
+      gap: 12px;
+    }
+
+    body[data-page="settings"] .auto-panel {
+      border-radius: 24px;
+      padding: 18px;
+    }
+
+    body[data-page="settings"] .job-list {
+      max-height: none;
+      min-height: 260px;
+    }
+
+    body[data-page="settings"] #jobState {
       display: none;
     }
 
@@ -2207,6 +2348,12 @@ HTML_PAGE = r"""
       min-width: 0;
     }
 
+    .ops-stack {
+      display: grid;
+      gap: 14px;
+      min-width: 0;
+    }
+
     .ops-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) 110px auto;
@@ -2384,7 +2531,7 @@ HTML_PAGE = r"""
 
     .auto-controls {
       display: grid;
-      grid-template-columns: repeat(2, minmax(110px, 1fr)) minmax(130px, auto) auto auto;
+      grid-template-columns: repeat(2, minmax(110px, 1fr)) minmax(170px, auto) auto auto auto;
       gap: 10px;
       align-items: end;
     }
@@ -2397,6 +2544,24 @@ HTML_PAGE = r"""
     }
 
     .auto-field input { width: 100%; }
+
+    .auto-check {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 0;
+      padding: 0;
+      color: var(--muted);
+      font: 12px var(--mono);
+      white-space: nowrap;
+      justify-self: start;
+      align-self: end;
+    }
+
+    .auto-check input {
+      width: auto;
+      accent-color: var(--accent);
+    }
 
     .auto-summary {
       color: var(--muted);
@@ -2518,6 +2683,13 @@ HTML_PAGE = r"""
       .ops-row { grid-template-columns: 1fr; }
       .auto-controls { grid-template-columns: 1fr; }
       .auto-head { align-items: flex-start; flex-direction: column; }
+      body[data-page="tasks"] #opsModalBackdrop,
+      body[data-page="settings"] #opsModalBackdrop {
+        width: min(100vw - 20px, 1440px);
+      }
+      body[data-page="tasks"] .ops {
+        grid-template-columns: 1fr;
+      }
       .list { grid-template-columns: 1fr; }
       .card-actions { justify-content: flex-start; flex-wrap: wrap; }
     }
@@ -2532,7 +2704,11 @@ HTML_PAGE = r"""
       </div>
       <div class="top-actions">
         <div class="stats" id="stats"></div>
-        <a class="button-link ghost page-nav" id="pageNavLink" href="/tasks">任务页面</a>
+        <nav class="page-links" aria-label="页面导航">
+          <a class="button-link ghost page-nav" id="accountsNavLink" href="/">账号管理</a>
+          <a class="button-link ghost page-nav" id="tasksNavLink" href="/tasks">任务页面</a>
+          <a class="button-link ghost page-nav" id="settingsNavLink" href="/settings">设置</a>
+        </nav>
       </div>
     </header>
 
@@ -2644,8 +2820,8 @@ HTML_PAGE = r"""
     <div class="modal" role="dialog" aria-modal="true">
       <div class="editor-head">
         <div>
-          <div class="editor-title">执行任务</div>
-          <div class="eyebrow">注册、登录、授权独立运行</div>
+          <div class="editor-title" id="opsTitle">执行任务</div>
+          <div class="eyebrow" id="opsHint">注册、登录、授权独立运行</div>
         </div>
         <div class="header-actions">
           <span class="tab-badge" id="jobState" data-status="idle">空闲</span>
@@ -2654,18 +2830,25 @@ HTML_PAGE = r"""
       </div>
       <section class="tab-panel" data-panel="ops">
         <div class="ops">
-          <div class="ops-row">
-            <select id="opMode">
-              <option value="register">register 注册</option>
-              <option value="login">login 登录</option>
-              <option value="authorize">authorize 授权</option>
-            </select>
-            <input id="opCount" type="number" min="1" max="20" value="1" title="注册模式下可一次启动多个任务" />
-            <button class="secondary" type="button" id="startJobBtn">开始执行</button>
-          </div>
-          <div class="grid-2">
-            <input id="opEmail" placeholder="执行邮箱，留空可使用当前表单" />
-            <input id="opPassword" placeholder="执行密码，留空可使用当前表单" />
+          <div class="ops-stack">
+            <div class="ops-row">
+              <select id="opMode">
+                <option value="register">register 注册</option>
+                <option value="login">login 登录</option>
+                <option value="authorize">authorize 授权</option>
+              </select>
+              <input id="opCount" type="number" min="1" max="20" value="1" title="注册模式下可一次启动多个任务" />
+              <button class="secondary" type="button" id="startJobBtn">开始执行</button>
+            </div>
+            <div class="grid-2 op-credentials">
+              <input id="opEmail" placeholder="执行邮箱，留空可使用当前表单" />
+              <input id="opPassword" placeholder="执行密码，留空可使用当前表单" />
+            </div>
+            <div class="prompt-box" id="promptBox">
+              <input id="promptInput" placeholder="输入邮箱验证码后继续" />
+              <button type="button" id="submitPromptBtn">提交验证码</button>
+            </div>
+            <div class="job-console" id="jobLog">任务日志会显示在这里。</div>
           </div>
           <div class="auto-panel">
             <div class="auto-head">
@@ -2677,7 +2860,9 @@ HTML_PAGE = r"""
             </div>
             <div class="auto-controls">
               <label class="auto-field">间隔秒数<input id="autoInterval" type="number" min="1" value="300" /></label>
-              <label class="auto-field">每轮注册数<input id="autoBatchCount" type="number" min="1" max="20" value="3" /></label>
+              <label class="auto-field">每轮注册数<input id="autoBatchCount" type="number" min="1" max="20" value="1" /></label>
+              <label class="auto-check"><input id="autoCreateCheckout" type="checkbox" checked /> 自动生成 checkout</label>
+              <button class="ghost" type="button" id="autoSaveBtn">保存配置</button>
               <button class="secondary" type="button" id="autoStartBtn">启动自动注册</button>
               <button class="ghost" type="button" id="autoStopBtn">停止</button>
             </div>
@@ -2686,11 +2871,6 @@ HTML_PAGE = r"""
             <div class="ops-summary" id="queueSummary">当前没有运行中的任务</div>
             <div class="job-list" id="jobList"></div>
           </div>
-          <div class="prompt-box" id="promptBox">
-            <input id="promptInput" placeholder="输入邮箱验证码后继续" />
-            <button type="button" id="submitPromptBtn">提交验证码</button>
-          </div>
-          <div class="job-console" id="jobLog">任务日志会显示在这里。</div>
         </div>
       </section>
     </div>
@@ -2741,21 +2921,43 @@ HTML_PAGE = r"""
 
     function setupPageChrome() {
       const brand = $('brandMark');
-      const link = $('pageNavLink');
-      if (pageMode === 'tasks') {
-        document.title = 'Protocol Reg 任务控制台';
-        if (brand) brand.textContent = '任务控制台';
-        if (link) {
-          link.href = '/';
-          link.textContent = '账号管理';
-        }
-        return;
-      }
-      document.title = 'Protocol Reg 账号管理';
-      if (brand) brand.textContent = '账号库控制台';
-      if (link) {
-        link.href = '/tasks';
-        link.textContent = '任务页面';
+      const opsTitle = $('opsTitle');
+      const opsHint = $('opsHint');
+      const titles = {
+        accounts: {
+          title: '账号管理',
+          brand: '账号库控制台',
+          opsTitle: '账号管理',
+          opsHint: '查看、筛选、导入、导出',
+        },
+        tasks: {
+          title: '任务控制台',
+          brand: '任务控制台',
+          opsTitle: '执行任务',
+          opsHint: '手动投放注册、登录与授权',
+        },
+        settings: {
+          title: '设置',
+          brand: '设置中心',
+          opsTitle: '自动注册设置',
+          opsHint: '保存配置并启停自动注册',
+        },
+      };
+      const links = [
+        ['accountsNavLink', '/'],
+        ['tasksNavLink', '/tasks'],
+        ['settingsNavLink', '/settings'],
+      ];
+      const resolved = titles[pageMode] || titles.accounts;
+      document.title = `Protocol Reg ${resolved.title}`;
+      if (brand) brand.textContent = resolved.brand;
+      if (opsTitle) opsTitle.textContent = resolved.opsTitle;
+      if (opsHint) opsHint.textContent = resolved.opsHint;
+      for (const [id, href] of links) {
+        const node = $(id);
+        if (!node) continue;
+        node.href = href;
+        node.classList.toggle('is-active', href === window.location.pathname);
       }
     }
 
@@ -2972,10 +3174,7 @@ HTML_PAGE = r"""
     }
 
     function openOpsModal() {
-      if (pageMode !== 'tasks') {
-        window.location.href = '/tasks';
-        return;
-      }
+      if (pageMode !== 'tasks') return;
       $('opsModalBackdrop').classList.add('is-open');
     }
 
@@ -3319,24 +3518,31 @@ HTML_PAGE = r"""
       const auto = state.auto || {};
       const enabled = Boolean(auto.enabled);
       const badge = $('autoState');
-      if (enabled && auto.interval_seconds && document.activeElement !== $('autoInterval')) {
+      if (auto.interval_seconds && document.activeElement !== $('autoInterval')) {
         $('autoInterval').value = String(auto.interval_seconds);
       }
-      if (enabled && auto.batch_count && document.activeElement !== $('autoBatchCount')) {
+      if (auto.batch_count && document.activeElement !== $('autoBatchCount')) {
         $('autoBatchCount').value = String(auto.batch_count);
+      }
+      if (document.activeElement !== $('autoCreateCheckout')) {
+        $('autoCreateCheckout').checked = Boolean(auto.create_checkout ?? true);
       }
       badge.textContent = enabled ? '运行中' : '未启动';
       badge.dataset.status = enabled ? 'running' : 'idle';
-      $('autoStartBtn').textContent = enabled ? '更新设置' : '启动自动注册';
+      $('autoStartBtn').textContent = enabled ? '已启用' : '启动自动注册';
+      $('autoStartBtn').disabled = enabled;
       $('autoStopBtn').disabled = !enabled;
+      $('autoSaveBtn').disabled = false;
       if (!enabled) {
-        $('autoSummary').textContent = '未启动。启动后会立即投放第一轮注册任务，然后按间隔继续投放。';
+        const checkoutText = Boolean(auto.create_checkout ?? true) ? '生成 checkout' : '不生成 checkout';
+        $('autoSummary').textContent = `已保存：每 ${auto.interval_seconds || 300}s 投放 ${auto.batch_count || 1} 个注册任务 · ${checkoutText} · 点击“启动自动注册”开始执行。`;
         return;
       }
       const last = fmtUnixSeconds(auto.last_run_at);
       const nextLeft = secondsLeft(auto.next_run_at);
       const error = auto.last_error ? ` · 最近错误：${auto.last_error}` : '';
-      $('autoSummary').textContent = `每 ${auto.interval_seconds}s 投放 ${auto.batch_count} 个注册任务 · 已投放 ${auto.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`;
+      const checkoutText = Boolean(auto.create_checkout ?? true) ? '生成 checkout' : '不生成 checkout';
+      $('autoSummary').textContent = `每 ${auto.interval_seconds}s 投放 ${auto.batch_count} 个注册任务 · ${checkoutText} · 已投放 ${auto.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`;
     }
 
     function renderQueueSummary() {
@@ -3480,8 +3686,20 @@ HTML_PAGE = r"""
       return {
         interval_seconds: Math.max(1, Math.trunc(Number($('autoInterval').value || 1))),
         batch_count: Math.min(20, Math.max(1, Math.trunc(Number($('autoBatchCount').value || 1)))),
-        create_checkout: true,
+        create_checkout: $('autoCreateCheckout').checked,
       };
+    }
+
+    async function saveAutoRegisterConfig() {
+      const data = await request('/api/ops/auto-register/config', {
+        method: 'POST',
+        body: JSON.stringify(autoRegisterPayload()),
+      });
+      state.auto = data.auto || {};
+      state.queue = data.queue || state.queue;
+      renderAutoPanel();
+      renderQueueSummary();
+      toast('自动注册配置已保存');
     }
 
     async function startAutoRegister() {
@@ -3546,7 +3764,7 @@ HTML_PAGE = r"""
       badge.textContent = jobStatusLabel(current.status);
       badge.dataset.status = current.status || 'idle';
       updateCheckoutButton();
-      if (current.status === 'waiting') openOpsModal();
+      if (current.status === 'waiting' && pageMode === 'tasks') openOpsModal();
       const lines = (current.logs || []).join('\n');
       const result = current.result && Object.keys(current.result).length ? `\n\n[结果] ${JSON.stringify(current.result, null, 2)}` : '';
       const error = current.error ? `\n\n[错误] ${current.error}` : '';
@@ -3695,6 +3913,7 @@ HTML_PAGE = r"""
     $('regenCheckoutBtn').addEventListener('click', () => regenerateCheckout().catch((err) => toast(err.message)));
     $('refreshSessionBtn').addEventListener('click', () => refreshSession().catch((err) => toast(err.message)));
     $('startJobBtn').addEventListener('click', () => startJob().catch((err) => toast(err.message)));
+    $('autoSaveBtn').addEventListener('click', () => saveAutoRegisterConfig().catch((err) => toast(err.message)));
     $('autoStartBtn').addEventListener('click', () => startAutoRegister().catch((err) => toast(err.message)));
     $('autoStopBtn').addEventListener('click', () => stopAutoRegister().catch((err) => toast(err.message)));
     $('submitPromptBtn').addEventListener('click', () => submitPrompt().catch((err) => toast(err.message)));
@@ -3759,7 +3978,7 @@ HTML_PAGE = r"""
     });
 
     setupPageChrome();
-    if (pageMode === 'tasks') {
+    if (pageMode === 'tasks' || pageMode === 'settings') {
       state.returnAccountId = new URLSearchParams(window.location.search).get('returnAccount') || '';
       syncOperationControls();
       loadJobBoard().catch((err) => toast(err.message));
