@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import random
+import secrets
 import string
+import time
 from datetime import datetime
 
 
@@ -30,6 +32,21 @@ def make_password(length: int = 20) -> str:
     chars = required + rest
     random.shuffle(chars)
     return "".join(chars)
+
+
+def make_random_email(suffixes: tuple[str, ...], used_emails: set[str] | None = None) -> str:
+    """生成高熵随机邮箱，并避开传入的已占用邮箱。"""
+
+    if not suffixes:
+        raise ValueError("随机邮箱需要先在配置文件设置 email_suffixes")
+    used = {item.strip().lower() for item in (used_emails or set()) if item.strip()}
+    for _ in range(1000):
+        suffix = secrets.choice(suffixes)
+        local = f"oa{time.time_ns():x}{secrets.token_hex(8)}"
+        email = f"{local}@{suffix}".lower()
+        if email not in used:
+            return email
+    raise ValueError("随机邮箱生成失败：配置后缀下的候选邮箱均与已有记录冲突")
 
 
 def random_profile() -> dict[str, str]:

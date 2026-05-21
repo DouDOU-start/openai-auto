@@ -9,7 +9,6 @@ from pathlib import Path
 import secrets
 import sqlite3
 import socket
-import string
 import sys
 import threading
 import time
@@ -47,7 +46,7 @@ from .storage import (
     update_account_subscription_type_db,
     update_account_stock_status_db,
 )
-from .utils import make_password
+from .utils import make_password, make_random_email
 
 
 class AccountPayload(BaseModel):
@@ -1085,18 +1084,9 @@ def _email_exists(email: str) -> bool:
 
 
 def _random_email(suffixes: tuple[str, ...], reserved_emails: set[str] | None = None) -> str:
-    if not suffixes:
-        raise ValueError("随机邮箱需要先在配置文件设置 email_suffixes")
-    alphabet = string.ascii_lowercase + string.digits
     existing = {account.get("email", "") for account in list_account_rows()}
     reserved = {item.strip().lower() for item in (reserved_emails or set()) if item.strip()}
-    for _ in range(1000):
-        suffix = secrets.choice(suffixes)
-        local = "oa" + "".join(secrets.choice(alphabet) for _ in range(12))
-        email = f"{local}@{suffix}".lower()
-        if email not in existing and email not in reserved:
-            return email
-    raise ValueError("随机邮箱生成失败：配置后缀下的候选邮箱均与已有记录冲突")
+    return make_random_email(suffixes, existing | reserved)
 
 
 def _checkout_long_url(checkout: object) -> str:

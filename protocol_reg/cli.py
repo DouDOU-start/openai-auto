@@ -5,9 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
-import secrets
 import shutil
-import string
 import subprocess
 import sys
 import webbrowser
@@ -28,7 +26,7 @@ from .storage import (
     try_load_login_session,
     update_account_checkout_url_db,
 )
-from .utils import make_password
+from .utils import make_password, make_random_email
 
 
 _MODE_OPTIONS = (
@@ -231,16 +229,10 @@ def _collect_existing_emails(*paths: Path) -> set[str]:
 
 
 def _random_email(suffixes: tuple[str, ...], existing_emails: set[str]) -> str:
-    if not suffixes:
-        raise SystemExit("[错误] 邮箱留空随机生成时，必须先在配置文件设置 email_suffixes")
-    alphabet = string.ascii_lowercase + string.digits
-    for _ in range(1000):
-        suffix = secrets.choice(suffixes)
-        local = "oa" + "".join(secrets.choice(alphabet) for _ in range(12))
-        email = f"{local}@{suffix}".lower()
-        if email not in existing_emails:
-            return email
-    raise SystemExit("[错误] 随机邮箱生成失败：配置后缀下的候选邮箱均与已有记录冲突")
+    try:
+        return make_random_email(suffixes, existing_emails)
+    except ValueError as exc:
+        raise SystemExit(f"[错误] {exc}") from exc
 
 
 def _choose_authorize_account(accounts_path: Path) -> tuple[str, str] | None:
