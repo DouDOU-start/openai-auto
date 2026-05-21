@@ -382,87 +382,28 @@ class RegisterFlow:
         return current
 
     def _email_otp(self, email: str, did: str, user_agent: str, ctx: dict[str, Any]) -> str:
-        print("[注册] 触发邮箱验证码发送")
-        send_resp = self.http.post_json(
-            url="https://auth.openai.com/api/accounts/email-otp/send",
+        return self._solve_email_otp(
+            http=self.http,
+            label="注册",
+            email=email,
             did=did,
-            flow="authorize_continue",
-            proxy=self.settings.proxy,
             user_agent=user_agent,
             ctx=ctx,
-            referer="https://auth.openai.com/create-account/password",
-            payload={},
+            send_referer="https://auth.openai.com/create-account/password",
+            prompt_text="请输入邮箱收到的 6 位验证码；未收到可直接回车触发重发: ",
         )
-        if send_resp.status_code != 200:
-            print(f"[警告] 发信接口返回 HTTP {send_resp.status_code}: {send_resp.text[:300]}")
-        code = ""
-        if self.email_code.enabled():
-            print("[注册] 等待邮箱验证码（cloudflare-email）")
-            code = self.email_code.wait_code(email).code
-            print(f"[注册] 已获取验证码: {code}")
-        else:
-            code = self.prompt("请输入邮箱收到的 6 位验证码: ").strip()
-        if not code:
-            raise RuntimeError("验证码不能为空")
-        otp_resp = self.http.post_json(
-            url="https://auth.openai.com/api/accounts/email-otp/validate",
-            did=did,
-            flow="authorize_continue",
-            proxy=self.settings.proxy,
-            user_agent=user_agent,
-            ctx=ctx,
-            referer="https://auth.openai.com/email-verification",
-            payload={"code": code},
-        )
-        self._ensure_status(otp_resp, 200, "验证码校验")
-        return self._next_url(otp_resp.json())
 
     def _authorize_email_otp(self, did: str, user_agent: str, ctx: dict[str, Any]) -> str:
-        # When cloudflare-email is enabled, we always poll for the latest unread OTP.
-        # The fallback interactive path keeps the old resend flow.
-        if self.email_code.enabled():
-            recipient = str(ctx.get("email") or "").strip()
-            if not recipient:
-                # ctx may not always carry email, fall back to interactive.
-                recipient = ""
-            if recipient:
-                print("[登录] 等待邮箱验证码（cloudflare-email）")
-                code = self.email_code.wait_code(recipient).code
-                print(f"[登录] 已获取验证码: {code}")
-            else:
-                code = self.prompt("请输入登录邮箱验证码: ").strip()
-        else:
-            code = self.prompt("请输入登录邮箱验证码；未收到可直接回车触发重发: ").strip()
-        if not code:
-            send_resp = self.http.post_json(
-                url="https://auth.openai.com/api/accounts/email-otp/send",
-                did=did,
-                flow="authorize_continue",
-                proxy=self.settings.proxy,
-                user_agent=user_agent,
-                ctx=ctx,
-                referer="https://auth.openai.com/email-verification",
-                payload={},
-            )
-            if send_resp.status_code != 200:
-                print(f"[警告] 登录验证码发信返回 HTTP {send_resp.status_code}: {send_resp.text[:300]}")
-            code = self.prompt("请输入登录邮箱验证码: ").strip()
-        if not code:
-            raise RuntimeError("登录邮箱验证码不能为空")
-        otp_resp = self.http.post_json(
-            url="https://auth.openai.com/api/accounts/email-otp/validate",
+        next_page = self._solve_email_otp(
+            http=self.http,
+            label="登录",
+            email=str(ctx.get("email") or ""),
             did=did,
-            flow="authorize_continue",
-            proxy=self.settings.proxy,
             user_agent=user_agent,
             ctx=ctx,
-            referer="https://auth.openai.com/email-verification",
-            payload={"code": code},
+            send_referer="https://auth.openai.com/email-verification",
+            prompt_text="请输入登录邮箱验证码；未收到可直接回车触发重发: ",
         )
-        self._ensure_status(otp_resp, 200, "登录邮箱验证码校验")
-        next_page = self._next_url(otp_resp.json())
-        if not next_page:
-            raise RuntimeError("登录邮箱验证码校验后未返回下一步地址")
         _, current = self.http.follow_redirects(next_page)
         return current
 
@@ -536,28 +477,16 @@ class RegisterFlow:
                 raise RuntimeError("密码登录后未返回下一步地址")
             _, current = login_http.follow_redirects(next_page)
             if current.endswith("/email-verification"):
-                if self.email_code.enabled():
-                    print("[登录] 等待邮箱验证码（cloudflare-email）")
-                    code = self.email_code.wait_code(email).code
-                    print(f"[登录] 已获取验证码: {code}")
-                else:
-                    code = self.prompt("登录二次验证：请输入邮箱验证码: ").strip()
-                if not code:
-                    raise RuntimeError("登录二次验证码不能为空")
-                otp_resp = login_http.post_json(
-                    url="https://auth.openai.com/api/accounts/email-otp/validate",
+                next_page = self._solve_email_otp(
+                    http=login_http,
+                    label="登录",
+                    email=email,
                     did=did,
-                    flow="authorize_continue",
-                    proxy=self.settings.proxy,
                     user_agent=user_agent,
                     ctx=ctx,
-                    referer="https://auth.openai.com/email-verification",
-                    payload={"code": code},
+                    send_referer="https://auth.openai.com/email-verification",
+                    prompt_text="登录二次验证：请输入邮箱验证码；未收到可直接回车触发重发: ",
                 )
-                self._ensure_status(otp_resp, 200, "登录二次验证码")
-                next_page = self._next_url(otp_resp.json())
-                if not next_page:
-                    raise RuntimeError("登录二次验证码校验后未返回下一步地址")
                 _, current = login_http.follow_redirects(next_page)
             if "/workspace" in current or current.endswith("/consent"):
                 selected = self._select_workspace_with_session(login_http.session, did, current)
@@ -786,3 +715,144 @@ class RegisterFlow:
         if resp.status_code == 403:
             raise RuntimeError(f"{label}触发 403，当前授权/代理/风控环境不可用")
         raise RuntimeError(f"{label}失败 HTTP {resp.status_code}: {resp.text[:500]}")
+
+    def _solve_email_otp(
+        self,
+        http: OpenAIHTTP,
+        *,
+        email: str,
+        did: str,
+        user_agent: str,
+        ctx: dict[str, Any],
+        label: str,
+        send_referer: str,
+        prompt_text: str,
+    ) -> str:
+        max_retries = max(1, int(self.settings.otp_max_retries or 1))
+        recipient = str(email or ctx.get("email") or "").strip()
+        last_error = ""
+        for attempt in range(1, max_retries + 1):
+            print(f"[{label}] 触发邮箱验证码发送（第 {attempt}/{max_retries} 轮）")
+            try:
+                send_resp = http.post_json(
+                    url="https://auth.openai.com/api/accounts/email-otp/send",
+                    did=did,
+                    flow="authorize_continue",
+                    proxy=self.settings.proxy,
+                    user_agent=user_agent,
+                    ctx=ctx,
+                    referer=send_referer,
+                    payload={},
+                )
+            except Exception as exc:
+                last_error = f"发信异常: {exc}"
+                if attempt < max_retries:
+                    print(f"[警告] {label} 发信异常，准备重试: {exc}")
+                    continue
+                break
+            if send_resp.status_code != 200:
+                print(f"[警告] {label} 发信接口返回 HTTP {send_resp.status_code}: {send_resp.text[:300]}")
+
+            try:
+                code = self._read_email_otp_code(label, recipient, prompt_text)
+            except Exception as exc:
+                last_error = f"读取验证码失败: {exc}"
+                if attempt < max_retries:
+                    print(f"[警告] {label} 读取验证码失败，准备重试: {exc}")
+                    continue
+                break
+
+            if not code:
+                last_error = "验证码不能为空"
+                if attempt < max_retries:
+                    print(f"[警告] {label} 验证码为空，准备重试")
+                    continue
+                break
+
+            try:
+                otp_resp = http.post_json(
+                    url="https://auth.openai.com/api/accounts/email-otp/validate",
+                    did=did,
+                    flow="authorize_continue",
+                    proxy=self.settings.proxy,
+                    user_agent=user_agent,
+                    ctx=ctx,
+                    referer="https://auth.openai.com/email-verification",
+                    payload={"code": code},
+                )
+            except Exception as exc:
+                last_error = f"验证码校验异常: {exc}"
+                if attempt < max_retries:
+                    print(f"[警告] {label} 验证码校验异常，准备重试: {exc}")
+                    continue
+                break
+
+            retry_reason = self._retryable_email_otp_error(otp_resp)
+            if retry_reason:
+                last_error = retry_reason
+                if attempt < max_retries:
+                    print(f"[警告] {label} 验证码校验失败，准备重试: {retry_reason}")
+                    continue
+                break
+
+            self._ensure_status(otp_resp, 200, f"{label}验证码校验")
+            next_page = self._next_url(otp_resp.json())
+            if next_page:
+                return next_page
+
+            last_error = "验证码校验后未返回下一步地址"
+            if attempt < max_retries:
+                print(f"[警告] {label} 验证码校验后未返回下一步地址，准备重试")
+                continue
+            break
+
+        raise RuntimeError(f"{label}邮箱验证码校验失败，已重试 {max_retries} 轮: {last_error}")
+
+    def _read_email_otp_code(self, label: str, recipient: str, prompt_text: str) -> str:
+        if self.email_code.enabled() and recipient:
+            print(f"[{label}] 等待邮箱验证码（cloudflare-email）")
+            result = self.email_code.wait_code(recipient, max_attempts=self.settings.otp_poll_max_attempts)
+            code = result.code.strip()
+            print(f"[{label}] 已获取验证码: {code}")
+            return code
+        return self.prompt(prompt_text).strip()
+
+    @staticmethod
+    def _retryable_email_otp_error(resp: Any) -> str:
+        text = RegisterFlow._response_text(resp)
+        lowered = text.lower()
+        if "wrong_email_otp_code" in lowered:
+            return "wrong_email_otp_code"
+        if "otp" in lowered and any(token in lowered for token in ("wrong", "invalid", "expired")):
+            return text[:300] or "邮箱验证码校验失败"
+        if resp.status_code in {429, 500, 502, 503, 504}:
+            return text[:300] or f"HTTP {resp.status_code}"
+        return ""
+
+    @staticmethod
+    def _response_text(resp: Any) -> str:
+        try:
+            data = resp.json()
+        except Exception:
+            return str(getattr(resp, "text", "") or "").strip()
+        parts: list[str] = []
+        RegisterFlow._collect_text(data, parts)
+        text = " ".join(part for part in parts if part).strip()
+        return text or str(getattr(resp, "text", "") or "").strip()
+
+    @staticmethod
+    def _collect_text(value: Any, parts: list[str]) -> None:
+        if value is None:
+            return
+        if isinstance(value, (str, int, float, bool)):
+            text = str(value).strip()
+            if text:
+                parts.append(text)
+            return
+        if isinstance(value, dict):
+            for item in value.values():
+                RegisterFlow._collect_text(item, parts)
+            return
+        if isinstance(value, list):
+            for item in value:
+                RegisterFlow._collect_text(item, parts)

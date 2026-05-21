@@ -57,7 +57,7 @@ class EmailCodeClient:
             url,
             headers=headers,
             json=payload,
-            proxies=self._settings.proxies,
+            proxies=self._settings.email_code_proxies,
             verify=self._settings.ssl_verify,
             timeout=self._settings.timeout,
         )
@@ -73,11 +73,15 @@ class EmailCodeClient:
         message_id = int(mid) if isinstance(mid, int) or (isinstance(mid, str) and mid.isdigit()) else None
         return EmailCodeResult(code=code, message_id=message_id, raw=data if isinstance(data, dict) else None)
 
-    def wait_code(self, recipient: str) -> EmailCodeResult:
+    def wait_code(self, recipient: str, *, max_attempts: int | None = None) -> EmailCodeResult:
         deadline = time.time() + float(self._settings.email_code_timeout)
         interval = float(self._settings.email_code_poll_interval)
         last_err: Exception | None = None
+        attempts = 0
         while time.time() < deadline:
+            if max_attempts is not None and attempts >= max_attempts:
+                break
+            attempts += 1
             try:
                 result = self.fetch_code_once(recipient, mark_read=True)
                 if result is not None:
@@ -88,8 +92,10 @@ class EmailCodeClient:
             time.sleep(interval)
 
         suffix = self._settings.email_code_sender_suffix or "openai.com"
-        msg = f"等待邮箱验证码超时（{self._settings.email_code_timeout}s）：{recipient} sender_suffix={suffix}"
+        msg = (
+            f"等待邮箱验证码超时（{self._settings.email_code_timeout}s, attempts={attempts}）："
+            f"{recipient} sender_suffix={suffix}"
+        )
         if last_err is not None:
             msg += f"，最后一次错误: {last_err}"
         raise RuntimeError(msg)
-

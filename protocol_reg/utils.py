@@ -3,7 +3,6 @@ from __future__ import annotations
 import random
 import secrets
 import string
-import time
 from datetime import datetime
 
 
@@ -35,18 +34,37 @@ def make_password(length: int = 20) -> str:
 
 
 def make_random_email(suffixes: tuple[str, ...], used_emails: set[str] | None = None) -> str:
-    """生成高熵随机邮箱，并避开传入的已占用邮箱。"""
+    """生成更像正常用户的随机邮箱，并避开传入的已占用邮箱。"""
 
     if not suffixes:
         raise ValueError("随机邮箱需要先在配置文件设置 email_suffixes")
     used = {item.strip().lower() for item in (used_emails or set()) if item.strip()}
     for _ in range(1000):
         suffix = secrets.choice(suffixes)
-        local = f"oa{time.time_ns():x}{secrets.token_hex(8)}"
-        email = f"{local}@{suffix}".lower()
-        if email not in used:
-            return email
+        for local in _make_email_local_parts():
+            email = f"{local}@{suffix}".lower()
+            if email not in used:
+                return email
     raise ValueError("随机邮箱生成失败：配置后缀下的候选邮箱均与已有记录冲突")
+
+
+def _make_email_local_parts() -> tuple[str, ...]:
+    first = _email_token(secrets.choice(FIRST_NAMES))
+    last = _email_token(secrets.choice(LAST_NAMES))
+    suffix = f"{secrets.randbelow(100):02d}"
+    return (
+        f"{first}.{last}",
+        f"{first}{last}",
+        f"{first[0]}{last}",
+        f"{first}.{last}{suffix}",
+        f"{first}{last}{suffix}",
+        f"{first[0]}{last}{suffix}",
+    )
+
+
+def _email_token(value: str) -> str:
+    token = "".join(ch for ch in value.lower() if ch.isalnum())
+    return token or "user"
 
 
 def random_profile() -> dict[str, str]:

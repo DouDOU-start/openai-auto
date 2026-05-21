@@ -133,6 +133,20 @@ cp config/protocol-reg.example.yaml config/protocol-reg.yaml
 proxy: "http://用户名:密码@主机:端口"
 ```
 
+也可以配置多个代理，程序会在 CLI 运行、Web 任务、批量订阅类型刷新等出网调用之间按轮询平均分配；`proxies` 优先级高于单个 `proxy`：
+
+```yaml
+proxies:
+  - "http://用户名:密码@主机1:端口"
+  - "http://用户名:密码@主机2:端口"
+```
+
+环境变量也支持多代理：
+
+```bash
+PROTOCOL_REG_PROXIES="http://127.0.0.1:7897,http://127.0.0.1:7898" uv run protocol-reg-web
+```
+
 配置文件还支持设置 Web 端任务最大并发数，超出的任务会自动排队：
 
 ```yaml
@@ -146,6 +160,19 @@ email_suffixes:
   - "example.com"
   - "example.net"
 ```
+
+邮箱前缀本身会优先从名字表里拼出几种常见形态，例如 `firstname.lastname`、`firstnamelastname`、`flastname`，再带上两位数字后缀，最后才和随机后缀拼成完整地址。程序会把生成结果和已有记录做去重，CLI 会扫描 `accounts.txt`、`accounts_rt.txt`、`tokens.jsonl`、`sessions.json`，Web 会额外检查数据库和当前排队任务。
+
+邮箱验证码配置里还可以调重试和代理策略：
+
+```yaml
+email_code:
+  max_otp_retries: 5
+  otp_poll_max_attempts: 20
+  use_proxy: false
+```
+
+这个开关也兼容 `use_proxy_for_email` 写法。
 
 注册账号输出：
 

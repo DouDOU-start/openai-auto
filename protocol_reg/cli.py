@@ -14,7 +14,8 @@ import yaml
 
 from .config import config_template, load_app_config
 from .flow import RegisterFlow
-from .settings import Settings
+from .proxy_pool import pick_proxy_from_pool
+from .settings import Settings, proxy_preview, resolve_proxy_pool
 from .storage import (
     NULL_VALUE,
     load_account_records,
@@ -72,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="生成默认配置文件到 --config 路径后退出",
     )
-    parser.add_argument("--proxy", default="", help="注册代理，例如 http://127.0.0.1:7897")
+    parser.add_argument("--proxy", default="", help="注册代理；多个代理可用逗号分隔，例如 http://127.0.0.1:7897,http://127.0.0.1:7898")
     parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="注册账号 TXT 输出路径")
     parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
     # 兼容旧 accounts_rt.txt：启动时自动合并到 accounts.txt，不再单独写入。
@@ -317,11 +318,18 @@ def main() -> None:
     merge_legacy_rt_txt(accounts_output, rt_output)
 
     # 优先级：命令行参数（非空 / >0）> 环境变量 > 配置文件。
-    proxy = (
-        str(args.proxy or "").strip()
-        or os.environ.get("PROTOCOL_REG_PROXY", "").strip()
-        or cfg.proxy
+    proxy_pool = resolve_proxy_pool(
+        str(args.proxy or "").strip(),
+        os.environ.get("PROTOCOL_REG_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_PROXY", ""),
+        getattr(cfg, "proxies", ()),
+        getattr(cfg, "proxy", ""),
     )
+    proxy = pick_proxy_from_pool(proxy_pool)
+    if len(proxy_pool) > 1:
+        print(f"[代理] 已配置 {len(proxy_pool)} 个代理，本次 CLI 轮询使用: {proxy_preview(proxy)}")
+    elif proxy:
+        print(f"[代理] 使用代理: {proxy_preview(proxy)}")
     email_code_api = (
         str(args.email_code_api or "").strip()
         or os.environ.get("EMAIL_CODE_API", "").strip()
@@ -348,6 +356,12 @@ def main() -> None:
         if float(args.email_code_poll) > 0
         else float(os.environ.get("EMAIL_CODE_POLL", "0") or 0) or cfg.email_code_poll
     )
+    otp_max_retries = _positive_int(os.environ.get("EMAIL_CODE_MAX_OTP_RETRIES"), cfg.otp_max_retries)
+    otp_poll_max_attempts = _positive_int(
+        os.environ.get("EMAIL_CODE_OTP_POLL_MAX_ATTEMPTS"),
+        cfg.otp_poll_max_attempts,
+    )
+    use_proxy_for_email = _boolish(os.environ.get("EMAIL_CODE_USE_PROXY"), cfg.use_proxy_for_email)
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
         proxy=str(proxy or "").strip(),
@@ -363,6 +377,9 @@ def main() -> None:
         email_code_sender_suffix=str(email_code_sender_suffix or "openai.com").strip() or "openai.com",
         email_code_poll_interval=max(0.5, float(email_code_poll)),
         email_code_timeout=max(5, int(email_code_timeout)),
+        otp_max_retries=max(1, int(otp_max_retries)),
+        otp_poll_max_attempts=max(1, int(otp_poll_max_attempts)),
+        use_proxy_for_email=bool(use_proxy_for_email),
     )
     sync_account_storage(settings.output, settings.session_file)
 
@@ -637,3 +654,22 @@ def _is_wsl() -> bool:
         return "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower()
     except Exception:
         return False
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _boolish(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default

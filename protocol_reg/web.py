@@ -23,7 +23,8 @@ from pydantic import BaseModel
 
 from .config import AppConfig, load_app_config
 from .flow import RegisterFlow
-from .settings import Settings
+from .proxy_pool import pick_proxy_from_pool
+from .settings import Settings, proxy_preview, resolve_proxy_pool
 from .storage import (
     ACCOUNT_STATUS_ABANDONED,
     NULL_VALUE,
@@ -117,6 +118,7 @@ class WebJob:
     id: str
     mode: str
     email: str
+    proxy: str = ""
     status: str = "pending"
     queue_position: int = 0
     prompt: str = ""
@@ -189,6 +191,7 @@ class JobWriter:
     def __init__(self, job: WebJob):
         self.job = job
         self._buffer = ""
+        self._terminal_buffer = ""
 
     def write(self, data: str) -> int:
         self._buffer += data
@@ -201,6 +204,25 @@ class JobWriter:
         if self._buffer:
             self.job.log(self._buffer)
             self._buffer = ""
+
+    def write_terminal(self, fallback: Any, data: str) -> int:
+        self._terminal_buffer += data
+        while "\n" in self._terminal_buffer:
+            line, self._terminal_buffer = self._terminal_buffer.split("\n", 1)
+            self._write_terminal_line(fallback, line.rstrip("\r"))
+        return len(data)
+
+    def flush_terminal(self, fallback: Any) -> None:
+        if self._terminal_buffer:
+            self._write_terminal_line(fallback, self._terminal_buffer.rstrip("\r"))
+            self._terminal_buffer = ""
+
+    def _write_terminal_line(self, fallback: Any, line: str) -> None:
+        fallback.write(f"{self._terminal_prefix()} {line}\n")
+
+    def _terminal_prefix(self) -> str:
+        email = self.job.email.strip() or "未命名"
+        return f"[任务 {self.job.id[:8]} {self.job.mode} {email}]"
 
 
 class _ThreadBoundStream:
@@ -227,8 +249,9 @@ class _ThreadBoundStream:
             return self._fallback.write(data)
         written = writer.write(data)
         try:
-            self._fallback.write(data)
-            self._fallback.flush()
+            with _stream_router_lock:
+                writer.write_terminal(self._fallback, data)
+                self._fallback.flush()
         except Exception:
             pass
         return written
@@ -240,7 +263,9 @@ class _ThreadBoundStream:
             return
         writer.flush()
         try:
-            self._fallback.flush()
+            with _stream_router_lock:
+                writer.flush_terminal(self._fallback)
+                self._fallback.flush()
         except Exception:
             pass
 
@@ -278,7 +303,7 @@ class JobManager:
         self.runtime = runtime
         self.max_concurrency = max(1, int(runtime.max_concurrency or 1))
         self._jobs: dict[str, WebJob] = {}
-        self._queue: list[tuple[WebJob, OperationPayload]] = []
+        self._queue: list[tuple[WebJob, OperationPayload, str]] = []
         self._running_ids: set[str] = set()
         self._lock = threading.RLock()
 
@@ -297,11 +322,16 @@ class JobManager:
             resolved_payload = payload.model_copy(
                 update={"mode": mode, "email": email, "password": password},
             )
-            job = WebJob(id=secrets.token_hex(8), mode=mode, email=email)
+            proxy, proxy_count = self._next_proxy_locked(cfg)
+            job = WebJob(id=secrets.token_hex(8), mode=mode, email=email, proxy=proxy)
             self._jobs[job.id] = job
-            self._queue.append((job, resolved_payload))
+            self._queue.append((job, resolved_payload, proxy))
             self._refresh_queue_positions_locked()
             job.log(f"[队列] 已入队，排队位置 {job.queue_position}，并发上限 {self.max_concurrency}")
+            if proxy_count > 1:
+                job.log(f"[代理] 轮询选择 {proxy_preview(proxy)}（代理池 {proxy_count} 个）")
+            elif proxy:
+                job.log(f"[代理] 使用 {proxy_preview(proxy)}")
             to_start = self._schedule_locked()
         self._start_workers(to_start)
         return job
@@ -343,32 +373,32 @@ class JobManager:
         }
 
     def _refresh_queue_positions_locked(self) -> None:
-        for index, (job, _) in enumerate(self._queue, start=1):
+        for index, (job, _, _) in enumerate(self._queue, start=1):
             job.set_status("pending", queue_position=index)
 
-    def _schedule_locked(self) -> list[tuple[WebJob, OperationPayload]]:
-        to_start: list[tuple[WebJob, OperationPayload]] = []
+    def _schedule_locked(self) -> list[tuple[WebJob, OperationPayload, str]]:
+        to_start: list[tuple[WebJob, OperationPayload, str]] = []
         while len(self._running_ids) < self.max_concurrency and self._queue:
-            job, payload = self._queue.pop(0)
+            job, payload, proxy = self._queue.pop(0)
             self._running_ids.add(job.id)
             job.set_status("running", queue_position=0)
             job.log(f"[队列] 获得执行槽，当前运行 {len(self._running_ids)}/{self.max_concurrency}")
-            to_start.append((job, payload))
+            to_start.append((job, payload, proxy))
         self._refresh_queue_positions_locked()
         return to_start
 
-    def _start_workers(self, jobs: list[tuple[WebJob, OperationPayload]]) -> None:
-        for job, payload in jobs:
-            thread = threading.Thread(target=self._run, args=(job, payload), daemon=True)
+    def _start_workers(self, jobs: list[tuple[WebJob, OperationPayload, str]]) -> None:
+        for job, payload, proxy in jobs:
+            thread = threading.Thread(target=self._run, args=(job, payload, proxy), daemon=True)
             thread.start()
 
-    def _run(self, job: WebJob, payload: OperationPayload) -> None:
+    def _run(self, job: WebJob, payload: OperationPayload, proxy: str) -> None:
         writer = JobWriter(job)
         stdout_ctx, stderr_ctx = _bind_job_output(writer)
         with stdout_ctx, stderr_ctx:
             flow: RegisterFlow | None = None
             try:
-                settings = _settings_from_runtime(self.runtime)
+                settings = _settings_from_runtime(self.runtime, proxy=proxy)
                 email = payload.email.strip().lower()
                 password = payload.password
                 if payload.mode.strip().lower() == "register" and _email_exists(email):
@@ -406,6 +436,10 @@ class JobManager:
             return
         for job in sorted(completed, key=lambda item: item.updated_at)[: len(self._jobs) - 120]:
             self._jobs.pop(job.id, None)
+
+    def _next_proxy_locked(self, cfg: AppConfig) -> tuple[str, int]:
+        pool = _resolve_runtime_proxy_pool(self.runtime, cfg)
+        return pick_proxy_from_pool(pool), len(pool)
 
     def _archive_failed_job(self, job: WebJob) -> None:
         try:
@@ -619,11 +653,16 @@ def create_app(
     @app.patch("/api/accounts/batch/subscription-type/refresh")
     def api_batch_refresh_subscription_type(payload: BatchIdsPayload) -> dict[str, Any]:
         ids = _unique_positive_ids(payload.ids)
+        proxy_pool = _resolve_runtime_proxy_pool(runtime)
         results: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for account_id in ids:
             try:
-                saved = _refresh_account_subscription_type(account_id, runtime)
+                saved = _refresh_account_subscription_type(
+                    account_id,
+                    runtime,
+                    proxy=pick_proxy_from_pool(proxy_pool),
+                )
                 results.append(_account_summary(saved))
             except Exception as exc:
                 errors.append({"id": account_id, "error": str(exc)})
@@ -693,7 +732,11 @@ def create_app(
     @app.patch("/api/accounts/{account_id}/subscription-type/refresh")
     def api_refresh_subscription_type(account_id: int) -> dict[str, Any]:
         try:
-            saved = _refresh_account_subscription_type(account_id, runtime)
+            saved = _refresh_account_subscription_type(
+                account_id,
+                runtime,
+                proxy=_next_proxy_for_runtime(runtime),
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -706,7 +749,11 @@ def create_app(
     @app.patch("/api/accounts/{account_id}/subscription-type/mark-subscribed")
     def api_mark_account_subscribed(account_id: int) -> dict[str, Any]:
         try:
-            saved = _refresh_account_subscription_type(account_id, runtime)
+            saved = _refresh_account_subscription_type(
+                account_id,
+                runtime,
+                proxy=_next_proxy_for_runtime(runtime),
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
@@ -857,14 +904,23 @@ def _unique_positive_ids(ids: list[int]) -> list[int]:
     return unique
 
 
-def _refresh_account_subscription_type(account_id: int, runtime: WebRuntime) -> dict[str, str]:
+def _next_proxy_for_runtime(runtime: WebRuntime) -> str:
+    return pick_proxy_from_pool(_resolve_runtime_proxy_pool(runtime))
+
+
+def _refresh_account_subscription_type(
+    account_id: int,
+    runtime: WebRuntime,
+    *,
+    proxy: str | None = None,
+) -> dict[str, str]:
     account = get_account_db(account_id)
     if account is None:
         raise KeyError(f"账号不存在: {account_id}")
     access_token = _session_access_token(account.get("session"))
     if not access_token:
         raise ValueError("当前账号没有保存 session accessToken")
-    plan_type = _fetch_subscription_type_by_access_token(access_token, runtime)
+    plan_type = _fetch_subscription_type_by_access_token(access_token, runtime, proxy=proxy)
     return update_account_subscription_type_db(account_id, plan_type)
 
 
@@ -923,6 +979,7 @@ def _job_view(job: WebJob) -> dict[str, Any]:
         "id": job.id,
         "mode": job.mode,
         "email": job.email,
+        "proxy": proxy_preview(job.proxy),
         "status": job.status,
         "queue_position": job.queue_position,
         "prompt": job.prompt,
@@ -934,9 +991,22 @@ def _job_view(job: WebJob) -> dict[str, Any]:
     }
 
 
-def _settings_from_runtime(runtime: WebRuntime) -> Settings:
+def _resolve_runtime_proxy_pool(runtime: WebRuntime, cfg: AppConfig | None = None) -> tuple[str, ...]:
+    cfg = cfg or load_app_config(runtime.config_path)
+    return resolve_proxy_pool(
+        runtime.proxy,
+        os.environ.get("PROTOCOL_REG_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_PROXY", ""),
+        cfg.proxies,
+        cfg.proxy,
+    )
+
+
+def _settings_from_runtime(runtime: WebRuntime, *, proxy: str | None = None) -> Settings:
     cfg = load_app_config(runtime.config_path)
-    proxy = runtime.proxy.strip() or os.environ.get("PROTOCOL_REG_PROXY", "").strip() or cfg.proxy
+    if proxy is None:
+        pool = _resolve_runtime_proxy_pool(runtime, cfg)
+        proxy = pool[0] if pool else ""
     email_code_api = os.environ.get("EMAIL_CODE_API", "").strip() or cfg.email_code_api
     email_code_key = os.environ.get("EMAIL_CODE_API_KEY", "").strip() or cfg.email_code_key
     email_code_sender_suffix = (
@@ -946,6 +1016,12 @@ def _settings_from_runtime(runtime: WebRuntime) -> Settings:
     )
     email_code_timeout = int(os.environ.get("EMAIL_CODE_TIMEOUT", "0") or 0) or cfg.email_code_timeout
     email_code_poll = float(os.environ.get("EMAIL_CODE_POLL", "0") or 0) or cfg.email_code_poll
+    otp_max_retries = _positive_int(os.environ.get("EMAIL_CODE_MAX_OTP_RETRIES"), cfg.otp_max_retries)
+    otp_poll_max_attempts = _positive_int(
+        os.environ.get("EMAIL_CODE_OTP_POLL_MAX_ATTEMPTS"),
+        cfg.otp_poll_max_attempts,
+    )
+    use_proxy_for_email = _boolish(os.environ.get("EMAIL_CODE_USE_PROXY"), cfg.use_proxy_for_email)
     return Settings(
         project_root=runtime.repo_root.resolve(),
         proxy=proxy,
@@ -960,7 +1036,29 @@ def _settings_from_runtime(runtime: WebRuntime) -> Settings:
         email_code_sender_suffix=str(email_code_sender_suffix or "openai.com").strip() or "openai.com",
         email_code_poll_interval=max(0.5, float(email_code_poll)),
         email_code_timeout=max(5, int(email_code_timeout)),
+        otp_max_retries=max(1, int(otp_max_retries)),
+        otp_poll_max_attempts=max(1, int(otp_poll_max_attempts)),
+        use_proxy_for_email=bool(use_proxy_for_email),
     )
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _boolish(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _resolve_operation_account(
@@ -1080,7 +1178,7 @@ def _execute_operation(
 
 def _email_exists(email: str) -> bool:
     expected = email.strip().lower()
-    return any(account.get("email") == expected for account in list_account_rows())
+    return any(str(account.get("email") or "").strip().lower() == expected for account in list_account_rows())
 
 
 def _random_email(suffixes: tuple[str, ...], reserved_emails: set[str] | None = None) -> str:
@@ -1154,14 +1252,20 @@ def _extract_session_subscription_type(session_json: object) -> str:
     return ""
 
 
-def _fetch_subscription_type_by_access_token(access_token: str, runtime: WebRuntime) -> str:
+def _fetch_subscription_type_by_access_token(
+    access_token: str,
+    runtime: WebRuntime,
+    *,
+    proxy: str | None = None,
+) -> str:
     try:
+        settings = _settings_from_runtime(runtime, proxy=proxy)
         response = requests.get(
             "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
             headers=_accounts_check_headers(access_token),
-            proxies=_settings_from_runtime(runtime).proxies,
-            verify=runtime.ssl_verify,
-            timeout=max(1, runtime.timeout),
+            proxies=settings.proxies,
+            verify=settings.ssl_verify,
+            timeout=max(1, settings.timeout),
             impersonate="chrome136",
         )
     except Exception as exc:
@@ -1262,7 +1366,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
     parser.add_argument("--db", default=str(repo_root / "data" / "data.db"), help="SQLite 数据库路径")
     parser.add_argument("--config", default=str(repo_root / "config" / "protocol-reg.yaml"), help="配置文件路径")
-    parser.add_argument("--proxy", default="", help="注册/登录/授权代理")
+    parser.add_argument("--proxy", default="", help="注册/登录/授权代理；多个代理可用逗号分隔")
     parser.add_argument("--max-concurrency", type=int, default=0, help="任务最大并发数，0 表示读取配置文件")
     parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="兼容导出的 accounts.txt 路径")
     parser.add_argument("--session-file", default=str(repo_root / "data" / "sessions.json"), help="登录会话 JSON 路径")
@@ -1311,6 +1415,11 @@ def main() -> None:
     print(f"[Web] 配置文件: {runtime.config_path}")
     print(f"[Web] accounts.txt 导出: {accounts_output}")
     print(f"[Web] 任务最大并发: {runtime.max_concurrency}")
+    proxy_pool = _resolve_runtime_proxy_pool(runtime, app_cfg)
+    if len(proxy_pool) > 1:
+        print(f"[Web] 代理池: {len(proxy_pool)} 个，任务按轮询分配")
+    elif proxy_pool:
+        print(f"[Web] 代理: {proxy_preview(proxy_pool[0])}")
     if args.open:
         webbrowser.open(urls[0])
     uvicorn.run(app, host=args.host, port=args.port)
@@ -1572,6 +1681,7 @@ HTML_PAGE = r"""
       max-width: none;
       max-height: none;
       min-height: calc(100vh - 116px);
+      min-width: 0;
       animation: rise .35s ease both;
     }
 
@@ -2094,6 +2204,7 @@ HTML_PAGE = r"""
     .ops {
       display: grid;
       gap: 14px;
+      min-width: 0;
     }
 
     .ops-row {
@@ -2101,6 +2212,7 @@ HTML_PAGE = r"""
       grid-template-columns: minmax(0, 1fr) 110px auto;
       gap: 12px;
       align-items: stretch;
+      min-width: 0;
     }
 
     .ops-row select { height: 100%; }
@@ -2108,6 +2220,7 @@ HTML_PAGE = r"""
     .ops-meta {
       display: grid;
       gap: 10px;
+      min-width: 0;
     }
 
     .ops-summary {
@@ -2121,21 +2234,34 @@ HTML_PAGE = r"""
 
     .job-list {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-      gap: 10px;
+      grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr));
+      gap: 8px;
+      max-height: 210px;
+      min-width: 0;
+      overflow: auto;
+      overscroll-behavior: contain;
+      padding: 8px;
+      border: 1px solid rgba(17,16,13,.1);
+      border-radius: 16px;
+      background: rgba(255,255,255,.22);
+      align-content: start;
     }
 
     .job-card {
       display: grid;
-      gap: 6px;
+      gap: 5px;
       text-align: left;
       border: 1px solid rgba(17,16,13,.12);
-      border-radius: 18px;
-      padding: 11px 12px;
+      border-radius: 12px;
+      padding: 9px 10px;
       background: rgba(255,255,255,.32);
       color: var(--ink);
       box-shadow: none;
       transform: none;
+      min-width: 0;
+      width: 100%;
+      white-space: normal;
+      overflow: hidden;
     }
 
     .job-card:hover {
@@ -2148,17 +2274,45 @@ HTML_PAGE = r"""
       background: rgba(216, 97, 44, .10);
     }
 
+    .job-card[data-status="running"],
+    .job-card[data-status="pending"] {
+      border-color: rgba(15, 107, 95, .28);
+      background: rgba(15, 107, 95, .08);
+    }
+
+    .job-card[data-status="waiting"] {
+      border-color: rgba(169, 95, 0, .32);
+      background: rgba(169, 95, 0, .08);
+    }
+
+    .job-card[data-status="failed"] {
+      border-color: rgba(163, 59, 47, .34);
+      background: rgba(163, 59, 47, .08);
+    }
+
+    .job-card[data-status="succeeded"] {
+      border-color: rgba(45, 122, 70, .3);
+      background: rgba(45, 122, 70, .07);
+    }
+
     .job-card-head {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 8px;
+      min-width: 0;
+    }
+
+    .job-card .tab-badge {
+      flex: none;
+      padding-inline: 7px;
     }
 
     .job-card-title {
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      min-width: 0;
       font: 600 12px var(--mono);
     }
 
@@ -2168,6 +2322,7 @@ HTML_PAGE = r"""
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      min-width: 0;
     }
 
     @keyframes pulse {
@@ -2210,6 +2365,7 @@ HTML_PAGE = r"""
       background:
         linear-gradient(135deg, rgba(216,97,44,.12), rgba(15,107,95,.09)),
         rgba(255,255,255,.34);
+      min-width: 0;
     }
 
     .auto-head {
@@ -2257,6 +2413,9 @@ HTML_PAGE = r"""
       color: #f4ead8;
       font: 12px/1.65 var(--mono);
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      min-width: 0;
+      width: 100%;
       border: 1px solid rgba(255,255,255,.08);
     }
 
@@ -3209,7 +3368,7 @@ HTML_PAGE = r"""
           : status;
         const email = job.email ? escapeHtml(job.email) : '未命名任务';
         return `
-          <button type="button" class="job-card${active}" data-job-id="${escapeHtml(job.id)}">
+          <button type="button" class="job-card${active}" data-job-id="${escapeHtml(job.id)}" data-status="${escapeHtml(statusClass)}">
             <div class="job-card-head">
               <div class="job-card-title">${email}</div>
               <span class="tab-badge" data-status="${escapeHtml(statusClass)}">${escapeHtml(status)}</span>

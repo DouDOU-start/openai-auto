@@ -2,6 +2,10 @@
 # 复制为 config/protocol-reg.yaml 后按需填写；实际配置文件默认不提交，避免泄露密钥。
 # 注册、登录和授权请求代理；支持 http://用户名:密码@主机:端口 这类格式，留空则不使用代理。
 proxy: ""
+# 多代理池；优先级高于 proxy。多个任务/调用会按顺序轮询，平均分配到每个代理。
+proxies:
+  # - "http://用户名:密码@主机1:端口"
+  # - "http://用户名:密码@主机2:端口"
 # Web 端任务最大并发数；多余任务会排队等待。
 max_concurrency: 3
 # 注册模式邮箱留空时，会从这些后缀中随机生成邮箱；可写多个后缀。
@@ -18,3 +22,9 @@ email_code:
   timeout: 120
   # 轮询邮箱验证码的间隔秒数，最小会按 0.5 秒处理。
   poll: 2.0
+  # 验证码为空、过期或 wrong_email_otp_code 时，自动重新发信并重试的轮数。
+  max_otp_retries: 5
+  # 每一轮等待邮箱验证码的最大轮询次数。
+  otp_poll_max_attempts: 20
+  # cloudflare-email API 是否也走当前任务代理；自建邮箱 API 通常保持 false。兼容 use_proxy_for_email 写法。
+  use_proxy: false
