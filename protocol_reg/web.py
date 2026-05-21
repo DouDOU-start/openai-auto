@@ -2531,7 +2531,7 @@ HTML_PAGE = r"""
 
     .auto-controls {
       display: grid;
-      grid-template-columns: repeat(2, minmax(110px, 1fr)) minmax(170px, auto) auto auto auto;
+      grid-template-columns: repeat(2, minmax(110px, 1fr)) minmax(170px, auto) auto auto;
       gap: 10px;
       align-items: end;
     }
@@ -2544,24 +2544,6 @@ HTML_PAGE = r"""
     }
 
     .auto-field input { width: 100%; }
-
-    .auto-check {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      min-height: 0;
-      padding: 0;
-      color: var(--muted);
-      font: 12px var(--mono);
-      white-space: nowrap;
-      justify-self: start;
-      align-self: end;
-    }
-
-    .auto-check input {
-      width: auto;
-      accent-color: var(--accent);
-    }
 
     .auto-summary {
       color: var(--muted);
@@ -2861,7 +2843,6 @@ HTML_PAGE = r"""
             <div class="auto-controls">
               <label class="auto-field">间隔秒数<input id="autoInterval" type="number" min="1" value="300" /></label>
               <label class="auto-field">每轮注册数<input id="autoBatchCount" type="number" min="1" max="20" value="1" /></label>
-              <label class="auto-check"><input id="autoCreateCheckout" type="checkbox" checked /> 自动生成 checkout</label>
               <button class="ghost" type="button" id="autoSaveBtn">保存配置</button>
               <button class="secondary" type="button" id="autoStartBtn">启动自动注册</button>
               <button class="ghost" type="button" id="autoStopBtn">停止</button>
@@ -3524,24 +3505,20 @@ HTML_PAGE = r"""
       if (auto.batch_count && document.activeElement !== $('autoBatchCount')) {
         $('autoBatchCount').value = String(auto.batch_count);
       }
-      if (document.activeElement !== $('autoCreateCheckout')) {
-        $('autoCreateCheckout').checked = Boolean(auto.create_checkout ?? true);
-      }
       badge.textContent = enabled ? '运行中' : '未启动';
       badge.dataset.status = enabled ? 'running' : 'idle';
       $('autoStartBtn').textContent = enabled ? '已启用' : '启动自动注册';
       $('autoStartBtn').disabled = enabled;
       $('autoStopBtn').disabled = !enabled;
       $('autoSaveBtn').disabled = false;
+      const checkoutText = '自动生成 checkout';
       if (!enabled) {
-        const checkoutText = Boolean(auto.create_checkout ?? true) ? '生成 checkout' : '不生成 checkout';
         $('autoSummary').textContent = `已保存：每 ${auto.interval_seconds || 300}s 投放 ${auto.batch_count || 1} 个注册任务 · ${checkoutText} · 点击“启动自动注册”开始执行。`;
         return;
       }
       const last = fmtUnixSeconds(auto.last_run_at);
       const nextLeft = secondsLeft(auto.next_run_at);
       const error = auto.last_error ? ` · 最近错误：${auto.last_error}` : '';
-      const checkoutText = Boolean(auto.create_checkout ?? true) ? '生成 checkout' : '不生成 checkout';
       $('autoSummary').textContent = `每 ${auto.interval_seconds}s 投放 ${auto.batch_count} 个注册任务 · ${checkoutText} · 已投放 ${auto.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`;
     }
 
@@ -3686,7 +3663,7 @@ HTML_PAGE = r"""
       return {
         interval_seconds: Math.max(1, Math.trunc(Number($('autoInterval').value || 1))),
         batch_count: Math.min(20, Math.max(1, Math.trunc(Number($('autoBatchCount').value || 1)))),
-        create_checkout: $('autoCreateCheckout').checked,
+        create_checkout: true,
       };
     }
 
