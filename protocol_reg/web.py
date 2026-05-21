@@ -1681,18 +1681,6 @@ HTML_PAGE = r"""
       display: block;
     }
 
-    body[data-page="tasks"],
-    body[data-page="settings"] {
-      overflow: auto;
-    }
-
-    body[data-page="tasks"] .shell,
-    body[data-page="settings"] .shell {
-      height: auto;
-      min-height: 0;
-      padding-bottom: 0;
-    }
-
     body[data-page="tasks"] .workspace,
     body[data-page="settings"] .workspace,
     body[data-page="tasks"] #accountModalBackdrop,
@@ -1711,17 +1699,19 @@ HTML_PAGE = r"""
 
     body[data-page="tasks"] #opsModalBackdrop,
     body[data-page="settings"] #opsModalBackdrop {
-      position: static;
+      position: relative;
       inset: auto;
       z-index: auto;
+      flex: 1 1 auto;
+      min-height: 0;
       display: flex !important;
       align-items: stretch;
       justify-content: stretch;
       padding: 0;
       background: transparent;
       animation: none;
-      width: min(100vw - 32px, 1440px);
-      margin: 0 auto 24px;
+      width: 100%;
+      margin: 0;
     }
 
     body[data-page="tasks"] #opsModalBackdrop .modal,
@@ -1729,7 +1719,8 @@ HTML_PAGE = r"""
       width: 100%;
       max-width: none;
       max-height: none;
-      min-height: calc(100vh - 116px);
+      height: 100%;
+      min-height: 0;
       min-width: 0;
       animation: rise .35s ease both;
     }
@@ -1745,14 +1736,17 @@ HTML_PAGE = r"""
 
     body[data-page="tasks"] .ops {
       grid-template-columns: minmax(340px, 430px) minmax(0, 1fr);
-      align-items: start;
-      align-content: start;
-      min-height: calc(100vh - 164px);
+      align-items: stretch;
+      align-content: stretch;
+      height: 100%;
     }
 
     body[data-page="tasks"] .ops-stack {
-      display: grid;
+      display: flex;
+      flex-direction: column;
       gap: 14px;
+      height: 100%;
+      min-height: 0;
       align-content: start;
     }
 
@@ -1791,20 +1785,24 @@ HTML_PAGE = r"""
 
     body[data-page="tasks"] .job-list {
       max-height: none;
-      min-height: 220px;
       flex: 1;
+      min-height: 0;
     }
 
     body[data-page="tasks"] .job-console {
-      min-height: 240px;
+      min-height: 0;
+      max-height: none;
+      flex: 1;
     }
 
     body[data-page="settings"] .ops {
       grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto minmax(0, 1fr);
       max-width: 920px;
       margin: 0 auto;
-      align-content: start;
-      min-height: calc(100vh - 164px);
+      align-content: stretch;
+      align-items: stretch;
+      height: 100%;
     }
 
     body[data-page="settings"] .ops-stack {
@@ -1812,8 +1810,11 @@ HTML_PAGE = r"""
     }
 
     body[data-page="settings"] .ops-meta {
-      display: grid;
+      display: flex;
+      flex-direction: column;
       gap: 12px;
+      min-height: 0;
+      height: 100%;
     }
 
     body[data-page="settings"] .auto-panel {
@@ -1823,7 +1824,8 @@ HTML_PAGE = r"""
 
     body[data-page="settings"] .job-list {
       max-height: none;
-      min-height: 260px;
+      min-height: 0;
+      flex: 1;
     }
 
     body[data-page="settings"] #jobState {
@@ -2730,7 +2732,6 @@ HTML_PAGE = r"""
         </div>
       </div>
     </section>
-  </main>
   <div class="modal-backdrop" id="accountModalBackdrop">
     <div class="modal" role="dialog" aria-modal="true">
       <div class="editor-head">
@@ -2856,6 +2857,7 @@ HTML_PAGE = r"""
       </section>
     </div>
   </div>
+  </main>
   <div class="modal-backdrop" id="confirmBackdrop">
     <div class="modal modal-confirm" role="alertdialog" aria-modal="true">
       <div class="confirm-head">
