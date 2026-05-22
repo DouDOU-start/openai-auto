@@ -10,9 +10,9 @@ proxies:
 max_concurrency: 3
 # 注册模式邮箱留空时，会从这些后缀中随机生成邮箱；可写多个后缀。
 email_suffixes:
-  - "example.com"
+  - "your-domain.com"
 email_code:
-  # cloudflare-email 服务地址，例如 https://mail.example.com；留空则禁用自动取码。
+  # cloudflare-email 服务地址，例如 https://mail.your-domain.com；留空则禁用自动取码。
   api: ""
   # cloudflare-email ADMIN_API_KEY；留空则禁用自动取码。
   key: ""

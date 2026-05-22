@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import sys
@@ -19,12 +18,10 @@ from .settings import Settings, proxy_preview, resolve_proxy_pool
 from .storage import (
     NULL_VALUE,
     load_account_records,
-    merge_legacy_rt_txt,
-    save_account,
+    save_authorization_token_db,
     save_account_storage,
-    save_login_session,
-    sync_account_storage,
-    try_load_login_session,
+    save_login_session_db,
+    try_load_login_session_db,
     update_account_checkout_url_db,
 )
 from .utils import make_password, make_random_email
@@ -35,9 +32,6 @@ _MODE_OPTIONS = (
     ("login", "仅登录保存会话"),
     ("authorize", "使用已保存会话授权"),
 )
-_EMAIL_RE = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
-
-
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -74,16 +68,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="生成默认配置文件到 --config 路径后退出",
     )
     parser.add_argument("--proxy", default="", help="注册代理；多个代理可用逗号分隔，例如 http://127.0.0.1:7897,http://127.0.0.1:7898")
-    parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="注册账号 TXT 输出路径")
-    parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
-    # 兼容旧 accounts_rt.txt：启动时自动合并到 accounts.txt，不再单独写入。
-    parser.add_argument(
-        "--rt-output",
-        default=str(repo_root / "data" / "accounts_rt.txt"),
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument("--session-file", default=str(repo_root / "data" / "sessions.json"), help="登录会话 JSON 路径")
-    parser.add_argument("--checkout-output", default=str(repo_root / "data" / "checkout_urls.jsonl"), help="支付链接 JSONL 输出路径")
     parser.add_argument("--license-file", default=str(default_license) if default_license else "", help="auth_core 授权文件路径")
     parser.add_argument("--login-delay", type=int, default=20, help="注册成功后等待多少秒再获取 ChatGPT session")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP 超时时间，单位秒")
@@ -91,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # cloudflare-email email-code-api.md
     # Config file is the primary source; flags/env vars override.
-    parser.add_argument("--email-code-api", default="", help="cloudflare-email 验证码 API base，例如 https://mail.example.com")
+    parser.add_argument("--email-code-api", default="", help="cloudflare-email 验证码 API base，例如 https://mail.your-domain.com")
     parser.add_argument("--email-code-key", default="", help="cloudflare-email ADMIN_API_KEY（Authorization: Bearer ...）")
     parser.add_argument("--email-code-sender-suffix", default="", help="验证码邮件发件人域名后缀，默认 openai.com")
     parser.add_argument("--email-code-timeout", type=int, default=0, help="等待邮箱验证码超时秒数，默认 120")
@@ -216,17 +200,12 @@ def _select_with_keys(title: str, options: list[tuple[str, str, str]]) -> str | 
 
 
 def _collect_existing_emails(*paths: Path) -> set[str]:
-    emails: set[str] = set()
-    for path in paths:
-        if not path.exists() or not path.is_file():
-            continue
-        try:
-            text = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        for match in _EMAIL_RE.findall(text):
-            emails.add(match.lower())
-    return emails
+    del paths
+    return {
+        str(account.get("email") or "").strip().lower()
+        for account in load_account_records()
+        if _usable_saved_account(account)
+    }
 
 
 def _random_email(suffixes: tuple[str, ...], existing_emails: set[str]) -> str:
@@ -236,8 +215,8 @@ def _random_email(suffixes: tuple[str, ...], existing_emails: set[str]) -> str:
         raise SystemExit(f"[错误] {exc}") from exc
 
 
-def _choose_authorize_account(accounts_path: Path) -> tuple[str, str] | None:
-    accounts = [account for account in load_account_records(accounts_path) if _usable_saved_account(account)]
+def _choose_authorize_account() -> tuple[str, str] | None:
+    accounts = [account for account in load_account_records() if _usable_saved_account(account)]
     if not accounts:
         return None
 
@@ -310,13 +289,6 @@ def main() -> None:
 
     cfg = load_app_config(config_path)
     mode = _resolve_mode(args.mode)
-    token_output = Path(args.token_output).resolve()
-    rt_output = Path(args.rt_output).resolve()
-    checkout_output = Path(args.checkout_output).resolve()
-    accounts_output = Path(args.output).resolve()
-    session_file = Path(args.session_file).resolve()
-    merge_legacy_rt_txt(accounts_output, rt_output)
-
     # 优先级：命令行参数（非空 / >0）> 环境变量 > 配置文件。
     proxy_pool = resolve_proxy_pool(
         str(args.proxy or "").strip(),
@@ -365,8 +337,6 @@ def main() -> None:
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
         proxy=str(proxy or "").strip(),
-        output=accounts_output,
-        session_file=session_file,
         license_file=Path(args.license_file).resolve() if args.license_file else None,
         login_delay=max(0, args.login_delay),
         timeout=max(1, args.timeout),
@@ -381,10 +351,9 @@ def main() -> None:
         otp_poll_max_attempts=max(1, int(otp_poll_max_attempts)),
         use_proxy_for_email=bool(use_proxy_for_email),
     )
-    sync_account_storage(settings.output, settings.session_file)
 
-    existing_emails = _collect_existing_emails(settings.output, rt_output, token_output, settings.session_file)
-    selected_account = _choose_authorize_account(settings.output) if mode == "authorize" else None
+    existing_emails = {account["email"] for account in load_account_records() if _usable_saved_account(account)}
+    selected_account = _choose_authorize_account() if mode == "authorize" else None
     if selected_account is not None:
         email, password = selected_account
     else:
@@ -412,30 +381,28 @@ def main() -> None:
     try:
         if mode == "register":
             token_data = flow.run(email, password)
-            save_account_storage(settings.output, email, password, token_data, source="register")
+            save_account_storage(email, password, token_data, source="register")
             account_saved = True
             _print_chatgpt_session(token_data.get("chatgpt_session"))
             checkout = flow.create_plus_trial_checkout(
                 flow.http.session,
                 token_data.get("chatgpt_session") if isinstance(token_data.get("chatgpt_session"), dict) else {},
             )
-            _handle_checkout(checkout, checkout_output, args.open_checkout, args.incognito_checkout, email=email)
+            _handle_checkout(checkout, args.open_checkout, args.incognito_checkout, email=email)
         elif mode == "login":
             session_data = flow.login(email, password, create_checkout=not args.no_checkout)
-            save_login_session(settings.session_file, email, password, session_data)
-            save_account_storage(settings.output, email, password, session_data, source="login")
+            save_login_session_db(email, password, session_data)
             _print_chatgpt_session(session_data.get("chatgpt_session"))
             if not args.no_checkout:
                 _handle_checkout(
                     session_data.get("plus_trial_checkout"),
-                    checkout_output,
                     args.open_checkout,
                     args.incognito_checkout,
                     email=email,
                 )
             token_data = {}
         else:
-            session_data = try_load_login_session(settings.session_file, email)
+            session_data = try_load_login_session_db(email)
             if session_data is None:
                 print("[授权] 未找到可用登录会话，改为使用密码即时登录")
                 if not password:
@@ -443,33 +410,30 @@ def main() -> None:
                 if not password:
                     raise SystemExit("[错误] 单独授权必须有登录会话或输入已有账号密码")
                 session_data = flow.login(email, password, create_checkout=False)
-                save_login_session(settings.session_file, email, password, session_data)
-                save_account_storage(settings.output, email, password, session_data, source="login")
+                save_login_session_db(email, password, session_data)
             else:
                 password = str(session_data.get("password") or "")
             token_data = flow.authorize_from_session(email, session_data)
-            save_account(token_output, email, password, token_data)
-            save_account_storage(settings.output, email, password, token_data, source="authorize")
+            save_authorization_token_db(email, password, token_data)
     except KeyboardInterrupt:
         raise SystemExit("\n[中断] 用户取消")
     except Exception as exc:
         if mode == "register" and account_saved:
-            print(f"[完成] 账号数据已写入: {settings.output}")
+            print("[完成] 账号数据已写入数据库")
         raise SystemExit(f"[错误] {exc}") from exc
     finally:
         flow.close()
 
     if mode == "login":
-        print(f"[完成] 登录会话已保存: {settings.session_file}")
+        print("[完成] 登录会话已保存到数据库")
         return
     action = "注册" if mode == "register" else "授权"
     print(f"[完成] {action}成功: {token_data.get('email') or email}")
     if mode == "register":
-        print(f"[完成] 账号数据已写入: {settings.output}")
+        print("[完成] 账号数据已写入数据库")
     else:
-        print(f"[完成] 授权数据已写入: {token_output}")
-        print(f"[完成] 账号数据已写入: {settings.output}")
-        print(f"[完成] 登录会话文件: {settings.session_file}")
+        print("[完成] 授权数据已保存到数据库")
+        print("[完成] 账号数据已写入数据库")
 
 
 def _print_chatgpt_session(chatgpt_session: object) -> None:
@@ -519,7 +483,6 @@ def _print_plus_trial_checkout(checkout: object) -> None:
 
 def _handle_checkout(
     checkout: object,
-    output: Path,
     open_checkout: bool,
     incognito: bool = False,
     *,
@@ -529,9 +492,8 @@ def _handle_checkout(
     long_url = _checkout_long_url(checkout)
     if not long_url:
         raise RuntimeError("未获取到支付长链接，停止处理")
-    _save_checkout_url(long_url, checkout, output, email=email)
     if email:
-        update_account_checkout_url_db(email, long_url)
+        update_account_checkout_url_db(email, long_url, checkout if isinstance(checkout, dict) else None)
     if open_checkout:
         _open_checkout_url(long_url, incognito=incognito)
     return long_url
@@ -545,18 +507,6 @@ def _checkout_long_url(checkout: object) -> str:
         if url:
             return url
     return ""
-
-
-def _save_checkout_url(long_url: str, checkout: object, output: Path, *, email: str = "") -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    record = {
-        "email": email.strip().lower() or None,
-        "long_url": long_url,
-        "status_code": checkout.get("status_code") if isinstance(checkout, dict) else None,
-    }
-    with output.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-    print(f"[Plus] 支付链接已写入: {output}")
 
 
 def _open_checkout_url(long_url: str, *, incognito: bool = False) -> None:

@@ -18,7 +18,7 @@ from typing import Any
 from curl_cffi import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from .config import AppConfig, load_app_config
@@ -30,18 +30,21 @@ from .storage import (
     NULL_VALUE,
     STOCK_STATUS_IN,
     STOCK_STATUS_OUT,
+    build_accounts_db_txt,
+    build_checkout_db_jsonl,
+    build_tokens_db_jsonl,
     account_stats_db,
     count_account_rows,
     delete_account_db,
-    export_accounts_db_to_txt,
+    init_accounts_db,
     get_account_db,
     list_account_rows,
-    save_account,
+    list_account_rows_by_ids,
     save_account_storage,
     save_account_db_record,
-    save_login_session,
-    sync_account_storage,
-    try_load_login_session,
+    save_authorization_token_db,
+    save_login_session_db,
+    try_load_login_session_db,
     update_account_checkout_url_db,
     update_account_status_db,
     update_account_subscription_type_db,
@@ -100,10 +103,6 @@ class PromptPayload(BaseModel):
 @dataclass(frozen=True)
 class WebRuntime:
     repo_root: Path
-    accounts_path: Path
-    sessions_path: Path
-    token_path: Path
-    checkout_path: Path
     config_path: Path
     license_file: Path | None
     proxy: str = ""
@@ -577,26 +576,14 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def create_app(
-    accounts_output: Path | None = None,
-    session_file: Path | None = None,
-    runtime: WebRuntime | None = None,
-) -> FastAPI:
+def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     repo_root = _repo_root()
-    accounts_path = (accounts_output or repo_root / "data" / "accounts.txt").resolve()
-    sessions_path = (session_file or repo_root / "data" / "sessions.json").resolve()
     if runtime is None:
         runtime = WebRuntime(
             repo_root=repo_root,
-            accounts_path=accounts_path,
-            sessions_path=sessions_path,
-            token_path=(repo_root / "data" / "tokens.jsonl").resolve(),
-            checkout_path=(repo_root / "data" / "checkout_urls.jsonl").resolve(),
             config_path=(repo_root / "config" / "protocol-reg.yaml").resolve(),
             license_file=_default_license_file(repo_root),
         )
-    accounts_path = runtime.accounts_path
-    sessions_path = runtime.sessions_path
     manager = JobManager(runtime)
     auto_scheduler = AutoRegisterScheduler(manager)
 
@@ -604,7 +591,7 @@ def create_app(
 
     @app.on_event("startup")
     def startup() -> None:
-        sync_account_storage(accounts_path, sessions_path)
+        init_accounts_db()
 
     @app.on_event("shutdown")
     def shutdown() -> None:
@@ -664,7 +651,6 @@ def create_app(
                 results.append(_account_summary(saved))
             except Exception as exc:
                 errors.append({"id": account_id, "error": str(exc)})
-        export_accounts_db_to_txt(accounts_path)
         return {"updated": len(results), "failed": errors, "items": results, "stats": account_stats_db()}
 
     @app.patch("/api/accounts/batch/subscription-type/refresh")
@@ -683,7 +669,6 @@ def create_app(
                 results.append(_account_summary(saved))
             except Exception as exc:
                 errors.append({"id": account_id, "error": str(exc)})
-        export_accounts_db_to_txt(accounts_path)
         return {"updated": len(results), "failed": errors, "items": results, "stats": account_stats_db()}
 
     @app.post("/api/accounts/batch/delete")
@@ -699,8 +684,32 @@ def create_app(
                     errors.append({"id": account_id, "error": "账号不存在"})
             except Exception as exc:
                 errors.append({"id": account_id, "error": str(exc)})
-        export_accounts_db_to_txt(accounts_path)
         return {"deleted": deleted, "failed": errors, "stats": account_stats_db()}
+
+    @app.post("/api/accounts/batch/export-jsonl")
+    def api_batch_export_accounts_jsonl(payload: BatchIdsPayload) -> Response:
+        ids = _unique_positive_ids(payload.ids)
+        accounts = list_account_rows_by_ids(ids)
+        if not accounts:
+            raise HTTPException(status_code=404, detail="没有找到可导出的账号")
+        lines: list[str] = []
+        skipped = 0
+        for account in accounts:
+            line = _session_jsonl_line(account.get("session"))
+            if line is None:
+                skipped += 1
+                continue
+            lines.append(line)
+        if not lines:
+            raise HTTPException(status_code=404, detail="所选账号没有可导出的 session")
+        content = "\n".join(lines) + "\n"
+        filename = f"sessions_selected_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Exported-Count": str(len(lines)),
+            "X-Skipped-Count": str(skipped),
+        }
+        return Response(content=content, media_type="application/x-ndjson; charset=utf-8", headers=headers)
 
     @app.get("/api/accounts/{account_id}")
     def api_account_detail(account_id: int) -> dict[str, Any]:
@@ -718,7 +727,6 @@ def create_app(
             raise HTTPException(status_code=400, detail="邮箱已存在，不能保存重复账号") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        export_accounts_db_to_txt(accounts_path)
         return {"item": _account_detail(saved), "stats": account_stats_db()}
 
     @app.put("/api/accounts/{account_id}")
@@ -732,7 +740,6 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        export_accounts_db_to_txt(accounts_path)
         return {"item": _account_detail(saved), "stats": account_stats_db()}
 
     @app.patch("/api/accounts/{account_id}/stock-status")
@@ -743,7 +750,6 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        export_accounts_db_to_txt(accounts_path)
         return {"item": _account_detail(saved), "stats": account_stats_db()}
 
     @app.patch("/api/accounts/{account_id}/subscription-type/refresh")
@@ -760,7 +766,6 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        export_accounts_db_to_txt(accounts_path)
         return {"item": _account_detail(saved), "stats": account_stats_db()}
 
     @app.patch("/api/accounts/{account_id}/subscription-type/mark-subscribed")
@@ -777,7 +782,6 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        export_accounts_db_to_txt(accounts_path)
         plan_type = str(saved.get("subscription_type") or NULL_VALUE).strip() or NULL_VALUE
         marked = plan_type.lower() == "plus"
         return {"item": _account_detail(saved), "stats": account_stats_db(), "marked": marked, "plan_type": plan_type}
@@ -793,7 +797,6 @@ def create_app(
                 saved = update_account_stock_status_db(account_id, STOCK_STATUS_IN)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        export_accounts_db_to_txt(accounts_path)
         return {"item": _account_detail(saved), "stats": account_stats_db(), "marked": True}
 
     @app.delete("/api/accounts/{account_id}")
@@ -801,18 +804,43 @@ def create_app(
         deleted = delete_account_db(account_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="账号不存在")
-        export_accounts_db_to_txt(accounts_path)
         return {"deleted": True, "stats": account_stats_db()}
 
-    @app.post("/api/sync")
-    def api_sync() -> dict[str, Any]:
-        sync_account_storage(accounts_path, sessions_path)
-        return {"ok": True, "stats": account_stats_db()}
-
     @app.post("/api/export")
-    def api_export() -> dict[str, Any]:
-        export_accounts_db_to_txt(accounts_path)
-        return {"ok": True, "path": str(accounts_path), "stats": account_stats_db()}
+    def api_export() -> Response:
+        content = build_accounts_db_txt()
+        if not content:
+            raise HTTPException(status_code=404, detail="没有可导出的账号")
+        filename = f"accounts_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Exported-Count": str(len([line for line in content.splitlines() if line.strip()])),
+        }
+        return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+
+    @app.post("/api/export/tokens")
+    def api_export_tokens() -> Response:
+        content = build_tokens_db_jsonl()
+        if not content:
+            raise HTTPException(status_code=404, detail="没有可导出的 token")
+        filename = f"tokens_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Exported-Count": str(len([line for line in content.splitlines() if line.strip()])),
+        }
+        return Response(content=content, media_type="application/x-ndjson; charset=utf-8", headers=headers)
+
+    @app.post("/api/export/checkouts")
+    def api_export_checkouts() -> Response:
+        content = build_checkout_db_jsonl()
+        if not content:
+            raise HTTPException(status_code=404, detail="没有可导出的 checkout")
+        filename = f"checkout_urls_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Exported-Count": str(len([line for line in content.splitlines() if line.strip()])),
+        }
+        return Response(content=content, media_type="application/x-ndjson; charset=utf-8", headers=headers)
 
     @app.post("/api/ops/jobs")
     def api_start_job(payload: OperationPayload) -> dict[str, Any]:
@@ -978,6 +1006,8 @@ def _account_summary(account: dict[str, str]) -> dict[str, Any]:
         "has_refresh_token": _has_value(account.get("refresh_token")),
         "has_session": _has_value(account.get("session")),
         "has_checkout_url": _has_value(account.get("checkout_url")),
+        "has_login_session": _has_value(account.get("login_session")),
+        "has_auth_token": _has_value(account.get("auth_token")),
         "password_preview": _secret_preview(account.get("password")),
         "refresh_token_preview": _secret_preview(account.get("refresh_token")),
         "session_preview": _secret_preview(account.get("session")),
@@ -993,10 +1023,26 @@ def _account_detail(account: dict[str, str]) -> dict[str, Any]:
             "refresh_token": account.get("refresh_token", NULL_VALUE),
             "session_json": account.get("session", NULL_VALUE),
             "checkout_url": account.get("checkout_url", NULL_VALUE),
+            "login_session_json": account.get("login_session", NULL_VALUE),
+            "auth_token_json": account.get("auth_token", NULL_VALUE),
+            "checkout_json": account.get("checkout", NULL_VALUE),
             "created_at": account.get("created_at", NULL_VALUE),
         }
     )
     return detail
+
+
+def _session_jsonl_line(session_text: object) -> str | None:
+    text = str(session_text or "").strip()
+    if not _has_value(text):
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, (dict, list)):
+        return None
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
 
 def _job_view(job: WebJob) -> dict[str, Any]:
@@ -1050,8 +1096,6 @@ def _settings_from_runtime(runtime: WebRuntime, *, proxy: str | None = None) -> 
     return Settings(
         project_root=runtime.repo_root.resolve(),
         proxy=proxy,
-        output=runtime.accounts_path,
-        session_file=runtime.sessions_path,
         license_file=runtime.license_file,
         login_delay=max(0, runtime.login_delay),
         timeout=max(1, runtime.timeout),
@@ -1117,7 +1161,7 @@ def _resolve_operation_account(
     if payload.mode in {"register", "login"} and not password:
         raise ValueError("密码不能为空")
     if payload.mode == "authorize" and not password:
-        session_data = try_load_login_session(runtime.sessions_path, email)
+        session_data = try_load_login_session_db(email)
         if session_data is None:
             raise ValueError("授权需要已有登录会话或账号密码")
     return email, password
@@ -1162,7 +1206,7 @@ def _execute_operation(
     mode = payload.mode.strip().lower()
     if mode == "register":
         token_data = flow.run(email, password)
-        save_account_storage(settings.output, email, password, token_data, source="register")
+        save_account_storage(email, password, token_data, source="register")
         checkout = None
         if payload.create_checkout:
             checkout = flow.create_plus_trial_checkout(
@@ -1175,8 +1219,7 @@ def _execute_operation(
     if mode == "login":
         session_data = flow.login(email, password, create_checkout=payload.create_checkout)
         session_payload = _require_chatgpt_session_payload(session_data)
-        save_login_session(settings.session_file, email, password, session_data)
-        save_account_storage(settings.output, email, password, session_data, source="login")
+        save_login_session_db(email, password, session_data)
         checkout = session_data.get("plus_trial_checkout") if payload.create_checkout else None
         checkout_url = _store_checkout_for_account(email, checkout, runtime)
         plan_type = _extract_session_subscription_type(session_payload)
@@ -1187,18 +1230,16 @@ def _execute_operation(
             "subscription_type": plan_type or NULL_VALUE,
         }
 
-    session_data = try_load_login_session(settings.session_file, email)
+    session_data = try_load_login_session_db(email)
     if session_data is None:
         job.log("[授权] 未找到可用登录会话，使用账号密码即时登录")
         session_data = flow.login(email, password, create_checkout=False)
-        save_login_session(settings.session_file, email, password, session_data)
-        save_account_storage(settings.output, email, password, session_data, source="login")
+        save_login_session_db(email, password, session_data)
     else:
         password = str(session_data.get("password") or password)
     token_data = flow.authorize_from_session(email, session_data)
-    save_account(runtime.token_path, email, password, token_data)
-    save_account_storage(settings.output, email, password, token_data, source="authorize")
-    return {"email": token_data.get("email") or email, "token_output": str(runtime.token_path)}
+    save_authorization_token_db(email, password, token_data)
+    return {"email": token_data.get("email") or email, "token_saved": True}
 
 
 def _email_exists(email: str) -> bool:
@@ -1226,8 +1267,7 @@ def _store_checkout_for_account(email: str, checkout: object, runtime: WebRuntim
     checkout_url = _checkout_long_url(checkout)
     if not checkout_url:
         return ""
-    _save_checkout_if_available(checkout, runtime.checkout_path, email=email)
-    update_account_checkout_url_db(email, checkout_url)
+    update_account_checkout_url_db(email, checkout_url, checkout if isinstance(checkout, dict) else None)
     return checkout_url
 
 
@@ -1362,21 +1402,6 @@ def _account_check_plan_type(account: dict[str, Any]) -> str:
     return ""
 
 
-def _save_checkout_if_available(checkout: object, output: Path, *, email: str = "") -> None:
-    long_url = _checkout_long_url(checkout)
-    if not long_url:
-        return
-    with _web_file_lock:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "email": email.strip().lower() or None,
-            "long_url": long_url,
-            "status_code": checkout.get("status_code") if isinstance(checkout, dict) else None,
-        }
-        with output.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-
-
 def _default_license_file(repo_root: Path) -> Path | None:
     for candidate in (repo_root / "config" / "wenfxl.license", repo_root / "wenfxl.license"):
         if candidate.exists():
@@ -1393,10 +1418,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=str(repo_root / "config" / "protocol-reg.yaml"), help="配置文件路径")
     parser.add_argument("--proxy", default="", help="注册/登录/授权代理；多个代理可用逗号分隔")
     parser.add_argument("--max-concurrency", type=int, default=0, help="任务最大并发数，0 表示读取配置文件")
-    parser.add_argument("--output", default=str(repo_root / "data" / "accounts.txt"), help="兼容导出的 accounts.txt 路径")
-    parser.add_argument("--session-file", default=str(repo_root / "data" / "sessions.json"), help="登录会话 JSON 路径")
-    parser.add_argument("--token-output", default=str(repo_root / "data" / "tokens.jsonl"), help="授权 token JSONL 输出路径")
-    parser.add_argument("--checkout-output", default=str(repo_root / "data" / "checkout_urls.jsonl"), help="支付链接 JSONL 输出路径")
     parser.add_argument("--license-file", default="", help="auth_core 授权文件路径")
     parser.add_argument("--login-delay", type=int, default=20, help="注册成功后等待多少秒再获取 ChatGPT session")
     parser.add_argument("--timeout", type=int, default=30, help="HTTP 超时时间，单位秒")
@@ -1411,18 +1432,12 @@ def main() -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     os.environ["PROTOCOL_REG_DB_PATH"] = str(db_path)
 
-    accounts_output = Path(args.output).resolve()
-    session_file = Path(args.session_file).resolve()
     repo_root = _repo_root()
     license_file = Path(args.license_file).resolve() if args.license_file else _default_license_file(repo_root)
     app_cfg = load_app_config(Path(args.config).resolve())
     max_concurrency = int(args.max_concurrency) if int(args.max_concurrency) > 0 else app_cfg.max_concurrency
     runtime = WebRuntime(
         repo_root=repo_root,
-        accounts_path=accounts_output,
-        sessions_path=session_file,
-        token_path=Path(args.token_output).resolve(),
-        checkout_path=Path(args.checkout_output).resolve(),
         config_path=Path(args.config).resolve(),
         license_file=license_file,
         proxy=str(args.proxy or "").strip(),
@@ -1431,14 +1446,14 @@ def main() -> None:
         ssl_verify=not args.no_ssl_verify,
         max_concurrency=max(1, max_concurrency),
     )
-    app = create_app(accounts_output=accounts_output, session_file=session_file, runtime=runtime)
+    app = create_app(runtime=runtime)
     urls = _display_urls(args.host, args.port)
     print("[Web] 账号管理页面:")
     for url in urls:
         print(f"  {url}")
     print(f"[Web] 数据库: {db_path}")
     print(f"[Web] 配置文件: {runtime.config_path}")
-    print(f"[Web] accounts.txt 导出: {accounts_output}")
+    print("[Web] 数据存储: SQLite DB-only；TXT/JSON 仅按需下载导出")
     print(f"[Web] 任务最大并发: {runtime.max_concurrency}")
     print("[Web] 页面路径: / 账号管理 · /tasks 任务控制台 · /settings 自动注册设置")
     proxy_pool = _resolve_runtime_proxy_pool(runtime, app_cfg)
@@ -2710,8 +2725,9 @@ HTML_PAGE = r"""
             <option value="200">200 / 页</option>
           </select>
           <span class="toolbar-spacer"></span>
-          <button class="ghost" id="syncBtn">同步导入</button>
           <button class="ghost" id="exportBtn">导出 TXT</button>
+          <button class="ghost" id="exportTokensBtn">导出 Token</button>
+          <button class="ghost" id="exportCheckoutsBtn">导出 Checkout</button>
           <a class="button-link secondary" id="runBtn" href="/tasks">任务页面</a>
         </div>
         <div class="batchbar" id="batchBar">
@@ -2720,6 +2736,7 @@ HTML_PAGE = r"""
           <button class="accent" type="button" id="batchStockOutBtn">批量出库</button>
           <button class="ghost" type="button" id="batchStockInBtn">恢复未出库</button>
           <button class="secondary" type="button" id="batchRefreshPlanBtn">自动获取类型</button>
+          <button class="secondary" type="button" id="batchExportJsonlBtn">导出 Session JSONL</button>
           <button class="danger" type="button" id="batchDeleteBtn">批量删除</button>
           <button class="ghost" type="button" id="batchClearBtn">清空选择</button>
         </div>
@@ -2746,7 +2763,7 @@ HTML_PAGE = r"""
           <input type="hidden" id="accountId" />
           <div class="field">
             <label>邮箱 <span>唯一键</span></label>
-            <input id="email" class="copy-on-click" readonly placeholder="name@example.com" />
+            <input id="email" class="copy-on-click" readonly placeholder="name@your-domain.com" />
           </div>
           <div class="field">
             <label>密码</label>
@@ -2911,7 +2928,7 @@ HTML_PAGE = r"""
           title: '账号管理',
           brand: '账号库控制台',
           opsTitle: '账号管理',
-          opsHint: '查看、筛选、导入、导出',
+          opsHint: '查看、筛选、导出',
         },
         tasks: {
           title: '任务控制台',
@@ -3006,7 +3023,7 @@ HTML_PAGE = r"""
     function renderList(items) {
       const list = $('accountList');
       if (!items.length) {
-        list.innerHTML = '<div class="empty">没有匹配账号。进入「任务页面」运行 register 来注册账号，或点击「同步导入」从 accounts.txt / sessions.json 导入。</div>';
+        list.innerHTML = '<div class="empty">没有匹配账号。进入「任务页面」运行 register 来注册账号，或点击「导出 TXT」下载当前数据库。</div>';
         return;
       }
       list.innerHTML = items.map((item, index) => {
@@ -3084,7 +3101,7 @@ HTML_PAGE = r"""
       $('batchCount').textContent = `已选择 ${ids.length} 个`;
       $('selectAllVisible').checked = allVisibleSelected;
       $('selectAllVisible').indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < state.items.length;
-      for (const id of ['batchStockOutBtn', 'batchStockInBtn', 'batchRefreshPlanBtn', 'batchDeleteBtn', 'batchClearBtn']) {
+      for (const id of ['batchStockOutBtn', 'batchStockInBtn', 'batchRefreshPlanBtn', 'batchExportJsonlBtn', 'batchDeleteBtn', 'batchClearBtn']) {
         $(id).disabled = ids.length === 0;
       }
     }
@@ -3404,10 +3421,96 @@ HTML_PAGE = r"""
       await loadAccounts();
     }
 
+    function downloadBlob(blob, filename) {
+      const link = document.createElement('a');
+      const objectUrl = URL.createObjectURL(blob);
+      link.href = objectUrl;
+      link.download = filename;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    }
+
+    function filenameFromDisposition(disposition, fallback) {
+      const match = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(disposition || '');
+      const encoded = match?.[1];
+      if (encoded) {
+        try { return decodeURIComponent(encoded); } catch (err) { return fallback; }
+      }
+      return match?.[2] || fallback;
+    }
+
+    async function batchExportSessionJsonl() {
+      const ids = selectedIds();
+      if (!ids.length) return toast('请先选择账号');
+      const response = await fetch('/api/accounts/batch/export-jsonl', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || '导出失败');
+      }
+      const blob = await response.blob();
+      const filename = filenameFromDisposition(
+        response.headers.get('content-disposition'),
+        `sessions_selected_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.jsonl`,
+      );
+      downloadBlob(blob, filename);
+      const exported = Number(response.headers.get('x-exported-count') || ids.length) || ids.length;
+      const skipped = Number(response.headers.get('x-skipped-count') || 0) || 0;
+      toast(skipped > 0
+        ? `已导出 ${exported} 个 session，跳过 ${skipped} 个无 session 账号`
+        : `已导出 ${exported} 个 session`);
+    }
+
+    async function exportDownload(endpoint, fallbackFilename, successLabel) {
+      const response = await fetch(endpoint, { method: 'POST' });
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || '导出失败');
+      }
+      const blob = await response.blob();
+      const filename = filenameFromDisposition(
+        response.headers.get('content-disposition'),
+        fallbackFilename,
+      );
+      downloadBlob(blob, filename);
+      const exported = Number(response.headers.get('x-exported-count') || 0) || 0;
+      toast(exported > 0 ? `已导出 ${exported} 个${successLabel}` : `已导出${successLabel}`);
+    }
+
+    async function exportAccountsTxt() {
+      return exportDownload(
+        '/api/export',
+        `accounts_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.txt`,
+        '账号',
+      );
+    }
+
+    async function exportTokensJsonl() {
+      return exportDownload(
+        '/api/export/tokens',
+        `tokens_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.jsonl`,
+        'token',
+      );
+    }
+
+    async function exportCheckoutsJsonl() {
+      return exportDownload(
+        '/api/export/checkouts',
+        `checkout_urls_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.jsonl`,
+        'checkout',
+      );
+    }
+
     async function batchDeleteAccounts() {
       const ids = selectedIds();
       if (!ids.length) return toast('请先选择账号');
-      const ok = await showConfirm(`删除选中的 ${ids.length} 个账号，并同步导出 accounts.txt。`, { title: '批量删除账号', okText: '删除', danger: true });
+      const ok = await showConfirm(`删除选中的 ${ids.length} 个账号。`, { title: '批量删除账号', okText: '删除', danger: true });
       if (!ok) return;
       const data = await request('/api/accounts/batch/delete', {
         method: 'POST',
@@ -3427,7 +3530,7 @@ HTML_PAGE = r"""
       if (!id) return toast('当前没有选中账号');
       const email = ($('email').value || '').trim();
       const target = email ? `「${email}」` : '该账号';
-      const ok = await showConfirm(`删除${target}，并同步导出 accounts.txt。`, { title: '删除账号', okText: '删除', danger: true });
+      const ok = await showConfirm(`删除${target}。`, { title: '删除账号', okText: '删除', danger: true });
       if (!ok) return;
       await request(`/api/accounts/${id}`, { method: 'DELETE' });
       toast('账号已删除');
@@ -3885,6 +3988,7 @@ HTML_PAGE = r"""
     $('batchStockOutBtn').addEventListener('click', () => batchUpdateStockStatus(STOCK_OUT).catch((err) => toast(err.message)));
     $('batchStockInBtn').addEventListener('click', () => batchUpdateStockStatus(STOCK_IN).catch((err) => toast(err.message)));
     $('batchRefreshPlanBtn').addEventListener('click', () => batchRefreshSubscriptionTypes().catch((err) => toast(err.message)));
+    $('batchExportJsonlBtn').addEventListener('click', () => batchExportSessionJsonl().catch((err) => toast(err.message)));
     $('batchDeleteBtn').addEventListener('click', () => batchDeleteAccounts().catch((err) => toast(err.message)));
     $('batchClearBtn').addEventListener('click', clearSelection);
     $('copyLineBtn').addEventListener('click', () => copyText(compactLine(), '账号行已复制'));
@@ -3899,8 +4003,9 @@ HTML_PAGE = r"""
     $('promptInput').addEventListener('keydown', (event) => {
       if (event.key === 'Enter') submitPrompt().catch((err) => toast(err.message));
     });
-    $('syncBtn').addEventListener('click', async () => { await request('/api/sync', { method: 'POST' }); toast('已从本地文件同步导入'); await loadAccounts(); });
-    $('exportBtn').addEventListener('click', async () => { const data = await request('/api/export', { method: 'POST' }); toast(`已导出到 ${data.path}`); });
+    $('exportBtn').addEventListener('click', () => exportAccountsTxt().catch((err) => toast(err.message)));
+    $('exportTokensBtn').addEventListener('click', () => exportTokensJsonl().catch((err) => toast(err.message)));
+    $('exportCheckoutsBtn').addEventListener('click', () => exportCheckoutsJsonl().catch((err) => toast(err.message)));
 
     let confirmResolve = null;
     function showConfirm(message, options = {}) {

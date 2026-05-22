@@ -71,8 +71,6 @@ def _split_proxy_text(value: str) -> list[str]:
 class Settings:
     project_root: Path
     proxy: str
-    output: Path
-    session_file: Path
     license_file: Path | None
     login_delay: int
     timeout: int

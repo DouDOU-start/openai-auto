@@ -33,6 +33,9 @@ def init_accounts_db() -> None:
                 refresh_token TEXT DEFAULT 'null',
                 session_json TEXT DEFAULT 'null',
                 checkout_url TEXT DEFAULT 'null',
+                login_session_json TEXT DEFAULT 'null',
+                auth_token_json TEXT DEFAULT 'null',
+                checkout_json TEXT DEFAULT 'null',
                 stock_status TEXT DEFAULT '未出库',
                 status TEXT DEFAULT 'active',
                 created_at TEXT NOT NULL,
@@ -43,6 +46,9 @@ def init_accounts_db() -> None:
             """,
         )
         _ensure_accounts_column(cursor, "checkout_url", "TEXT DEFAULT 'null'")
+        _ensure_accounts_column(cursor, "login_session_json", "TEXT DEFAULT 'null'")
+        _ensure_accounts_column(cursor, "auth_token_json", "TEXT DEFAULT 'null'")
+        _ensure_accounts_column(cursor, "checkout_json", "TEXT DEFAULT 'null'")
         _ensure_accounts_column(cursor, "stock_status", "TEXT DEFAULT '未出库'")
         _drop_accounts_column(cursor, "source")
         db_manager.execute_sql(
@@ -73,38 +79,24 @@ def init_accounts_db() -> None:
         )
 
 
-def sync_account_storage(accounts_output: Path, session_file: Path) -> None:
-    """启动时把 TXT 和会话文件导入数据库，再从数据库导出兼容 TXT。"""
-
-    init_accounts_db()
-    import_compact_accounts_to_db(accounts_output)
-    import_sessions_to_db(session_file)
-    export_accounts_db_to_txt(accounts_output)
-
-
 def save_account_storage(
-    accounts_output: Path,
     email: str,
     password: str,
     token_data: dict[str, Any] | None = None,
     *,
     source: str = "manual",
 ) -> None:
-    """把账号写入数据库，并同步导出 accounts.txt。"""
+    """把账号主数据写入数据库。"""
 
     init_accounts_db()
     fields = _compact_account_fields(email, password, token_data or {})
     _upsert_account_db(fields, source)
-    export_accounts_db_to_txt(accounts_output)
 
 
-def load_account_records(accounts_output: Path | None = None) -> list[dict[str, str]]:
-    """读取数据库账号；数据库为空时可回退读取 TXT。"""
+def load_account_records() -> list[dict[str, str]]:
+    """读取数据库账号。"""
 
-    accounts = load_accounts_db()
-    if accounts or accounts_output is None:
-        return accounts
-    return load_compact_accounts(accounts_output)
+    return load_accounts_db()
 
 
 def load_accounts_db() -> list[dict[str, str]]:
@@ -115,7 +107,8 @@ def load_accounts_db() -> list[dict[str, str]]:
         rows = db_manager.execute_sql(
             cursor,
             """
-            SELECT email, password, subscription_type, refresh_token, session_json, checkout_url, stock_status,
+            SELECT email, password, subscription_type, refresh_token, session_json, checkout_url,
+                   login_session_json, auth_token_json, checkout_json, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             ORDER BY id ASC
@@ -174,7 +167,8 @@ def list_account_rows(
         rows = db_manager.execute_sql(
             cursor,
             f"""
-            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url, stock_status,
+            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
+                   login_session_json, auth_token_json, checkout_json, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             {where_sql}
@@ -184,6 +178,51 @@ def list_account_rows(
             params + extra_params,
         ).fetchall()
     return [_account_from_row(row) for row in rows]
+
+
+def list_account_rows_by_ids(ids: list[int]) -> list[dict[str, str]]:
+    """按给定账号 ID 顺序读取账号；不存在的 ID 会被跳过。"""
+
+    clean_ids: list[int] = []
+    seen: set[int] = set()
+    for raw_id in ids:
+        try:
+            account_id = int(raw_id)
+        except Exception:
+            continue
+        if account_id <= 0 or account_id in seen:
+            continue
+        seen.add(account_id)
+        clean_ids.append(account_id)
+    if not clean_ids:
+        return []
+
+    init_accounts_db()
+    rows_by_id: dict[int, dict[str, str]] = {}
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        for start in range(0, len(clean_ids), 900):
+            chunk = clean_ids[start : start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db_manager.execute_sql(
+                cursor,
+                f"""
+                SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
+                       login_session_json, auth_token_json, checkout_json, stock_status,
+                       status, created_at, updated_at, last_login_at, last_authorized_at
+                FROM accounts
+                WHERE id IN ({placeholders})
+                """,
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                account = _account_from_row(row)
+                try:
+                    rows_by_id[int(account.get("id") or 0)] = account
+                except Exception:
+                    continue
+    return [rows_by_id[account_id] for account_id in clean_ids if account_id in rows_by_id]
 
 
 def count_account_rows(search: str = "", status: str = "", plan: str = "", stock_status: str = "") -> int:
@@ -210,7 +249,8 @@ def get_account_db(account_id: int) -> dict[str, str] | None:
         row = db_manager.execute_sql(
             cursor,
             """
-            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url, stock_status,
+            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
+                   login_session_json, auth_token_json, checkout_json, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             WHERE id = ?
@@ -228,7 +268,8 @@ def _get_account_db_by_email(email: str) -> dict[str, str] | None:
         row = db_manager.execute_sql(
             cursor,
             """
-            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url, stock_status,
+            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
+                   login_session_json, auth_token_json, checkout_json, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             WHERE email = ?
@@ -346,24 +387,36 @@ def save_account_db_record(data: dict[str, Any], account_id: int | None = None) 
     return saved
 
 
-def update_account_checkout_url_db(email: str, checkout_url: str) -> dict[str, str] | None:
-    """按邮箱更新账号 checkout 长链接，空链接不会覆盖已有值。"""
+def update_account_checkout_url_db(
+    email: str,
+    checkout_url: str,
+    checkout_data: dict[str, Any] | None = None,
+) -> dict[str, str] | None:
+    """按邮箱更新账号 checkout 长链接和可选的完整 checkout 响应。"""
 
     normalized_email = _field(email).lower()
     normalized_url = _field(checkout_url)
     if normalized_email == NULL_VALUE or normalized_url == NULL_VALUE:
         return None
+    normalized_checkout = _field(json.dumps(checkout_data, ensure_ascii=False, separators=(",", ":"))) if checkout_data else NULL_VALUE
 
     init_accounts_db()
     db_manager = _db_manager()
     now = utc_now()
     with db_manager.get_db_conn(is_write=True) as conn:
         cursor = db_manager.get_cursor(conn)
-        db_manager.execute_sql(
-            cursor,
-            "UPDATE accounts SET checkout_url = ?, updated_at = ? WHERE email = ?",
-            (normalized_url, now, normalized_email),
-        )
+        if normalized_checkout == NULL_VALUE:
+            db_manager.execute_sql(
+                cursor,
+                "UPDATE accounts SET checkout_url = ?, updated_at = ? WHERE email = ?",
+                (normalized_url, now, normalized_email),
+            )
+        else:
+            db_manager.execute_sql(
+                cursor,
+                "UPDATE accounts SET checkout_url = ?, checkout_json = ?, updated_at = ? WHERE email = ?",
+                (normalized_url, normalized_checkout, now, normalized_email),
+            )
         if cursor.rowcount <= 0:
             return None
 
@@ -479,6 +532,12 @@ def account_stats_db() -> dict[str, Any]:
         with_checkout = cursor.execute(
             "SELECT COUNT(*) FROM accounts WHERE checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''"
         ).fetchone()[0]
+        with_login_session = cursor.execute(
+            "SELECT COUNT(*) FROM accounts WHERE login_session_json IS NOT NULL AND login_session_json != 'null' AND login_session_json != ''"
+        ).fetchone()[0]
+        with_auth_token = cursor.execute(
+            "SELECT COUNT(*) FROM accounts WHERE auth_token_json IS NOT NULL AND auth_token_json != 'null' AND auth_token_json != ''"
+        ).fetchone()[0]
         plans = cursor.execute(
             "SELECT subscription_type, COUNT(*) FROM accounts GROUP BY subscription_type ORDER BY COUNT(*) DESC"
         ).fetchall()
@@ -493,6 +552,8 @@ def account_stats_db() -> dict[str, Any]:
         "with_rt": with_rt,
         "with_session": with_session,
         "with_checkout": with_checkout,
+        "with_login_session": with_login_session,
+        "with_auth_token": with_auth_token,
         "plans": {str(plan or NULL_VALUE): count for plan, count in plans},
         "statuses": {str(item_status or NULL_VALUE): count for item_status, count in statuses},
         "stock_statuses": _stock_status_counts(stock_statuses),
@@ -527,24 +588,79 @@ def import_sessions_to_db(path: Path) -> None:
 
 
 def export_accounts_db_to_txt(output: Path) -> None:
+    """Legacy helper: write the compact account export to a text file."""
+
     with _file_write_lock:
-        accounts = load_accounts_db()
-        if not accounts:
+        text = build_accounts_db_txt()
+        if not text:
             return
         output.parent.mkdir(parents=True, exist_ok=True)
-        lines = [
-            "----".join(
-                [
-                    account["email"],
-                    account["password"],
-                    account["subscription_type"],
-                    account["refresh_token"],
-                    account["session"],
-                ]
-            )
-            for account in accounts
-        ]
-        output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        output.write_text(text, encoding="utf-8")
+
+
+def build_accounts_db_txt() -> str:
+    accounts = load_accounts_db()
+    if not accounts:
+        return ""
+    lines = [
+        "----".join(
+            [
+                account["email"],
+                account["password"],
+                account["subscription_type"],
+                account["refresh_token"],
+                account["session"],
+            ]
+        )
+        for account in accounts
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def build_tokens_db_jsonl() -> str:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        rows = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT auth_token_json
+            FROM accounts
+            WHERE auth_token_json IS NOT NULL AND auth_token_json != 'null' AND auth_token_json != ''
+            ORDER BY id ASC
+            """,
+        ).fetchall()
+    lines: list[str] = []
+    for row in rows:
+        blob = _field(row["auth_token_json"])
+        if not _has_session_blob(blob):
+            continue
+        lines.append(blob)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def build_checkout_db_jsonl() -> str:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        rows = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT email, checkout_json
+            FROM accounts
+            WHERE checkout_json IS NOT NULL AND checkout_json != 'null' AND checkout_json != ''
+            ORDER BY id ASC
+            """,
+        ).fetchall()
+    lines: list[str] = []
+    for row in rows:
+        blob = _field(row["checkout_json"])
+        if not _has_session_blob(blob):
+            continue
+        lines.append(blob)
+    return "\n".join(lines) + ("\n" if lines else "")
 
 
 def load_compact_accounts(path: Path) -> list[dict[str, str]]:
@@ -566,25 +682,94 @@ def load_compact_accounts(path: Path) -> list[dict[str, str]]:
     return accounts
 
 
-def sync_compact_accounts_from_sessions(accounts_output: Path, session_file: Path) -> None:
-    sync_account_storage(accounts_output, session_file)
-
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def save_account(output: Path, email: str, password: str, token_data: dict[str, Any]) -> None:
-    with _file_write_lock:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        record = {
-            "email": token_data.get("email") or email,
-            "password": password,
-            "token_data": token_data,
-            "created_at": utc_now(),
-        }
-        with output.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+def save_account(email: str, password: str, token_data: dict[str, Any]) -> None:
+    """保存授权结果到数据库。"""
+
+    save_authorization_token_db(email, password, token_data)
+
+
+def save_login_session_db(email: str, password: str, session_data: dict[str, Any]) -> dict[str, str] | None:
+    """保存登录会话快照到数据库。"""
+
+    init_accounts_db()
+    payload = {
+        **session_data,
+        "email": email,
+        "password": password,
+        "updated_at": utc_now(),
+    }
+    snapshot = _json_blob(payload)
+    fields = _compact_account_fields(email, password, session_data)
+    _upsert_account_db(fields, "login")
+
+    normalized_email = _field(email).lower()
+    if normalized_email == NULL_VALUE:
+        return None
+
+    db_manager = _db_manager()
+    now = utc_now()
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            "UPDATE accounts SET login_session_json = ?, updated_at = ?, last_login_at = ? WHERE email = ?",
+            (snapshot, now, now, normalized_email),
+        )
+        if cursor.rowcount <= 0:
+            return None
+    return _get_account_db_by_email(normalized_email)
+
+
+def save_authorization_token_db(email: str, password: str, token_data: dict[str, Any]) -> dict[str, str] | None:
+    """保存授权结果到数据库。"""
+
+    init_accounts_db()
+    fields = _compact_account_fields(email, password, token_data)
+    _upsert_account_db(fields, "authorize")
+
+    normalized_email = _field(email).lower()
+    if normalized_email == NULL_VALUE:
+        return None
+
+    record = {
+        "email": token_data.get("email") or email,
+        "password": password,
+        "token_data": token_data,
+        "created_at": utc_now(),
+    }
+    blob = _json_blob(record)
+    db_manager = _db_manager()
+    now = utc_now()
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            "UPDATE accounts SET auth_token_json = ?, updated_at = ?, last_authorized_at = ? WHERE email = ?",
+            (blob, now, now, normalized_email),
+        )
+        if cursor.rowcount <= 0:
+            return None
+    return _get_account_db_by_email(normalized_email)
+
+
+def try_load_login_session_db(email: str) -> dict[str, Any] | None:
+    account = _get_account_db_by_email(email)
+    if account is None:
+        return None
+    blob = account.get("login_session")
+    if not _has_session_blob(blob):
+        return None
+    session = _load_json_blob(blob)
+    if not isinstance(session, dict):
+        return None
+    cookies = session.get("cookies")
+    if not isinstance(cookies, list) or not cookies:
+        return None
+    return session
 
 
 def save_credentials_txt(output: Path, email: str, password: str) -> None:
@@ -603,7 +788,7 @@ def save_compact_account(output: Path, email: str, password: str, token_data: di
 
 
 def merge_legacy_rt_txt(accounts_output: Path, rt_output: Path) -> None:
-    """把旧 accounts_rt.txt 的账号----密码----rt 合并进 accounts.txt。"""
+    """Legacy helper: merge refresh tokens from old compact account files."""
 
     normalize_compact_accounts_txt(accounts_output)
     if not rt_output.exists() or not rt_output.is_file():
@@ -783,6 +968,9 @@ def _account_from_row(row: Any) -> dict[str, str]:
         "refresh_token": _field(row["refresh_token"]),
         "session": _session_field(row["session_json"]),
         "checkout_url": _field(row["checkout_url"]) if "checkout_url" in keys else NULL_VALUE,
+        "login_session": _field(row["login_session_json"]) if "login_session_json" in keys else NULL_VALUE,
+        "auth_token": _field(row["auth_token_json"]) if "auth_token_json" in keys else NULL_VALUE,
+        "checkout": _field(row["checkout_json"]) if "checkout_json" in keys else NULL_VALUE,
         "stock_status": _normalize_stock_status(row["stock_status"]) if "stock_status" in keys else STOCK_STATUS_IN,
         "status": _field(row["status"]),
         "created_at": _field(row["created_at"]),
@@ -1004,39 +1192,21 @@ def apply_session_cookies(session: Any, cookies: list[dict[str, Any]]) -> None:
 
 
 def save_login_session(path: Path, email: str, password: str, session_data: dict[str, Any]) -> None:
-    with _file_write_lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = _read_json_obj(path)
-        key = email.strip().lower()
-        data[key] = {
-            **session_data,
-            "email": email,
-            "password": password,
-            "updated_at": utc_now(),
-        }
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    del path
+    save_login_session_db(email, password, session_data)
 
 
 def load_login_session(path: Path, email: str) -> dict[str, Any]:
-    data = _read_json_obj(path)
-    record = data.get(email.strip().lower())
+    del path
+    record = try_load_login_session_db(email)
     if not isinstance(record, dict):
         raise RuntimeError(f"未找到登录会话，请先执行 login 模式: {email}")
-    cookies = record.get("cookies")
-    if not isinstance(cookies, list) or not cookies:
-        raise RuntimeError(f"登录会话没有可用 cookies，请重新执行 login 模式: {email}")
     return record
 
 
 def try_load_login_session(path: Path, email: str) -> dict[str, Any] | None:
-    data = _read_json_obj(path)
-    record = data.get(email.strip().lower())
-    if not isinstance(record, dict):
-        return None
-    cookies = record.get("cookies")
-    if not isinstance(cookies, list) or not cookies:
-        return None
-    return record
+    del path
+    return try_load_login_session_db(email)
 
 
 def _read_json_obj(path: Path) -> dict[str, Any]:
@@ -1049,6 +1219,36 @@ def _read_json_obj(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"会话文件格式错误: {path}")
     return data
+
+
+def _json_blob(value: object) -> str:
+    if value is None:
+        return NULL_VALUE
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return NULL_VALUE
+
+
+def _load_json_blob(value: object) -> object:
+    text = _field(value)
+    if text == NULL_VALUE:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _has_session_blob(value: object) -> bool:
+    text = _field(value)
+    if text == NULL_VALUE:
+        return False
+    try:
+        loaded = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(loaded, (dict, list))
 
 
 def _db_manager() -> Any:
