@@ -188,7 +188,7 @@ data/data.db
 uv run protocol-reg-web
 ```
 
-默认监听 `0.0.0.0:8765`，会读取 `config/protocol-reg.yaml`，同一局域网设备可以访问 `http://本机局域网IP:8765`。页面支持搜索、筛选、新建、编辑、删除账号记录，可以直接把账号标记为“出库”或恢复为“未出库”，也支持多选后批量出库、批量恢复未出库、批量自动获取订阅类型、批量导出选中账号的 Session JSONL 和批量删除。页面还可以按需导出账号 TXT、Token JSONL 和 Checkout JSONL，并查看、复制账号的 checkout 长链接。`/tasks` 页面里的“执行任务”面板可以直接执行 `register`、`login` 和 `authorize`；注册模式默认勾选随机邮箱、随机密码和生成 checkout，可填写任务数一次启动多个注册任务，多余任务会按 `max_concurrency` 排队。`/settings` 页面里可以调整自动注册的间隔和每轮注册数，并单独启停自动注册；自动注册固定生成 checkout。遇到邮箱验证码时任务会暂停并等待页面提交验证码，配置了 cloudflare-email 时仍会自动读取验证码。
+默认监听 `0.0.0.0:8765`，会读取 `config/protocol-reg.yaml`，同一局域网设备可以访问 `http://本机局域网IP:8765`。页面支持搜索、筛选、新建、编辑、删除账号记录，可以直接把账号标记为“出库”或恢复为“未出库”，也支持多选后批量出库、批量恢复未出库、批量自动获取订阅类型、批量导出选中账号的 Session JSONL 和批量删除。页面还可以按需导出账号 TXT、Token JSONL 和 Checkout JSONL，并查看、复制账号的 checkout 长链接。用户管理页里操作员权限是固定的，不再单独拆分细项。`/tasks` 页面里的“执行任务”面板可以直接执行 `register`、`login` 和 `authorize`；注册模式默认勾选随机邮箱、随机密码和生成 checkout，可填写任务数一次启动多个注册任务，多余任务会按 `max_concurrency` 排队。`/settings` 页面里可以调整自动注册的间隔和每轮注册数，并单独启停自动注册；自动注册固定生成 checkout。遇到邮箱验证码时任务会暂停并等待页面提交验证码，配置了 cloudflare-email 时仍会自动读取验证码。
 
 需要指定数据库、配置文件、代理或端口时：
 

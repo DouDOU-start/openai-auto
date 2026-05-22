@@ -996,6 +996,8 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             saved = verify_subscription_account_db(account_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         record_audit_log(int(user["id"]), "verify_subscription", target_type="account", target_id=str(account_id), detail=None, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
         return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
 
@@ -4567,6 +4569,20 @@ HTML_PAGE = r"""
       }
     });
 
+    document.addEventListener('click', async (event) => {
+      const node = event.target;
+      if (!(node instanceof HTMLElement) || !node.hasAttribute('data-copy-checkout')) return;
+      const value = (node.getAttribute('data-copy-checkout') || '').trim();
+      if (!hasValue(value)) return toast('没有可复制内容');
+      try {
+        await clipboardWrite(value);
+        toast('Checkout 链接已复制，请用无痕浏览器打开');
+        flashCopied(node);
+      } catch (err) {
+        toast(err.message || '复制失败');
+      }
+    });
+
     $('copySessionBtn').addEventListener('click', async () => {
       const value = ($('sessionJson').value || '').trim();
       if (!hasValue(value)) return toast('Session 为空');
@@ -4997,7 +5013,6 @@ ADMIN_USERS_PAGE = r"""
             <th>用户名</th>
             <th>角色</th>
             <th>状态</th>
-            <th>权限</th>
             <th>最近登录</th>
             <th>操作</th>
           </tr>
@@ -5023,7 +5038,7 @@ ADMIN_USERS_PAGE = r"""
             <option value="disabled">禁用</option>
           </select>
         </label>
-        <div class="permission-field">
+        <div class="permission-field" style="display:none">
           <div>权限</div>
           <div class="permission-editor">
             <div class="permission-summary" id="permissionSummary"></div>
@@ -5154,7 +5169,6 @@ ADMIN_USERS_PAGE = r"""
         const canDelete = String(user.id) !== currentUserId;
         const actions = `
           <button type="button" data-edit="${escapeHtml(user.id)}">编辑</button>
-          ${user.role === 'admin' ? '' : `<button type="button" data-permission-edit="${escapeHtml(user.id)}">权限</button>`}
           <button type="button" data-reset="${escapeHtml(user.id)}">重置密码</button>
           ${canDelete ? `<button class="danger" type="button" data-delete="${escapeHtml(user.id)}">删除</button>` : '<span class="muted">当前账号</span>'}
         `;
@@ -5164,17 +5178,13 @@ ADMIN_USERS_PAGE = r"""
             <td><strong>${escapeHtml(user.username)}</strong><br>${escapeHtml(user.display_name || '')}</td>
             <td>${escapeHtml(roleLabel(user.role))}</td>
             <td class="${statusClass}">${escapeHtml(statusLabel(user.status))}</td>
-            <td>${permissionTags(user.permissions || [])}</td>
             <td>${escapeHtml(formatDate(user.last_login_at))}</td>
             <td>${actions}</td>
           </tr>
         `;
-      }).join('') || '<tr><td colspan="7">暂无用户</td></tr>';
+      }).join('') || '<tr><td colspan="6">暂无用户</td></tr>';
       document.querySelectorAll('[data-edit]').forEach((button) => {
         button.addEventListener('click', () => editUser(button.dataset.edit));
-      });
-      document.querySelectorAll('[data-permission-edit]').forEach((button) => {
-        button.addEventListener('click', () => openPermissionModalForUser(button.dataset.permissionEdit));
       });
       document.querySelectorAll('[data-reset]').forEach((button) => {
         button.addEventListener('click', () => resetPassword(button.dataset.reset).catch((err) => toast(err.message)));
@@ -5399,15 +5409,25 @@ OPERATOR_PAGE = r"""
     .nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     a, button {
       border: 1px solid rgba(17,16,13,.12);
-      border-radius: 12px;
-      padding: 9px 12px;
+      border-radius: 999px;
+      min-height: 36px;
+      padding: 8px 12px;
       background: rgba(255,255,255,.38);
       color: var(--ink);
       text-decoration: none;
       font: 13px/1.2 inherit;
       cursor: pointer;
+      white-space: nowrap;
+      transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease;
+    }
+    button:hover:not(:disabled), a:hover { transform: translateY(-1px); }
+    button:disabled {
+      opacity: .42;
+      cursor: not-allowed;
+      transform: none;
     }
     button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+    button.claim { color: #fff; background: var(--accent-2); border-color: var(--accent-2); }
     button.good { color: #fff; background: var(--good); border-color: var(--good); }
     button.bad { color: #fff; background: var(--bad); border-color: var(--bad); }
     .badge {
@@ -5417,38 +5437,188 @@ OPERATOR_PAGE = r"""
       color: var(--muted);
       font: 12px/1 var(--mono);
     }
-    .panel { padding: 16px; }
+    .panel {
+      overflow: hidden;
+    }
+    .workspace-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 16px;
+      border-bottom: 1px solid rgba(17,16,13,.1);
+      align-items: center;
+      flex-wrap: wrap;
+    }
     .toolbar {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
       align-items: center;
-      margin-bottom: 16px;
+    }
+    .field-inline {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 999px;
+      padding: 4px 6px 4px 12px;
+      background: rgba(255,255,255,.38);
+      color: var(--muted);
+      font: 12px/1 var(--mono);
     }
     input {
       border: 1px solid rgba(17,16,13,.14);
       background: rgba(255,255,255,.55);
       color: var(--ink);
-      border-radius: 12px;
-      padding: 10px 11px;
+      border-radius: 999px;
+      min-height: 32px;
+      padding: 8px 10px;
       font: 14px/1.2 var(--body);
       outline: none;
     }
-    input[type="number"] { width: 110px; }
-    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 14px; }
+    input[type="number"] { width: 78px; }
+    .queue-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(92px, 1fr));
+      gap: 8px;
+      min-width: min(520px, 100%);
+    }
+    .summary-item {
+      border: 1px solid rgba(17,16,13,.1);
+      border-radius: 12px;
+      padding: 9px 11px;
+      background: rgba(255,255,255,.34);
+    }
+    .summary-label {
+      color: var(--muted);
+      font: 11px/1.1 var(--mono);
+    }
+    .summary-value {
+      margin-top: 5px;
+      font-size: 20px;
+      line-height: 1;
+      font-weight: 800;
+    }
+    .table-shell {
+      max-height: calc(100vh - 210px);
+      overflow: auto;
+    }
+    table {
+      width: 100%;
+      min-width: 980px;
+      border-collapse: separate;
+      border-spacing: 0;
+      table-layout: fixed;
+    }
+    col.email { width: 31%; }
+    col.status { width: 15%; }
+    col.checkout { width: 15%; }
+    col.operator { width: 12%; }
+    col.note { width: 14%; }
+    col.actions { width: 13%; }
     th, td {
       text-align: left;
-      padding: 11px 10px;
+      padding: 13px 10px;
       border-bottom: 1px solid rgba(17,16,13,.1);
-      vertical-align: top;
+      vertical-align: middle;
       font-size: 13px;
     }
-    th { color: var(--muted); font: 11px/1.2 var(--mono); background: rgba(255,255,255,.26); }
+    th {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: var(--muted);
+      font: 11px/1.2 var(--mono);
+      background: rgba(248,241,229,.96);
+      backdrop-filter: blur(14px);
+    }
+    tbody tr {
+      background: rgba(255,255,255,.16);
+      transition: background .16s ease;
+    }
+    tbody tr:hover { background: rgba(255,255,255,.34); }
+    tbody tr.is-claimed { box-shadow: inset 3px 0 0 rgba(216,97,44,.72); }
+    tbody tr.is-marked { box-shadow: inset 3px 0 0 rgba(45,122,70,.72); }
+    tbody tr.is-failed { box-shadow: inset 3px 0 0 rgba(163,59,47,.72); }
     td code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
-    .status-pending { color: var(--accent-2); }
-    .status-claimed { color: var(--accent); }
-    .status-marked { color: var(--good); }
-    .status-failed { color: var(--bad); }
+    .email-main {
+      font-weight: 800;
+      word-break: break-all;
+    }
+    .meta-line {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .mini-pill, .status-pill, .checkout-link, .checkout-copy {
+      display: inline-flex;
+      align-items: center;
+      width: fit-content;
+      border-radius: 999px;
+      border: 1px solid rgba(17,16,13,.1);
+      background: rgba(255,255,255,.38);
+      padding: 5px 8px;
+      line-height: 1;
+      font-size: 12px;
+    }
+    .status-pill {
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+    .status-pending { color: var(--accent-2); background: rgba(15,107,95,.09); border-color: rgba(15,107,95,.18); }
+    .status-claimed { color: var(--accent); background: rgba(216,97,44,.11); border-color: rgba(216,97,44,.22); }
+    .status-marked { color: var(--good); background: rgba(45,122,70,.1); border-color: rgba(45,122,70,.2); }
+    .status-failed { color: var(--bad); background: rgba(163,59,47,.1); border-color: rgba(163,59,47,.2); }
+    .checkout-link {
+      color: var(--accent-2);
+      text-decoration: none;
+      font-weight: 800;
+    }
+    .checkout-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .checkout-copy {
+      color: #fff;
+      background: var(--accent-2);
+      border-color: var(--accent-2);
+      font-weight: 800;
+    }
+    .checkout-copy.copied {
+      background: var(--good);
+      border-color: var(--good);
+    }
+    .muted {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .operator-chip {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 6px 9px;
+      background: rgba(255,255,255,.36);
+      border: 1px solid rgba(17,16,13,.1);
+      color: var(--ink);
+      font-size: 12px;
+    }
+    .action-row {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .action-row button {
+      min-width: 58px;
+      padding-inline: 11px;
+      font-weight: 800;
+    }
     .empty {
       padding: 42px 16px;
       color: var(--muted);
@@ -5469,7 +5639,10 @@ OPERATOR_PAGE = r"""
     }
     .toast.show { opacity: 1; transform: translateY(0); }
     @media (max-width: 920px) {
-      table { display: block; overflow-x: auto; }
+      .workspace-head { align-items: stretch; }
+      .toolbar { width: 100%; }
+      .queue-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 0; width: 100%; }
+      .table-shell { max-height: none; }
     }
   </style>
 </head>
@@ -5485,23 +5658,39 @@ OPERATOR_PAGE = r"""
       </nav>
     </header>
     <section class="panel">
-      <div class="toolbar">
-        <input id="pageSize" type="number" min="10" max="200" value="30" />
-        <button class="primary" id="reloadBtn" type="button">重新加载</button>
+      <div class="workspace-head">
+        <div class="toolbar">
+          <label class="field-inline" title="每页条数">
+            <span>每页</span>
+            <input id="pageSize" type="number" min="10" max="200" value="30" />
+          </label>
+          <button class="primary" id="reloadBtn" type="button">重新加载</button>
+        </div>
+        <div class="queue-summary" id="queueSummary"></div>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>邮箱</th>
-            <th>状态</th>
-            <th>Checkout</th>
-            <th>领取人</th>
-            <th>备注</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
+      <div class="table-shell">
+        <table>
+          <colgroup>
+            <col class="email" />
+            <col class="status" />
+            <col class="checkout" />
+            <col class="operator" />
+            <col class="note" />
+            <col class="actions" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>邮箱</th>
+              <th>状态</th>
+              <th>Checkout</th>
+              <th>领取人</th>
+              <th>备注</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
     </section>
   </main>
   <div class="toast" id="toast"></div>
@@ -5510,6 +5699,10 @@ OPERATOR_PAGE = r"""
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
     let items = [];
     let currentUser = {};
+    function hasValue(value) {
+      const text = String(value ?? '').trim();
+      return Boolean(text && text.toLowerCase() !== 'null');
+    }
     function toast(message) {
       const node = $('toast');
       node.textContent = message;
@@ -5533,14 +5726,17 @@ OPERATOR_PAGE = r"""
       if (Number.isNaN(date.getTime())) return value;
       return date.toLocaleString('zh-CN', { hour12: false });
     }
-    function statusClass(value) {
+    function statusTone(value) {
       return {
-        '待订阅': 'status-pending',
-        '处理中': 'status-claimed',
-        '已点击订阅': 'status-marked',
-        '已确认订阅': 'status-marked',
-        '订阅失败': 'status-failed',
-      }[value] || 'status-pending';
+        '待订阅': 'pending',
+        '处理中': 'claimed',
+        '已点击订阅': 'marked',
+        '已确认订阅': 'marked',
+        '订阅失败': 'failed',
+      }[value] || 'pending';
+    }
+    function statusClass(value) {
+      return `status-${statusTone(value)}`;
     }
     function statusLabel(value) {
       return value || '待订阅';
@@ -5560,6 +5756,58 @@ OPERATOR_PAGE = r"""
       if (Number.isNaN(date.getTime())) return true;
       return date.getTime() <= Date.now();
     }
+    function statusMeta(item) {
+      const status = item.subscription_status || '待订阅';
+      if (status === '处理中') {
+        return hasValue(item.subscription_claim_expires_at)
+          ? `到期 ${formatDate(item.subscription_claim_expires_at)}`
+          : '处理中';
+      }
+      if (status === '订阅失败') return '可重新领取';
+      if (status === '已点击订阅') return '等待确认';
+      if (status === '已确认订阅') return '已确认';
+      return '等待领取';
+    }
+    async function clipboardWrite(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return;
+        } catch (err) {
+          // fallback below
+        }
+      }
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.position = 'fixed';
+      textarea.style.top = '0';
+      textarea.style.left = '0';
+      textarea.style.opacity = '0';
+      textarea.style.pointerEvents = 'none';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      textarea.setSelectionRange(0, text.length);
+      let ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch (err) {
+        ok = false;
+      }
+      document.body.removeChild(textarea);
+      if (!ok) throw new Error('当前环境不支持复制');
+    }
+    async function copyCheckoutLink(value, node) {
+      const text = String(value || '').trim();
+      if (!hasValue(text)) return toast('没有可复制内容');
+      await clipboardWrite(text);
+      toast('Checkout 链接已复制，请用无痕浏览器打开');
+      if (node) {
+        node.classList.add('copied');
+        setTimeout(() => node.classList.remove('copied'), 700);
+      }
+    }
     async function loadCurrentUser() {
       const data = await request('/api/auth/me');
       const user = data.user || {};
@@ -5571,7 +5819,27 @@ OPERATOR_PAGE = r"""
       const data = await request(`/api/operator/subscriptions?page=1&page_size=${encodeURIComponent(pageSize)}`);
       items = data.items || [];
       $('queueCount').textContent = `数量 ${items.length}`;
+      renderQueueSummary();
       renderRows();
+    }
+    function renderQueueSummary() {
+      const counts = { pending: 0, claimed: 0, marked: 0, failed: 0 };
+      for (const item of items) {
+        const tone = statusTone(item.subscription_status || '待订阅');
+        if (tone in counts) counts[tone] += 1;
+      }
+      const cards = [
+        ['待订阅', counts.pending],
+        ['处理中', counts.claimed],
+        ['已完成', counts.marked],
+        ['失败', counts.failed],
+      ];
+      $('queueSummary').innerHTML = cards.map(([label, value]) => `
+        <div class="summary-item">
+          <div class="summary-label">${escapeHtml(label)}</div>
+          <div class="summary-value">${escapeHtml(value)}</div>
+        </div>
+      `).join('');
     }
     function renderRows() {
       if (!items.length) {
@@ -5580,29 +5848,58 @@ OPERATOR_PAGE = r"""
       }
       $('rows').innerHTML = items.map((item) => {
         const status = item.subscription_status || '待订阅';
-        const claimedBy = item.subscription_operator_id || '-';
-        const note = item.subscription_note === 'null' ? '' : (item.subscription_note || '');
-        const checkout = item.checkout_url && item.checkout_url !== 'null'
-          ? `<a href="${escapeHtml(item.checkout_url)}" target="_blank" rel="noreferrer">打开链接</a>`
-          : '领取后可打开';
+        const tone = statusTone(status);
         const owned = sameOperator(item);
+        const claimedByRaw = item.subscription_operator_id;
+        const claimedBy = hasValue(claimedByRaw)
+          ? (owned ? '我' : `#${escapeHtml(claimedByRaw)}`)
+          : '未领取';
+        const note = hasValue(item.subscription_note)
+          ? `<code>${escapeHtml(item.subscription_note)}</code>`
+          : '<span class="muted">无</span>';
+        const checkout = hasValue(item.checkout_url)
+          ? `
+            <div class="checkout-stack">
+              <button type="button" class="checkout-copy" data-copy-checkout="${escapeHtml(item.checkout_url)}">复制链接</button>
+              <span class="muted">建议用无痕浏览器打开</span>
+            </div>
+          `
+          : '<span class="muted">领取后可复制</span>';
         const canClaim = hasPermission('claim_subscription_account') && (status === '待订阅' || status === '订阅失败' || (status === '处理中' && (owned || claimExpired(item))));
         const canFinish = status === '处理中' && owned && hasPermission('mark_subscription_done');
         const canFail = status === '处理中' && owned && hasPermission('mark_subscription_failed');
         const canRelease = status === '处理中' && owned && hasPermission('claim_subscription_account');
-        const actions = `
-          <button type="button" data-claim="${escapeHtml(item.id)}" ${canClaim ? '' : 'disabled'}>${owned ? '续领' : '领取'}</button>
-          <button type="button" data-submitted="${escapeHtml(item.id)}" class="good" ${canFinish ? '' : 'disabled'}>已订阅</button>
-          <button type="button" data-failed="${escapeHtml(item.id)}" class="bad" ${canFail ? '' : 'disabled'}>失败</button>
-          <button type="button" data-release="${escapeHtml(item.id)}" ${canRelease ? '' : 'disabled'}>释放</button>
-        `;
+        const actions = (() => {
+          if (status === '处理中') {
+            if (!owned && !hasPermission('claim_subscription_account')) {
+              return '<span class="muted">处理中</span>';
+            }
+            return `
+              <div class="action-row">
+                <button type="button" data-submitted="${escapeHtml(item.id)}" class="good" ${canFinish ? '' : 'disabled'}>已订阅</button>
+                <button type="button" data-failed="${escapeHtml(item.id)}" class="bad" ${canFail ? '' : 'disabled'}>失败</button>
+                <button type="button" data-release="${escapeHtml(item.id)}" ${canRelease ? '' : 'disabled'}>释放</button>
+              </div>
+            `;
+          }
+          if (canClaim) {
+            return `<button type="button" data-claim="${escapeHtml(item.id)}" class="claim">${status === '订阅失败' ? '重新领取' : (owned ? '续领' : '领取')}</button>`;
+          }
+          return '<span class="muted">待处理</span>';
+        })();
         return `
-          <tr>
-            <td><strong>${escapeHtml(item.email)}</strong><br><code>${escapeHtml(item.subscription_type || 'null')}</code></td>
-            <td class="${statusClass(status)}">${escapeHtml(statusLabel(status))}<br><code>${escapeHtml(formatDate(item.subscription_claim_expires_at))}</code></td>
+          <tr class="is-${tone}">
+            <td>
+              <div class="email-main">${escapeHtml(item.email)}</div>
+              <div class="meta-line"><span class="mini-pill">${escapeHtml(hasValue(item.subscription_type) ? item.subscription_type : '无')}</span></div>
+            </td>
+            <td>
+              <div class="status-pill ${statusClass(status)}">${escapeHtml(statusLabel(status))}</div>
+              <div class="muted">${escapeHtml(statusMeta(item))}</div>
+            </td>
             <td>${checkout}</td>
-            <td>${escapeHtml(claimedBy)}</td>
-            <td><code>${escapeHtml(note || '')}</code></td>
+            <td><span class="operator-chip">${escapeHtml(claimedBy)}</span></td>
+            <td>${note}</td>
             <td>${actions}</td>
           </tr>
         `;
@@ -5618,6 +5915,9 @@ OPERATOR_PAGE = r"""
       });
       document.querySelectorAll('[data-release]').forEach((button) => {
         button.addEventListener('click', () => releaseAccount(button.dataset.release).catch((err) => toast(err.message)));
+      });
+      document.querySelectorAll('[data-copy-checkout]').forEach((button) => {
+        button.addEventListener('click', () => copyCheckoutLink(button.dataset.copyCheckout, button).catch((err) => toast(err.message)));
       });
     }
     async function claimAccount(id) {

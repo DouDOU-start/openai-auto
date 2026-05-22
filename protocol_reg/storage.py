@@ -750,9 +750,10 @@ def count_subscription_queue_db() -> int:
             SELECT COUNT(*)
             FROM accounts
             WHERE stock_status = ?
+              AND COALESCE(status, '') != ?
               AND checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''
             """,
-            (STOCK_STATUS_IN,),
+            (STOCK_STATUS_IN, ACCOUNT_STATUS_ABANDONED),
         ).fetchone()
     return int(row[0] if row is not None else 0)
 
@@ -768,7 +769,12 @@ def list_subscription_queue_db(
     effective_page = max(1, int(page))
     effective_page_size = max(1, min(500, int(page_size)))
     offset = (effective_page - 1) * effective_page_size
-    params: list[Any] = [STOCK_STATUS_IN, SUBSCRIPTION_STATUS_PENDING, SUBSCRIPTION_STATUS_FAILED]
+    params: list[Any] = [
+        STOCK_STATUS_IN,
+        ACCOUNT_STATUS_ABANDONED,
+        SUBSCRIPTION_STATUS_PENDING,
+        SUBSCRIPTION_STATUS_FAILED,
+    ]
     operator_clause = ""
     if operator_user_id is not None:
         operator_clause = " OR subscription_operator_id = ?"
@@ -795,6 +801,7 @@ def list_subscription_queue_db(
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             WHERE stock_status = ?
+              AND COALESCE(status, '') != ?
               AND checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''
               AND (
                     subscription_status IN (?, ?)
@@ -835,7 +842,7 @@ def claim_subscription_account_db(account_id: int, operator_user_id: int, *, cla
         row = db_manager.execute_sql(
             cursor,
             """
-            SELECT subscription_status, subscription_operator_id, subscription_claim_expires_at
+            SELECT status, subscription_status, subscription_operator_id, subscription_claim_expires_at
             FROM accounts
             WHERE id = ?
             """,
@@ -843,6 +850,9 @@ def claim_subscription_account_db(account_id: int, operator_user_id: int, *, cla
         ).fetchone()
         if row is None:
             raise KeyError(f"账号不存在: {account_id}")
+        account_status = _field(row["status"]) if "status" in row.keys() else ACCOUNT_STATUS_ACTIVE
+        if account_status == ACCOUNT_STATUS_ABANDONED:
+            raise ValueError("废弃账号不允许操作")
         current_status = _field(row["subscription_status"]) if "subscription_status" in row.keys() else SUBSCRIPTION_STATUS_PENDING
         current_operator = _field(row["subscription_operator_id"]) if "subscription_operator_id" in row.keys() else NULL_VALUE
         current_expires = _field(row["subscription_claim_expires_at"]) if "subscription_claim_expires_at" in row.keys() else NULL_VALUE
@@ -962,7 +972,7 @@ def _update_subscription_account_status(
         existing = db_manager.execute_sql(
             cursor,
             """
-            SELECT id, subscription_operator_id, subscription_status
+            SELECT id, status, subscription_operator_id, subscription_status
             FROM accounts
             WHERE id = ?
             """,
@@ -970,6 +980,9 @@ def _update_subscription_account_status(
         ).fetchone()
         if existing is None:
             raise KeyError(f"账号不存在: {account_id}")
+        account_status = _field(existing["status"]) if "status" in existing.keys() else ACCOUNT_STATUS_ACTIVE
+        if account_status == ACCOUNT_STATUS_ABANDONED:
+            raise ValueError("废弃账号不允许操作")
         current_operator = _field(existing["subscription_operator_id"]) if "subscription_operator_id" in existing.keys() else NULL_VALUE
         current_status = _normalize_subscription_status(existing["subscription_status"]) if "subscription_status" in existing.keys() else SUBSCRIPTION_STATUS_PENDING
         if allowed_current_statuses is not None and current_status not in set(allowed_current_statuses):
@@ -1192,7 +1205,7 @@ def update_web_user(
     next_display_name = current.get("display_name", "")
     next_role = current.get("role", AUTH_ROLE_OPERATOR)
     next_status = current.get("status", AUTH_STATUS_ACTIVE)
-    next_permissions = _load_permissions(current.get("permissions_json"))
+    next_permissions = _load_permissions(current.get("permissions_json"), current.get("role"))
     next_must_change = _bool_from_value(current.get("must_change_password"))
     if display_name is not None:
         next_display_name = str(display_name or "").strip()
@@ -1926,12 +1939,13 @@ def _account_from_row(row: Any) -> dict[str, str]:
 
 
 def _web_user_from_row(row: Any) -> dict[str, str]:
-    permissions = _load_permissions(row["permissions_json"])
+    role = _normalize_auth_role(row["role"])
+    permissions = _load_permissions(row["permissions_json"], role)
     return {
         "id": str(row["id"]),
         "username": _field(row["username"]).lower(),
         "display_name": str(row["display_name"] or "").strip(),
-        "role": _normalize_auth_role(row["role"]),
+        "role": role,
         "permissions": permissions,
         "permissions_json": json.dumps(permissions, ensure_ascii=False, separators=(",", ":")),
         "status": _normalize_auth_status(row["status"]),
@@ -1962,31 +1976,11 @@ def _permissions_json(permissions: list[str] | tuple[str, ...] | None, role: str
 def _normalize_permissions(permissions: list[str] | tuple[str, ...] | None, role: str) -> list[str]:
     if role == AUTH_ROLE_ADMIN:
         return list(ADMIN_PERMISSIONS)
-    values = list(DEFAULT_OPERATOR_PERMISSIONS if permissions is None else permissions)
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for value in values:
-        item = str(value or "").strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        normalized.append(item)
-    return normalized
+    return list(DEFAULT_OPERATOR_PERMISSIONS)
 
 
-def _load_permissions(raw: object) -> list[str]:
-    if isinstance(raw, list):
-        return _normalize_permissions([str(item) for item in raw], AUTH_ROLE_OPERATOR)
-    text = str(raw or "").strip()
-    if not text:
-        return []
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return []
-    if isinstance(data, list):
-        return [str(item) for item in data if str(item or "").strip()]
-    return []
+def _load_permissions(raw: object, role: object = AUTH_ROLE_OPERATOR) -> list[str]:
+    return _normalize_permissions(None, _normalize_auth_role(role))
 
 
 def _bool_from_value(value: object) -> bool:
