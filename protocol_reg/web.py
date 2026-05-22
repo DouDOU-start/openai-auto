@@ -4874,6 +4874,9 @@ ADMIN_USERS_PAGE = r"""
       background: rgba(17,16,13,.34);
       z-index: 20;
     }
+    #permissionModal {
+      z-index: 30;
+    }
     .modal-backdrop.hidden { display: none; }
     .modal {
       width: min(520px, calc(100vw - 40px));
@@ -4893,6 +4896,9 @@ ADMIN_USERS_PAGE = r"""
     .modal-head h2 {
       margin: 0;
       font-size: 20px;
+    }
+    .modal-user {
+      width: min(760px, calc(100vw - 40px));
     }
     .modal-close {
       width: 34px;
@@ -4954,28 +4960,8 @@ ADMIN_USERS_PAGE = r"""
       </nav>
     </header>
     <section class="panel">
-      <input type="hidden" id="userId" />
-      <div class="grid">
-        <label>用户名<input id="username" placeholder="operator01" autocomplete="off" /></label>
-        <label>显示名<input id="displayName" placeholder="操作员姓名" autocomplete="off" /></label>
-        <label>初始密码<input id="password" type="password" placeholder="新建时必填" autocomplete="new-password" /></label>
-        <label>状态
-          <select id="status">
-            <option value="active">active</option>
-            <option value="disabled">disabled</option>
-          </select>
-        </label>
-        <div class="actions">
-          <button class="primary" id="saveBtn" type="button">创建操作员</button>
-          <button id="cancelBtn" type="button">清空</button>
-        </div>
-        <div class="permission-field">
-          <div>权限</div>
-          <div class="permission-editor">
-            <div class="permission-summary" id="permissionSummary"></div>
-            <button id="openPermissionModalBtn" type="button">编辑权限</button>
-          </div>
-        </div>
+      <div class="toolbar" style="display:flex;justify-content:flex-end;margin-bottom:16px;">
+        <button class="primary" id="newUserBtn" type="button">新增操作员</button>
       </div>
       <table>
         <thead>
@@ -4993,6 +4979,37 @@ ADMIN_USERS_PAGE = r"""
       </table>
     </section>
   </main>
+  <div class="modal-backdrop hidden" id="userModal" role="dialog" aria-modal="true" aria-labelledby="userModalTitle">
+    <div class="modal modal-user">
+      <div class="modal-head">
+        <h2 id="userModalTitle">新增操作员</h2>
+        <button class="modal-close" id="userModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <input type="hidden" id="userId" />
+      <div class="grid">
+        <label>用户名<input id="username" placeholder="operator01" autocomplete="off" /></label>
+        <label>显示名<input id="displayName" placeholder="操作员姓名" autocomplete="off" /></label>
+        <label>初始密码<input id="password" type="password" placeholder="新建时必填" autocomplete="new-password" /></label>
+        <label>状态
+          <select id="status">
+            <option value="active">启用</option>
+            <option value="disabled">禁用</option>
+          </select>
+        </label>
+        <div class="permission-field">
+          <div>权限</div>
+          <div class="permission-editor">
+            <div class="permission-summary" id="permissionSummary"></div>
+            <button id="openPermissionModalBtn" type="button">编辑权限</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button id="cancelBtn" type="button">取消</button>
+        <button class="primary" id="saveBtn" type="button">保存用户</button>
+      </div>
+    </div>
+  </div>
   <div class="modal-backdrop hidden" id="permissionModal" role="dialog" aria-modal="true" aria-labelledby="permissionModalTitle">
     <div class="modal">
       <div class="modal-head">
@@ -5021,6 +5038,12 @@ ADMIN_USERS_PAGE = r"""
     let selectedPermissions = [...DEFAULT_PERMISSIONS];
     let formRole = 'operator';
     let permissionModalContext = { type: 'form', userId: '' };
+    function roleLabel(role) {
+      return String(role || '').toLowerCase() === 'admin' ? '管理员' : '操作员';
+    }
+    function statusLabel(status) {
+      return String(status || '').toLowerCase() === 'disabled' ? '禁用' : '启用';
+    }
     function toast(message) {
       const node = $('toast');
       node.textContent = message;
@@ -5088,7 +5111,7 @@ ADMIN_USERS_PAGE = r"""
     async function loadCurrentUser() {
       const data = await request('/api/auth/me');
       const user = data.user || {};
-      $('currentUser').textContent = `${user.username || '未知'} · ${user.role === 'admin' ? '管理员' : '操作员'}`;
+      $('currentUser').textContent = `${user.username || '未知'} · ${roleLabel(user.role)}`;
     }
     async function loadUsers() {
       const data = await request('/api/admin/users');
@@ -5107,8 +5130,8 @@ ADMIN_USERS_PAGE = r"""
           <tr>
             <td>${escapeHtml(user.id)}</td>
             <td><strong>${escapeHtml(user.username)}</strong><br>${escapeHtml(user.display_name || '')}</td>
-            <td>${escapeHtml(user.role)}</td>
-            <td class="${statusClass}">${escapeHtml(user.status)}</td>
+            <td>${escapeHtml(roleLabel(user.role))}</td>
+            <td class="${statusClass}">${escapeHtml(statusLabel(user.status))}</td>
             <td>${permissionTags(user.permissions || [])}</td>
             <td>${escapeHtml(formatDate(user.last_login_at))}</td>
             <td>${actions}</td>
@@ -5135,10 +5158,25 @@ ADMIN_USERS_PAGE = r"""
       $('status').value = 'active';
       setPermissions(DEFAULT_PERMISSIONS);
       $('saveBtn').textContent = '创建操作员';
+      $('userModalTitle').textContent = '新增操作员';
+      $('permissionModalSave').disabled = false;
+    }
+    function openUserModalForCreate() {
+      closePermissionModal();
+      clearForm();
+      $('userModal').classList.remove('hidden');
+      setTimeout(() => $('username').focus(), 0);
+    }
+    function closeUserModal() {
+      closePermissionModal();
+      $('userModal').classList.add('hidden');
+      clearForm();
     }
     function editUser(id) {
       const user = users.find((item) => String(item.id) === String(id));
       if (!user) return;
+      closePermissionModal();
+      clearForm();
       $('userId').value = user.id;
       $('username').value = user.username;
       $('username').disabled = true;
@@ -5146,8 +5184,11 @@ ADMIN_USERS_PAGE = r"""
       $('password').value = '';
       $('status').value = user.status || 'active';
       formRole = user.role || 'operator';
-      setPermissions(user.permissions || DEFAULT_PERMISSIONS);
+      setPermissions(user.permissions || (formRole === 'admin' ? ['*'] : DEFAULT_PERMISSIONS));
       $('saveBtn').textContent = '保存修改';
+      $('userModalTitle').textContent = '编辑用户';
+      $('userModal').classList.remove('hidden');
+      setTimeout(() => $('displayName').focus(), 0);
     }
     function openPermissionModalForForm() {
       if (formRole === 'admin') {
@@ -5176,6 +5217,16 @@ ADMIN_USERS_PAGE = r"""
     function closePermissionModal() {
       $('permissionModal').classList.add('hidden');
       permissionModalContext = { type: 'form', userId: '' };
+    }
+    function closeTopModalOnEscape(event) {
+      if (event.key !== 'Escape') return;
+      if (!$('permissionModal').classList.contains('hidden')) {
+        closePermissionModal();
+        return;
+      }
+      if (!$('userModal').classList.contains('hidden')) {
+        closeUserModal();
+      }
     }
     async function savePermissionModal() {
       const permissions = modalPermissionsArray();
@@ -5213,7 +5264,7 @@ ADMIN_USERS_PAGE = r"""
         await request(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) });
         toast('用户已更新');
       }
-      clearForm();
+      closeUserModal();
       await loadUsers();
     }
     async function resetPassword(id) {
@@ -5225,6 +5276,12 @@ ADMIN_USERS_PAGE = r"""
       });
       toast('密码已重置');
     }
+    $('newUserBtn').addEventListener('click', openUserModalForCreate);
+    $('userModalClose').addEventListener('click', closeUserModal);
+    $('cancelBtn').addEventListener('click', closeUserModal);
+    $('userModal').addEventListener('click', (event) => {
+      if (event.target === $('userModal')) closeUserModal();
+    });
     $('openPermissionModalBtn').addEventListener('click', openPermissionModalForForm);
     $('permissionModalClose').addEventListener('click', closePermissionModal);
     $('permissionModalCancel').addEventListener('click', closePermissionModal);
@@ -5236,7 +5293,7 @@ ADMIN_USERS_PAGE = r"""
       toast(err.message);
     }));
     $('saveBtn').addEventListener('click', () => saveUser().catch((err) => toast(err.message)));
-    $('cancelBtn').addEventListener('click', clearForm);
+    document.addEventListener('keydown', closeTopModalOnEscape);
     $('logoutBtn').addEventListener('click', async () => {
       try { await request('/api/auth/logout', { method: 'POST' }); } catch (err) {}
       window.location.href = '/login';
