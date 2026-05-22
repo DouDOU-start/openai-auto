@@ -1259,6 +1259,70 @@ def set_web_user_password(user_id: int, password: str, *, must_change_password: 
     return user
 
 
+def delete_web_user(user_id: int) -> dict[str, Any]:
+    init_accounts_db()
+    current = get_web_user_by_id(user_id)
+    if current is None:
+        raise KeyError(f"用户不存在: {user_id}")
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            "UPDATE web_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            (now, int(user_id)),
+        )
+        if str(current.get("role") or "").strip().lower() == AUTH_ROLE_OPERATOR:
+            db_manager.execute_sql(
+                cursor,
+                """
+                UPDATE accounts
+                SET subscription_status = CASE
+                        WHEN subscription_operator_id = ? AND subscription_status = ? THEN ?
+                        ELSE subscription_status
+                    END,
+                    subscription_operator_id = CASE
+                        WHEN subscription_operator_id = ? THEN NULL
+                        ELSE subscription_operator_id
+                    END,
+                    subscription_claimed_at = CASE
+                        WHEN subscription_operator_id = ? AND subscription_status = ? THEN NULL
+                        ELSE subscription_claimed_at
+                    END,
+                    subscription_claim_expires_at = CASE
+                        WHEN subscription_operator_id = ? AND subscription_status = ? THEN NULL
+                        ELSE subscription_claim_expires_at
+                    END,
+                    subscription_note = CASE
+                        WHEN subscription_operator_id = ? AND subscription_status = ? THEN ?
+                        ELSE subscription_note
+                    END,
+                    updated_at = ?
+                WHERE subscription_operator_id = ?
+                """,
+                (
+                    int(user_id),
+                    SUBSCRIPTION_STATUS_CLAIMED,
+                    SUBSCRIPTION_STATUS_PENDING,
+                    int(user_id),
+                    int(user_id),
+                    SUBSCRIPTION_STATUS_CLAIMED,
+                    int(user_id),
+                    SUBSCRIPTION_STATUS_CLAIMED,
+                    int(user_id),
+                    SUBSCRIPTION_STATUS_CLAIMED,
+                    NULL_VALUE,
+                    now,
+                    int(user_id),
+                ),
+            )
+        deleted = db_manager.execute_sql(cursor, "DELETE FROM web_users WHERE id = ?", (int(user_id),))
+        if deleted.rowcount <= 0:
+            raise KeyError(f"用户不存在: {user_id}")
+    return current
+
+
 def authenticate_web_user(
     username: str,
     password: str,

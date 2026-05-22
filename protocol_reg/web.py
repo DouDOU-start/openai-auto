@@ -47,6 +47,7 @@ from .storage import (
     claim_subscription_account_db,
     count_account_rows,
     delete_account_db,
+    delete_web_user,
     init_accounts_db,
     get_account_db,
     list_account_rows,
@@ -891,6 +892,32 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         revoke_web_sessions_for_user(user_id)
         record_audit_log(int(actor["id"]), "reset_password", target_type="web_user", target_id=str(user_id), detail={"username": user["username"]}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
         return {"item": _public_web_user(user)}
+
+    @app.delete("/api/admin/users/{user_id}")
+    def api_delete_web_user(user_id: int, request: Request) -> dict[str, Any]:
+        actor = _require_admin_user(request)
+        if str(actor.get("id") or "") == str(user_id):
+            raise HTTPException(status_code=400, detail="不能删除当前登录账号")
+        users = list_web_users()
+        current = next((item for item in users if str(item.get("id")) == str(user_id)), None)
+        if current is None:
+            raise HTTPException(status_code=404, detail=f"用户不存在: {user_id}")
+        if str(current.get("role") or "").strip().lower() == AUTH_ROLE_ADMIN:
+            other_active_admins = [
+                item
+                for item in users
+                if str(item.get("id") or "") != str(user_id)
+                and str(item.get("role") or "").strip().lower() == AUTH_ROLE_ADMIN
+                and str(item.get("status") or "").strip().lower() == AUTH_STATUS_ACTIVE
+            ]
+            if not other_active_admins:
+                raise HTTPException(status_code=400, detail="至少保留一个启用的管理员")
+        try:
+            user = delete_web_user(user_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        record_audit_log(int(actor["id"]), "delete_user", target_type="web_user", target_id=str(user_id), detail={"username": user["username"], "role": user["role"]}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _public_web_user(user), "items": [_public_web_user(item) for item in list_web_users()]}
 
     @app.get("/operator", response_class=HTMLResponse)
     def operator_page() -> str:
@@ -5035,6 +5062,7 @@ ADMIN_USERS_PAGE = r"""
     ];
     const DEFAULT_PERMISSIONS = PERMISSIONS.map((item) => item[0]);
     let users = [];
+    let currentUserId = '';
     let selectedPermissions = [...DEFAULT_PERMISSIONS];
     let formRole = 'operator';
     let permissionModalContext = { type: 'form', userId: '' };
@@ -5111,7 +5139,9 @@ ADMIN_USERS_PAGE = r"""
     async function loadCurrentUser() {
       const data = await request('/api/auth/me');
       const user = data.user || {};
+      currentUserId = String(user.id || '');
       $('currentUser').textContent = `${user.username || '未知'} · ${roleLabel(user.role)}`;
+      return user;
     }
     async function loadUsers() {
       const data = await request('/api/admin/users');
@@ -5121,10 +5151,12 @@ ADMIN_USERS_PAGE = r"""
     function renderUsers() {
       $('userRows').innerHTML = users.map((user) => {
         const statusClass = user.status === 'disabled' ? 'status-disabled' : 'status-active';
+        const canDelete = String(user.id) !== currentUserId;
         const actions = `
           <button type="button" data-edit="${escapeHtml(user.id)}">编辑</button>
           ${user.role === 'admin' ? '' : `<button type="button" data-permission-edit="${escapeHtml(user.id)}">权限</button>`}
           <button type="button" data-reset="${escapeHtml(user.id)}">重置密码</button>
+          ${canDelete ? `<button class="danger" type="button" data-delete="${escapeHtml(user.id)}">删除</button>` : '<span class="muted">当前账号</span>'}
         `;
         return `
           <tr>
@@ -5146,6 +5178,9 @@ ADMIN_USERS_PAGE = r"""
       });
       document.querySelectorAll('[data-reset]').forEach((button) => {
         button.addEventListener('click', () => resetPassword(button.dataset.reset).catch((err) => toast(err.message)));
+      });
+      document.querySelectorAll('[data-delete]').forEach((button) => {
+        button.addEventListener('click', () => deleteUser(button.dataset.delete).catch((err) => toast(err.message)));
       });
     }
     function clearForm() {
@@ -5275,6 +5310,15 @@ ADMIN_USERS_PAGE = r"""
         body: JSON.stringify({ password, must_change_password: false }),
       });
       toast('密码已重置');
+    }
+    async function deleteUser(id) {
+      const user = users.find((item) => String(item.id) === String(id));
+      if (!user) return;
+      const confirmed = window.confirm(`确定删除用户 ${user.username} 吗？\n该用户的会话会失效，处理中账号会自动回到待订阅。`);
+      if (!confirmed) return;
+      await request(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      toast('用户已删除');
+      await loadUsers();
     }
     $('newUserBtn').addEventListener('click', openUserModalForCreate);
     $('userModalClose').addEventListener('click', closeUserModal);
