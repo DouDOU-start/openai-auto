@@ -17,8 +17,8 @@ from typing import Any
 
 from curl_cffi import requests
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 from .config import AppConfig, load_app_config
@@ -28,23 +28,49 @@ from .settings import Settings, proxy_preview, resolve_proxy_pool
 from .storage import (
     ACCOUNT_STATUS_ABANDONED,
     NULL_VALUE,
+    AUTH_ROLE_ADMIN,
+    AUTH_ROLE_OPERATOR,
+    AUTH_STATUS_ACTIVE,
     STOCK_STATUS_IN,
     STOCK_STATUS_OUT,
+    SUBSCRIPTION_STATUS_CLAIMED,
+    SUBSCRIPTION_STATUS_FAILED,
+    SUBSCRIPTION_STATUS_MARKED,
+    SUBSCRIPTION_STATUS_PENDING,
+    SUBSCRIPTION_STATUS_VERIFIED,
+    WEB_SESSION_TTL_SECONDS,
     build_accounts_db_txt,
     build_checkout_db_jsonl,
     build_tokens_db_jsonl,
     account_stats_db,
+    authenticate_web_user,
+    claim_subscription_account_db,
     count_account_rows,
     delete_account_db,
     init_accounts_db,
     get_account_db,
     list_account_rows,
     list_account_rows_by_ids,
+    list_subscription_queue_db,
+    mark_subscription_account_clicked_db,
+    mark_subscription_account_failed_db,
+    release_subscription_account_db,
+    list_web_users,
     save_account_storage,
     save_account_db_record,
     save_authorization_token_db,
     save_login_session_db,
+    create_web_session,
+    create_web_user,
+    ensure_bootstrap_admin_user,
+    record_audit_log,
+    resolve_web_session,
+    revoke_web_session,
+    revoke_web_sessions_for_user,
+    set_web_user_password,
+    verify_subscription_account_db,
     try_load_login_session_db,
+    update_web_user,
     update_account_checkout_url_db,
     update_account_status_db,
     update_account_subscription_type_db,
@@ -98,6 +124,43 @@ class AutoRegisterPayload(BaseModel):
 
 class PromptPayload(BaseModel):
     value: str
+
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+class OperatorPayload(BaseModel):
+    username: str
+    password: str
+    display_name: str = ""
+    permissions: list[str] | None = None
+    status: str = AUTH_STATUS_ACTIVE
+
+
+class UserUpdatePayload(BaseModel):
+    display_name: str | None = None
+    role: str | None = None
+    permissions: list[str] | None = None
+    status: str | None = None
+    must_change_password: bool | None = None
+
+
+class ResetPasswordPayload(BaseModel):
+    password: str
+    must_change_password: bool = False
+
+
+class SubscriptionActionPayload(BaseModel):
+    note: str = ""
+
+
+class ClaimPayload(BaseModel):
+    claim_minutes: int = 30
+
+
+WEB_SESSION_COOKIE = "protocol_reg_session"
 
 
 @dataclass(frozen=True)
@@ -588,6 +651,94 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     auto_scheduler = AutoRegisterScheduler(manager)
 
     app = FastAPI(title="Protocol Reg 账号管理", version="0.1.0")
+    app.state.bootstrap_admin = ensure_bootstrap_admin_user()
+
+    def _current_user_from_request(request: Request) -> dict[str, Any] | None:
+        current = getattr(request.state, "current_user", None)
+        if isinstance(current, dict) and current.get("id"):
+            return current
+        token = str(request.cookies.get(WEB_SESSION_COOKIE) or "").strip()
+        if not token:
+            return None
+        session = resolve_web_session(token)
+        if session is None:
+            return None
+        request.state.current_user = session
+        return session
+
+    def _require_current_user(request: Request) -> dict[str, Any]:
+        user = _current_user_from_request(request)
+        if user is None:
+            raise HTTPException(status_code=401, detail="未登录")
+        return user
+
+    def _require_admin_user(request: Request) -> dict[str, Any]:
+        user = _require_current_user(request)
+        role = str(user.get("role") or "").strip().lower()
+        if role != AUTH_ROLE_ADMIN:
+            raise HTTPException(status_code=403, detail="需要管理员权限")
+        return user
+
+    def _require_operator_user(request: Request) -> dict[str, Any]:
+        user = _require_current_user(request)
+        role = str(user.get("role") or "").strip().lower()
+        if role not in {AUTH_ROLE_ADMIN, AUTH_ROLE_OPERATOR}:
+            raise HTTPException(status_code=403, detail="需要操作员权限")
+        return user
+
+    def _has_operator_permission(user: dict[str, Any], permission: str) -> bool:
+        role = str(user.get("role") or "").strip().lower()
+        if role == AUTH_ROLE_ADMIN:
+            return True
+        permissions = user.get("permissions")
+        if not isinstance(permissions, list):
+            return False
+        normalized = {str(item).strip() for item in permissions if str(item or "").strip()}
+        return "*" in normalized or str(permission).strip() in normalized
+
+    def _require_operator_permission(request: Request, permission: str) -> dict[str, Any]:
+        user = _require_operator_user(request)
+        if not _has_operator_permission(user, permission):
+            raise HTTPException(status_code=403, detail="当前账号没有该操作权限")
+        return user
+
+    @app.middleware("http")
+    async def auth_middleware(request: Request, call_next):
+        path = request.url.path
+        if path == "/login":
+            user = _current_user_from_request(request)
+            if user is not None:
+                role = str(user.get("role") or "").strip().lower()
+                target = "/operator" if role == AUTH_ROLE_OPERATOR else "/"
+                return RedirectResponse(url=target, status_code=303)
+            return await call_next(request)
+        public_paths = {"/login", "/api/auth/login", "/api/auth/logout", "/api/auth/bootstrap"}
+        if path in public_paths:
+            response = await call_next(request)
+            return response
+        user = _current_user_from_request(request)
+        if user is None:
+            if path.startswith("/api/"):
+                return JSONResponse({"detail": "未登录或会话已过期"}, status_code=401)
+            return RedirectResponse(url="/login", status_code=303)
+        if path == "/api/auth/me":
+            return await call_next(request)
+        role = str(user.get("role") or "").strip().lower()
+        if path.startswith("/api/admin") or path.startswith("/admin"):
+            if role != AUTH_ROLE_ADMIN:
+                return JSONResponse({"detail": "需要管理员权限"}, status_code=403)
+        elif path.startswith("/api/operator") or path.startswith("/operator"):
+            if role not in {AUTH_ROLE_ADMIN, AUTH_ROLE_OPERATOR}:
+                return JSONResponse({"detail": "需要操作员权限"}, status_code=403)
+        else:
+            if role != AUTH_ROLE_ADMIN:
+                if path.startswith("/api/"):
+                    return JSONResponse({"detail": "需要管理员权限"}, status_code=403)
+                return RedirectResponse(url="/operator", status_code=303)
+        if path == "/login":
+            return RedirectResponse(url="/", status_code=303)
+        response = await call_next(request)
+        return response
 
     @app.on_event("startup")
     def startup() -> None:
@@ -596,6 +747,10 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     @app.on_event("shutdown")
     def shutdown() -> None:
         auto_scheduler.stop()
+
+    @app.get("/login", response_class=HTMLResponse)
+    def login_page() -> str:
+        return _render_login_page()
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
@@ -608,6 +763,214 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page() -> str:
         return _render_html_page("settings")
+
+    @app.get("/admin/users", response_class=HTMLResponse)
+    def admin_users_page() -> str:
+        return _render_admin_users_page()
+
+    @app.get("/api/auth/me")
+    def api_auth_me(request: Request) -> dict[str, Any]:
+        user = _current_user_from_request(request)
+        if user is None:
+            raise HTTPException(status_code=401, detail="未登录")
+        return {"user": _public_web_user(user)}
+
+    @app.post("/api/auth/login")
+    def api_auth_login(payload: LoginPayload, request: Request) -> dict[str, Any]:
+        ip = _request_ip(request)
+        user_agent = str(request.headers.get("user-agent") or "")
+        user = authenticate_web_user(payload.username, payload.password, ip=ip, user_agent=user_agent)
+        if user is None:
+            raise HTTPException(status_code=401, detail="用户名或密码错误")
+        session = create_web_session(int(user["id"]), ip=ip, user_agent=user_agent, ttl_seconds=WEB_SESSION_TTL_SECONDS)
+        record_audit_log(
+            int(user["id"]),
+            "login",
+            target_type="session",
+            target_id=session.get("session_id", ""),
+            detail={"username": user["username"]},
+            ip=ip,
+            user_agent=user_agent,
+        )
+        response = {"user": _public_web_user(user), "expires_at": session["expires_at"]}
+        http_response = JSONResponse(response)
+        http_response.set_cookie(
+            WEB_SESSION_COOKIE,
+            session["token"],
+            max_age=WEB_SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            path="/",
+        )
+        return http_response
+
+    @app.post("/api/auth/logout")
+    def api_auth_logout(request: Request) -> dict[str, Any]:
+        token = str(request.cookies.get(WEB_SESSION_COOKIE) or "").strip()
+        user = _current_user_from_request(request)
+        if token:
+            revoke_web_session(token)
+        if user is not None:
+            record_audit_log(int(user["id"]), "logout", target_type="session", target_id=user.get("session_id", ""), ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        response = JSONResponse({"ok": True})
+        response.delete_cookie(WEB_SESSION_COOKIE, path="/")
+        return response
+
+    @app.get("/api/admin/users")
+    def api_list_web_users(request: Request) -> dict[str, Any]:
+        _require_admin_user(request)
+        return {"items": [_public_web_user(user) for user in list_web_users()]}
+
+    @app.post("/api/admin/users")
+    def api_create_web_user(payload: OperatorPayload, request: Request) -> dict[str, Any]:
+        actor = _require_admin_user(request)
+        try:
+            user = create_web_user(
+                username=payload.username,
+                password=payload.password,
+                role=AUTH_ROLE_OPERATOR,
+                display_name=payload.display_name,
+                permissions=payload.permissions,
+                status=payload.status,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        record_audit_log(int(actor["id"]), "create_user", target_type="web_user", target_id=user["id"], detail={"username": user["username"], "role": user["role"]}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _public_web_user(user), "items": [_public_web_user(item) for item in list_web_users()]}
+
+    @app.patch("/api/admin/users/{user_id}")
+    def api_update_web_user(user_id: int, payload: UserUpdatePayload, request: Request) -> dict[str, Any]:
+        actor = _require_admin_user(request)
+        current = next((item for item in list_web_users() if str(item.get("id")) == str(user_id)), None)
+        if current is not None:
+            requested_role = str(payload.role or current.get("role") or AUTH_ROLE_OPERATOR).strip().lower()
+            if payload.role is not None and requested_role != str(current.get("role") or AUTH_ROLE_OPERATOR).strip().lower():
+                raise HTTPException(status_code=400, detail="不支持通过页面修改用户角色")
+            requested_status = str(payload.status or current.get("status") or AUTH_STATUS_ACTIVE).strip().lower()
+            if (
+                str(current.get("role") or "").strip().lower() == AUTH_ROLE_ADMIN
+                and requested_status != AUTH_STATUS_ACTIVE
+            ):
+                other_active_admins = [
+                    item
+                    for item in list_web_users()
+                    if str(item.get("id") or "") != str(user_id)
+                    and str(item.get("role") or "").strip().lower() == AUTH_ROLE_ADMIN
+                    and str(item.get("status") or "").strip().lower() == AUTH_STATUS_ACTIVE
+                ]
+                if not other_active_admins:
+                    raise HTTPException(status_code=400, detail="至少保留一个启用的管理员")
+        try:
+            user = update_web_user(
+                user_id,
+                display_name=payload.display_name,
+                role=None,
+                permissions=payload.permissions,
+                status=payload.status,
+                must_change_password=payload.must_change_password,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if str(user.get("status") or "").strip().lower() != AUTH_STATUS_ACTIVE:
+            revoke_web_sessions_for_user(user_id)
+        record_audit_log(int(actor["id"]), "update_user", target_type="web_user", target_id=str(user_id), detail={"username": user["username"], "role": user["role"]}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _public_web_user(user), "items": [_public_web_user(item) for item in list_web_users()]}
+
+    @app.post("/api/admin/users/{user_id}/reset-password")
+    def api_reset_web_user_password(user_id: int, payload: ResetPasswordPayload, request: Request) -> dict[str, Any]:
+        actor = _require_admin_user(request)
+        try:
+            user = set_web_user_password(user_id, payload.password, must_change_password=payload.must_change_password)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        revoke_web_sessions_for_user(user_id)
+        record_audit_log(int(actor["id"]), "reset_password", target_type="web_user", target_id=str(user_id), detail={"username": user["username"]}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _public_web_user(user)}
+
+    @app.get("/operator", response_class=HTMLResponse)
+    def operator_page() -> str:
+        return _render_operator_page()
+
+    @app.get("/api/operator/subscriptions")
+    def api_operator_subscriptions(
+        request: Request,
+        page: int = Query(1, ge=1),
+        page_size: int = Query(20, ge=1, le=200),
+    ) -> dict[str, Any]:
+        user = _require_operator_permission(request, "view_subscription_accounts")
+        operator_id = int(user["id"]) if str(user.get("role") or "").strip().lower() == AUTH_ROLE_OPERATOR else None
+        items = list_subscription_queue_db(page=page, page_size=page_size, operator_user_id=operator_id)
+        rendered_items = []
+        for item in items:
+            expose_checkout = operator_id is None or str(item.get("subscription_operator_id") or "") == str(operator_id)
+            rendered_items.append(_subscription_queue_item(item, expose_checkout_url=expose_checkout))
+        return {
+            "items": rendered_items,
+            "stats": account_stats_db(),
+        }
+
+    @app.post("/api/operator/subscriptions/{account_id}/claim")
+    def api_operator_claim_subscription(account_id: int, payload: ClaimPayload, request: Request) -> dict[str, Any]:
+        user = _require_operator_permission(request, "claim_subscription_account")
+        try:
+            saved = claim_subscription_account_db(account_id, int(user["id"]), claim_minutes=payload.claim_minutes)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record_audit_log(int(user["id"]), "claim_subscription", target_type="account", target_id=str(account_id), detail={"status": saved.get("subscription_status")}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+
+    @app.post("/api/operator/subscriptions/{account_id}/mark-subscribed")
+    def api_operator_mark_subscribed(account_id: int, payload: SubscriptionActionPayload, request: Request) -> dict[str, Any]:
+        user = _require_operator_permission(request, "mark_subscription_done")
+        try:
+            saved = mark_subscription_account_clicked_db(account_id, int(user["id"]), note=payload.note)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record_audit_log(int(user["id"]), "mark_subscribed", target_type="account", target_id=str(account_id), detail={"note": payload.note}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+
+    @app.post("/api/operator/subscriptions/{account_id}/mark-failed")
+    def api_operator_mark_failed(account_id: int, payload: SubscriptionActionPayload, request: Request) -> dict[str, Any]:
+        user = _require_operator_permission(request, "mark_subscription_failed")
+        try:
+            saved = mark_subscription_account_failed_db(account_id, int(user["id"]), note=payload.note)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record_audit_log(int(user["id"]), "mark_failed", target_type="account", target_id=str(account_id), detail={"note": payload.note}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+
+    @app.post("/api/operator/subscriptions/{account_id}/release")
+    def api_operator_release(account_id: int, request: Request) -> dict[str, Any]:
+        user = _require_operator_permission(request, "claim_subscription_account")
+        try:
+            saved = release_subscription_account_db(account_id, int(user["id"]))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record_audit_log(int(user["id"]), "release_subscription", target_type="account", target_id=str(account_id), detail=None, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+
+    @app.post("/api/admin/subscriptions/{account_id}/verify")
+    def api_admin_verify_subscription(account_id: int, request: Request) -> dict[str, Any]:
+        user = _require_admin_user(request)
+        try:
+            saved = verify_subscription_account_db(account_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        record_audit_log(int(user["id"]), "verify_subscription", target_type="account", target_id=str(account_id), detail=None, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
 
     @app.get("/api/accounts")
     def api_accounts(
@@ -943,6 +1306,74 @@ def _render_html_page(page: str) -> str:
     return html
 
 
+def _render_login_page() -> str:
+    return LOGIN_PAGE
+
+
+def _render_admin_users_page() -> str:
+    return ADMIN_USERS_PAGE
+
+
+def _render_operator_page() -> str:
+    return OPERATOR_PAGE
+
+
+def _public_web_user(user: dict[str, Any]) -> dict[str, Any]:
+    permissions = user.get("permissions")
+    if not isinstance(permissions, list):
+        permissions = []
+    return {
+        "id": str(user.get("id") or ""),
+        "username": str(user.get("username") or "").strip().lower(),
+        "display_name": str(user.get("display_name") or "").strip(),
+        "role": str(user.get("role") or AUTH_ROLE_OPERATOR).strip().lower(),
+        "permissions": [str(item) for item in permissions if str(item or "").strip()],
+        "status": str(user.get("status") or AUTH_STATUS_ACTIVE).strip().lower(),
+        "must_change_password": str(user.get("must_change_password") or "false").lower() in {"1", "true", "yes"},
+        "created_at": str(user.get("created_at") or ""),
+        "updated_at": str(user.get("updated_at") or ""),
+        "last_login_at": str(user.get("last_login_at") or ""),
+        "last_login_ip": str(user.get("last_login_ip") or ""),
+        "last_login_user_agent": str(user.get("last_login_user_agent") or ""),
+    }
+
+
+def _subscription_queue_item(account: dict[str, Any], *, expose_checkout_url: bool = True) -> dict[str, Any]:
+    status = str(account.get("subscription_status") or SUBSCRIPTION_STATUS_PENDING)
+    operator_id = str(account.get("subscription_operator_id") or "")
+    checkout_url = str(account.get("checkout_url") or NULL_VALUE)
+    if not expose_checkout_url:
+        checkout_url = NULL_VALUE
+    return {
+        "id": str(account.get("id") or ""),
+        "email": str(account.get("email") or ""),
+        "subscription_type": str(account.get("subscription_type") or NULL_VALUE),
+        "checkout_url": checkout_url,
+        "subscription_status": status,
+        "subscription_operator_id": operator_id,
+        "subscription_claimed_at": str(account.get("subscription_claimed_at") or NULL_VALUE),
+        "subscription_claim_expires_at": str(account.get("subscription_claim_expires_at") or NULL_VALUE),
+        "subscription_marked_at": str(account.get("subscription_marked_at") or NULL_VALUE),
+        "subscription_verified_at": str(account.get("subscription_verified_at") or NULL_VALUE),
+        "subscription_note": str(account.get("subscription_note") or NULL_VALUE),
+        "stock_status": str(account.get("stock_status") or STOCK_STATUS_IN),
+        "created_at": str(account.get("created_at") or NULL_VALUE),
+        "updated_at": str(account.get("updated_at") or NULL_VALUE),
+        "last_login_at": str(account.get("last_login_at") or NULL_VALUE),
+        "is_claimed": status == SUBSCRIPTION_STATUS_CLAIMED,
+        "is_verified": status == SUBSCRIPTION_STATUS_VERIFIED,
+        "is_failed": status == SUBSCRIPTION_STATUS_FAILED,
+    }
+
+
+def _request_ip(request: Request) -> str:
+    forwarded = str(request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if forwarded:
+        return forwarded
+    client = request.client
+    return str(getattr(client, "host", "") or "")
+
+
 def _unique_positive_ids(ids: list[int]) -> list[int]:
     unique: list[int] = []
     seen: set[int] = set()
@@ -996,6 +1427,13 @@ def _account_summary(account: dict[str, str]) -> dict[str, Any]:
         "id": int(account.get("id") or 0),
         "email": account.get("email", ""),
         "subscription_type": account.get("subscription_type", NULL_VALUE),
+        "subscription_status": account.get("subscription_status", SUBSCRIPTION_STATUS_PENDING),
+        "subscription_operator_id": account.get("subscription_operator_id", NULL_VALUE),
+        "subscription_claimed_at": account.get("subscription_claimed_at", NULL_VALUE),
+        "subscription_claim_expires_at": account.get("subscription_claim_expires_at", NULL_VALUE),
+        "subscription_marked_at": account.get("subscription_marked_at", NULL_VALUE),
+        "subscription_verified_at": account.get("subscription_verified_at", NULL_VALUE),
+        "subscription_note": account.get("subscription_note", NULL_VALUE),
         "status": account.get("status", NULL_VALUE),
         "stock_status": account.get("stock_status", STOCK_STATUS_IN),
         "created_at": account.get("created_at", NULL_VALUE),
@@ -1023,6 +1461,13 @@ def _account_detail(account: dict[str, str]) -> dict[str, Any]:
             "refresh_token": account.get("refresh_token", NULL_VALUE),
             "session_json": account.get("session", NULL_VALUE),
             "checkout_url": account.get("checkout_url", NULL_VALUE),
+            "subscription_status": account.get("subscription_status", SUBSCRIPTION_STATUS_PENDING),
+            "subscription_operator_id": account.get("subscription_operator_id", NULL_VALUE),
+            "subscription_claimed_at": account.get("subscription_claimed_at", NULL_VALUE),
+            "subscription_claim_expires_at": account.get("subscription_claim_expires_at", NULL_VALUE),
+            "subscription_marked_at": account.get("subscription_marked_at", NULL_VALUE),
+            "subscription_verified_at": account.get("subscription_verified_at", NULL_VALUE),
+            "subscription_note": account.get("subscription_note", NULL_VALUE),
             "login_session_json": account.get("login_session", NULL_VALUE),
             "auth_token_json": account.get("auth_token", NULL_VALUE),
             "checkout_json": account.get("checkout", NULL_VALUE),
@@ -1447,6 +1892,7 @@ def main() -> None:
         max_concurrency=max(1, max_concurrency),
     )
     app = create_app(runtime=runtime)
+    bootstrap_admin = getattr(app.state, "bootstrap_admin", None)
     urls = _display_urls(args.host, args.port)
     print("[Web] 账号管理页面:")
     for url in urls:
@@ -1455,6 +1901,9 @@ def main() -> None:
     print(f"[Web] 配置文件: {runtime.config_path}")
     print("[Web] 数据存储: SQLite DB-only；TXT/JSON 仅按需下载导出")
     print(f"[Web] 任务最大并发: {runtime.max_concurrency}")
+    if isinstance(bootstrap_admin, dict):
+        print(f"[Web] 初始管理员: {bootstrap_admin.get('username')}")
+        print(f"[Web] 初始管理员密码: {bootstrap_admin.get('password')}")
     print("[Web] 页面路径: / 账号管理 · /tasks 任务控制台 · /settings 自动注册设置")
     proxy_pool = _resolve_runtime_proxy_pool(runtime, app_cfg)
     if len(proxy_pool) > 1:
@@ -2707,7 +3156,10 @@ HTML_PAGE = r"""
           <a class="button-link ghost page-nav" id="accountsNavLink" href="/">账号管理</a>
           <a class="button-link ghost page-nav" id="tasksNavLink" href="/tasks">任务页面</a>
           <a class="button-link ghost page-nav" id="settingsNavLink" href="/settings">设置</a>
+          <a class="button-link ghost page-nav" id="adminUsersNavLink" href="/admin/users">用户管理</a>
         </nav>
+        <span class="tab-badge" id="currentUserBadge">未登录</span>
+        <button class="ghost" type="button" id="logoutBtn">退出</button>
       </div>
     </header>
 
@@ -2947,6 +3399,7 @@ HTML_PAGE = r"""
         ['accountsNavLink', '/'],
         ['tasksNavLink', '/tasks'],
         ['settingsNavLink', '/settings'],
+        ['adminUsersNavLink', '/admin/users'],
       ];
       const resolved = titles[pageMode] || titles.accounts;
       document.title = `Protocol Reg ${resolved.title}`;
@@ -2959,6 +3412,24 @@ HTML_PAGE = r"""
         node.href = href;
         node.classList.toggle('is-active', href === window.location.pathname);
       }
+    }
+
+    async function loadCurrentUser() {
+      const response = await fetch('/api/auth/me');
+      if (response.status === 401) {
+        window.location.href = '/login';
+        return null;
+      }
+      if (!response.ok) {
+        throw new Error('无法读取登录状态');
+      }
+      const data = await response.json();
+      const user = data.user || null;
+      if (user) {
+        const role = user.role === 'admin' ? '管理员' : '操作员';
+        $('currentUserBadge').textContent = `${user.username} · ${role}`;
+      }
+      return user;
     }
 
     function toast(message) {
@@ -2974,6 +3445,10 @@ HTML_PAGE = r"""
         headers: { 'content-type': 'application/json' },
         ...options,
       });
+      if (response.status === 401) {
+        window.location.href = '/login';
+        throw new Error('未登录或会话已过期');
+      }
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.detail || '请求失败');
       return data;
@@ -3450,6 +3925,10 @@ HTML_PAGE = r"""
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ ids }),
       });
+      if (response.status === 401) {
+        window.location.href = '/login';
+        throw new Error('未登录或会话已过期');
+      }
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.detail || '导出失败');
@@ -3469,6 +3948,10 @@ HTML_PAGE = r"""
 
     async function exportDownload(endpoint, fallbackFilename, successLabel) {
       const response = await fetch(endpoint, { method: 'POST' });
+      if (response.status === 401) {
+        window.location.href = '/login';
+        throw new Error('未登录或会话已过期');
+      }
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         throw new Error(errorData.detail || '导出失败');
@@ -4006,6 +4489,14 @@ HTML_PAGE = r"""
     $('exportBtn').addEventListener('click', () => exportAccountsTxt().catch((err) => toast(err.message)));
     $('exportTokensBtn').addEventListener('click', () => exportTokensJsonl().catch((err) => toast(err.message)));
     $('exportCheckoutsBtn').addEventListener('click', () => exportCheckoutsJsonl().catch((err) => toast(err.message)));
+    $('logoutBtn').addEventListener('click', async () => {
+      try {
+        await request('/api/auth/logout', { method: 'POST' });
+      } catch (err) {
+        // 即使会话已经过期，也直接回到登录页。
+      }
+      window.location.href = '/login';
+    });
 
     let confirmResolve = null;
     function showConfirm(message, options = {}) {
@@ -4061,15 +4552,777 @@ HTML_PAGE = r"""
       }
     });
 
-    setupPageChrome();
-    if (pageMode === 'tasks' || pageMode === 'settings') {
-      state.returnAccountId = new URLSearchParams(window.location.search).get('returnAccount') || '';
-      syncOperationControls();
-      loadJobBoard().catch((err) => toast(err.message));
-    } else {
-      resetForm();
-      loadAccounts().catch((err) => toast(err.message));
+    async function initApp() {
+      setupPageChrome();
+      await loadCurrentUser();
+      if (pageMode === 'tasks' || pageMode === 'settings') {
+        state.returnAccountId = new URLSearchParams(window.location.search).get('returnAccount') || '';
+        syncOperationControls();
+        await loadJobBoard();
+      } else {
+        resetForm();
+        await loadAccounts();
+      }
     }
+    initApp().catch((err) => toast(err.message));
+  </script>
+</body>
+</html>
+"""
+
+
+LOGIN_PAGE = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Protocol Reg 登录</title>
+  <style>
+    :root {
+      --ink: #11100d;
+      --paper: #f5efe2;
+      --line: rgba(17, 16, 13, .16);
+      --muted: #6f6659;
+      --accent: #d8612c;
+      --accent-2: #0f6b5f;
+      --bad: #a33b2f;
+      --shadow: 0 24px 80px rgba(48, 39, 25, .18);
+      --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+      --body: "Aptos", "Gill Sans", "Trebuchet MS", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      color: var(--ink);
+      font-family: var(--body);
+      background: linear-gradient(135deg, #f8f0df 0%, #efe4d2 52%, #e3d3bd 100%);
+    }
+    .login {
+      width: min(420px, calc(100vw - 28px));
+      border: 1px solid var(--line);
+      background: rgba(245, 239, 226, .82);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      border-radius: 22px;
+      padding: 24px;
+    }
+    .eyebrow {
+      font: 11px/1.2 var(--mono);
+      color: var(--muted);
+      letter-spacing: .16em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 8px 0 22px;
+      font-size: 28px;
+      line-height: 1.15;
+    }
+    label {
+      display: block;
+      color: var(--muted);
+      font: 12px/1.2 var(--mono);
+      margin: 14px 0 8px;
+    }
+    input {
+      width: 100%;
+      border: 1px solid rgba(17,16,13,.14);
+      background: rgba(255,255,255,.55);
+      color: var(--ink);
+      border-radius: 12px;
+      padding: 12px 13px;
+      font: 15px/1.2 inherit;
+      outline: none;
+    }
+    input:focus {
+      border-color: rgba(216,97,44,.72);
+      box-shadow: 0 0 0 4px rgba(216,97,44,.12);
+    }
+    button {
+      width: 100%;
+      margin-top: 18px;
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 14px;
+      color: #fff;
+      background: var(--accent);
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .msg {
+      min-height: 22px;
+      margin-top: 12px;
+      color: var(--bad);
+      font-size: 13px;
+    }
+    .hint {
+      margin-top: 18px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+  </style>
+</head>
+<body>
+  <main class="login">
+    <div class="eyebrow">Protocol Reg</div>
+    <h1>管理员登录</h1>
+    <form id="loginForm">
+      <label for="username">用户名</label>
+      <input id="username" autocomplete="username" value="admin" />
+      <label for="password">密码</label>
+      <input id="password" type="password" autocomplete="current-password" />
+      <button id="loginBtn" type="submit">登录</button>
+      <div class="msg" id="message"></div>
+    </form>
+    <div class="hint">第一次启动时，终端会打印初始管理员密码。</div>
+  </main>
+  <script>
+    const form = document.getElementById('loginForm');
+    const message = document.getElementById('message');
+    const button = document.getElementById('loginBtn');
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      message.textContent = '';
+      button.disabled = true;
+      try {
+        const response = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            username: document.getElementById('username').value.trim(),
+            password: document.getElementById('password').value,
+          }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.detail || '登录失败');
+        const user = data.user || {};
+        window.location.href = user.role === 'operator' ? '/operator' : '/';
+      } catch (err) {
+        message.textContent = err.message || '登录失败';
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
+"""
+
+
+ADMIN_USERS_PAGE = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Protocol Reg 用户管理</title>
+  <style>
+    :root {
+      --ink: #11100d;
+      --paper: #f5efe2;
+      --line: rgba(17, 16, 13, .16);
+      --muted: #6f6659;
+      --accent: #d8612c;
+      --accent-2: #0f6b5f;
+      --good: #2d7a46;
+      --bad: #a33b2f;
+      --shadow: 0 24px 80px rgba(48, 39, 25, .16);
+      --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+      --body: "Aptos", "Gill Sans", "Trebuchet MS", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: var(--body);
+      background: linear-gradient(135deg, #f8f0df 0%, #efe4d2 52%, #e3d3bd 100%);
+    }
+    .shell { width: min(1200px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 36px; }
+    .topbar, .panel {
+      border: 1px solid var(--line);
+      background: rgba(245, 239, 226, .78);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      border-radius: 20px;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .brand { font-size: 24px; font-weight: 800; }
+    .nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    a, button {
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 12px;
+      padding: 9px 12px;
+      background: rgba(255,255,255,.38);
+      color: var(--ink);
+      text-decoration: none;
+      font: 13px/1.2 inherit;
+      cursor: pointer;
+    }
+    button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+    button.danger { color: #fff; background: var(--bad); border-color: var(--bad); }
+    .badge {
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 999px;
+      padding: 8px 10px;
+      color: var(--muted);
+      font: 12px/1 var(--mono);
+    }
+    .panel { padding: 16px; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 10px;
+      align-items: end;
+      margin-bottom: 16px;
+    }
+    label { display: grid; gap: 6px; color: var(--muted); font: 12px/1.2 var(--mono); }
+    input, select {
+      width: 100%;
+      border: 1px solid rgba(17,16,13,.14);
+      background: rgba(255,255,255,.55);
+      color: var(--ink);
+      border-radius: 12px;
+      padding: 10px 11px;
+      font: 14px/1.2 var(--body);
+      outline: none;
+    }
+    .span-2 { grid-column: span 2; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 14px; }
+    th, td {
+      text-align: left;
+      padding: 11px 10px;
+      border-bottom: 1px solid rgba(17,16,13,.1);
+      vertical-align: top;
+      font-size: 13px;
+    }
+    th { color: var(--muted); font: 11px/1.2 var(--mono); background: rgba(255,255,255,.26); }
+    td code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+    .status-active { color: var(--good); }
+    .status-disabled { color: var(--bad); }
+    .toast {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      opacity: 0;
+      transform: translateY(10px);
+      color: #fff;
+      background: var(--ink);
+      border-radius: 14px;
+      padding: 12px 14px;
+      transition: .18s ease;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    @media (max-width: 860px) {
+      .grid { grid-template-columns: 1fr; }
+      .span-2 { grid-column: auto; }
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">用户管理</div>
+      <nav class="nav">
+        <a href="/">账号管理</a>
+        <a href="/tasks">任务页面</a>
+        <a href="/settings">设置</a>
+        <span class="badge" id="currentUser">加载中</span>
+        <button id="logoutBtn" type="button">退出</button>
+      </nav>
+    </header>
+    <section class="panel">
+      <input type="hidden" id="userId" />
+      <div class="grid">
+        <label>用户名<input id="username" placeholder="operator01" autocomplete="off" /></label>
+        <label>显示名<input id="displayName" placeholder="操作员姓名" autocomplete="off" /></label>
+        <label>初始密码<input id="password" type="password" placeholder="新建时必填" autocomplete="new-password" /></label>
+        <label>状态
+          <select id="status">
+            <option value="active">active</option>
+            <option value="disabled">disabled</option>
+          </select>
+        </label>
+        <div class="actions">
+          <button class="primary" id="saveBtn" type="button">创建操作员</button>
+          <button id="cancelBtn" type="button">清空</button>
+        </div>
+        <label class="span-2">权限<input id="permissions" value="view_subscription_accounts, claim_subscription_account, mark_subscription_done, mark_subscription_failed" /></label>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>用户名</th>
+            <th>角色</th>
+            <th>状态</th>
+            <th>权限</th>
+            <th>最近登录</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="userRows"></tbody>
+      </table>
+    </section>
+  </main>
+  <div class="toast" id="toast"></div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    let users = [];
+    function toast(message) {
+      const node = $('toast');
+      node.textContent = message;
+      node.classList.add('show');
+      clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(() => node.classList.remove('show'), 2200);
+    }
+    async function request(url, options = {}) {
+      const response = await fetch(url, { headers: { 'content-type': 'application/json' }, ...options });
+      if (response.status === 401) {
+        window.location.href = '/login';
+        throw new Error('未登录或会话已过期');
+      }
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || '请求失败');
+      return data;
+    }
+    function permissionsArray() {
+      return $('permissions').value.split(',').map((item) => item.trim()).filter(Boolean);
+    }
+    function formatDate(value) {
+      if (!value || value === 'null') return '无记录';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString('zh-CN', { hour12: false });
+    }
+    async function loadCurrentUser() {
+      const data = await request('/api/auth/me');
+      const user = data.user || {};
+      $('currentUser').textContent = `${user.username || '未知'} · ${user.role === 'admin' ? '管理员' : '操作员'}`;
+    }
+    async function loadUsers() {
+      const data = await request('/api/admin/users');
+      users = data.items || [];
+      renderUsers();
+    }
+    function renderUsers() {
+      $('userRows').innerHTML = users.map((user) => {
+        const statusClass = user.status === 'disabled' ? 'status-disabled' : 'status-active';
+        const actions = `
+          <button type="button" data-edit="${escapeHtml(user.id)}">编辑</button>
+          <button type="button" data-reset="${escapeHtml(user.id)}">重置密码</button>
+        `;
+        return `
+          <tr>
+            <td>${escapeHtml(user.id)}</td>
+            <td><strong>${escapeHtml(user.username)}</strong><br>${escapeHtml(user.display_name || '')}</td>
+            <td>${escapeHtml(user.role)}</td>
+            <td class="${statusClass}">${escapeHtml(user.status)}</td>
+            <td><code>${escapeHtml((user.permissions || []).join(', '))}</code></td>
+            <td>${escapeHtml(formatDate(user.last_login_at))}</td>
+            <td>${actions}</td>
+          </tr>
+        `;
+      }).join('') || '<tr><td colspan="7">暂无用户</td></tr>';
+      document.querySelectorAll('[data-edit]').forEach((button) => {
+        button.addEventListener('click', () => editUser(button.dataset.edit));
+      });
+      document.querySelectorAll('[data-reset]').forEach((button) => {
+        button.addEventListener('click', () => resetPassword(button.dataset.reset).catch((err) => toast(err.message)));
+      });
+    }
+    function clearForm() {
+      $('userId').value = '';
+      $('username').value = '';
+      $('username').disabled = false;
+      $('displayName').value = '';
+      $('password').value = '';
+      $('status').value = 'active';
+      $('permissions').value = 'view_subscription_accounts, claim_subscription_account, mark_subscription_done, mark_subscription_failed';
+      $('saveBtn').textContent = '创建操作员';
+    }
+    function editUser(id) {
+      const user = users.find((item) => String(item.id) === String(id));
+      if (!user) return;
+      $('userId').value = user.id;
+      $('username').value = user.username;
+      $('username').disabled = true;
+      $('displayName').value = user.display_name || '';
+      $('password').value = '';
+      $('status').value = user.status || 'active';
+      $('permissions').value = (user.permissions || []).join(', ');
+      $('saveBtn').textContent = '保存修改';
+    }
+    async function saveUser() {
+      const id = $('userId').value.trim();
+      const payload = {
+        display_name: $('displayName').value.trim(),
+        permissions: permissionsArray(),
+        status: $('status').value,
+      };
+      if (!id) {
+        payload.username = $('username').value.trim();
+        payload.password = $('password').value;
+        if (!payload.username) return toast('用户名不能为空');
+        if (!payload.password) return toast('新建操作员需要初始密码');
+        await request('/api/admin/users', { method: 'POST', body: JSON.stringify(payload) });
+        toast('操作员已创建');
+      } else {
+        await request(`/api/admin/users/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(payload) });
+        toast('用户已更新');
+      }
+      clearForm();
+      await loadUsers();
+    }
+    async function resetPassword(id) {
+      const password = window.prompt('输入新密码（至少 6 位）');
+      if (!password) return;
+      await request(`/api/admin/users/${encodeURIComponent(id)}/reset-password`, {
+        method: 'POST',
+        body: JSON.stringify({ password, must_change_password: false }),
+      });
+      toast('密码已重置');
+    }
+    $('saveBtn').addEventListener('click', () => saveUser().catch((err) => toast(err.message)));
+    $('cancelBtn').addEventListener('click', clearForm);
+    $('logoutBtn').addEventListener('click', async () => {
+      try { await request('/api/auth/logout', { method: 'POST' }); } catch (err) {}
+      window.location.href = '/login';
+    });
+    loadCurrentUser().then(loadUsers).catch((err) => toast(err.message));
+  </script>
+</body>
+</html>
+"""
+
+
+OPERATOR_PAGE = r"""
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Protocol Reg 操作员工作台</title>
+  <style>
+    :root {
+      --ink: #11100d;
+      --line: rgba(17, 16, 13, .16);
+      --muted: #6f6659;
+      --accent: #d8612c;
+      --accent-2: #0f6b5f;
+      --good: #2d7a46;
+      --bad: #a33b2f;
+      --shadow: 0 24px 80px rgba(48, 39, 25, .16);
+      --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+      --body: "Aptos", "Gill Sans", "Trebuchet MS", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: var(--body);
+      background: linear-gradient(135deg, #f8f0df 0%, #efe4d2 52%, #e3d3bd 100%);
+    }
+    .shell { width: min(1360px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 36px; }
+    .topbar, .panel {
+      border: 1px solid var(--line);
+      background: rgba(245, 239, 226, .78);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      border-radius: 20px;
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 12px 16px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .brand { font-size: 24px; font-weight: 800; }
+    .nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    a, button {
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 12px;
+      padding: 9px 12px;
+      background: rgba(255,255,255,.38);
+      color: var(--ink);
+      text-decoration: none;
+      font: 13px/1.2 inherit;
+      cursor: pointer;
+    }
+    button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+    button.good { color: #fff; background: var(--good); border-color: var(--good); }
+    button.bad { color: #fff; background: var(--bad); border-color: var(--bad); }
+    .badge {
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 999px;
+      padding: 8px 10px;
+      color: var(--muted);
+      font: 12px/1 var(--mono);
+    }
+    .panel { padding: 16px; }
+    .toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+    input {
+      border: 1px solid rgba(17,16,13,.14);
+      background: rgba(255,255,255,.55);
+      color: var(--ink);
+      border-radius: 12px;
+      padding: 10px 11px;
+      font: 14px/1.2 var(--body);
+      outline: none;
+    }
+    input[type="number"] { width: 110px; }
+    table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 14px; }
+    th, td {
+      text-align: left;
+      padding: 11px 10px;
+      border-bottom: 1px solid rgba(17,16,13,.1);
+      vertical-align: top;
+      font-size: 13px;
+    }
+    th { color: var(--muted); font: 11px/1.2 var(--mono); background: rgba(255,255,255,.26); }
+    td code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
+    .status-pending { color: var(--accent-2); }
+    .status-claimed { color: var(--accent); }
+    .status-marked { color: var(--good); }
+    .status-failed { color: var(--bad); }
+    .empty {
+      padding: 42px 16px;
+      color: var(--muted);
+      text-align: center;
+      border-bottom: 1px solid rgba(17,16,13,.1);
+    }
+    .toast {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      opacity: 0;
+      transform: translateY(10px);
+      color: #fff;
+      background: var(--ink);
+      border-radius: 14px;
+      padding: 12px 14px;
+      transition: .18s ease;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    @media (max-width: 920px) {
+      table { display: block; overflow-x: auto; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">操作员工作台</div>
+      <nav class="nav">
+        <span class="badge" id="currentUser">加载中</span>
+        <span class="badge" id="queueCount">待加载</span>
+        <button id="refreshBtn" type="button">刷新</button>
+        <button id="logoutBtn" type="button">退出</button>
+      </nav>
+    </header>
+    <section class="panel">
+      <div class="toolbar">
+        <input id="pageSize" type="number" min="10" max="200" value="30" />
+        <button class="primary" id="reloadBtn" type="button">重新加载</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>邮箱</th>
+            <th>状态</th>
+            <th>Checkout</th>
+            <th>领取人</th>
+            <th>备注</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </section>
+  </main>
+  <div class="toast" id="toast"></div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    let items = [];
+    let currentUser = {};
+    function toast(message) {
+      const node = $('toast');
+      node.textContent = message;
+      node.classList.add('show');
+      clearTimeout(window.__toastTimer);
+      window.__toastTimer = setTimeout(() => node.classList.remove('show'), 2200);
+    }
+    async function request(url, options = {}) {
+      const response = await fetch(url, { headers: { 'content-type': 'application/json' }, ...options });
+      if (response.status === 401) {
+        window.location.href = '/login';
+        throw new Error('未登录或会话已过期');
+      }
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || '请求失败');
+      return data;
+    }
+    function formatDate(value) {
+      if (!value || value === 'null') return '无';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return value;
+      return date.toLocaleString('zh-CN', { hour12: false });
+    }
+    function statusClass(value) {
+      return {
+        '待订阅': 'status-pending',
+        '处理中': 'status-claimed',
+        '已点击订阅': 'status-marked',
+        '已确认订阅': 'status-marked',
+        '订阅失败': 'status-failed',
+      }[value] || 'status-pending';
+    }
+    function statusLabel(value) {
+      return value || '待订阅';
+    }
+    function hasPermission(name) {
+      if (currentUser.role === 'admin') return true;
+      const permissions = Array.isArray(currentUser.permissions) ? currentUser.permissions : [];
+      return permissions.includes('*') || permissions.includes(name);
+    }
+    function sameOperator(item) {
+      return Boolean(currentUser.id) && String(item.subscription_operator_id || '') === String(currentUser.id || '');
+    }
+    function claimExpired(item) {
+      const value = item.subscription_claim_expires_at;
+      if (!value || value === 'null') return true;
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return true;
+      return date.getTime() <= Date.now();
+    }
+    async function loadCurrentUser() {
+      const data = await request('/api/auth/me');
+      const user = data.user || {};
+      currentUser = user;
+      $('currentUser').textContent = `${user.username || '未知'} · ${user.role === 'admin' ? '管理员' : '操作员'}`;
+    }
+    async function loadQueue() {
+      const pageSize = Number($('pageSize').value || 30);
+      const data = await request(`/api/operator/subscriptions?page=1&page_size=${encodeURIComponent(pageSize)}`);
+      items = data.items || [];
+      $('queueCount').textContent = `数量 ${items.length}`;
+      renderRows();
+    }
+    function renderRows() {
+      if (!items.length) {
+        $('rows').innerHTML = '<tr><td class="empty" colspan="6">暂无待订阅账号</td></tr>';
+        return;
+      }
+      $('rows').innerHTML = items.map((item) => {
+        const status = item.subscription_status || '待订阅';
+        const claimedBy = item.subscription_operator_id || '-';
+        const note = item.subscription_note === 'null' ? '' : (item.subscription_note || '');
+        const checkout = item.checkout_url && item.checkout_url !== 'null'
+          ? `<a href="${escapeHtml(item.checkout_url)}" target="_blank" rel="noreferrer">打开链接</a>`
+          : '领取后可打开';
+        const owned = sameOperator(item);
+        const canClaim = hasPermission('claim_subscription_account') && (status === '待订阅' || status === '订阅失败' || (status === '处理中' && (owned || claimExpired(item))));
+        const canFinish = status === '处理中' && owned && hasPermission('mark_subscription_done');
+        const canFail = status === '处理中' && owned && hasPermission('mark_subscription_failed');
+        const canRelease = status === '处理中' && owned && hasPermission('claim_subscription_account');
+        const actions = `
+          <button type="button" data-claim="${escapeHtml(item.id)}" ${canClaim ? '' : 'disabled'}>${owned ? '续领' : '领取'}</button>
+          <button type="button" data-submitted="${escapeHtml(item.id)}" class="good" ${canFinish ? '' : 'disabled'}>已订阅</button>
+          <button type="button" data-failed="${escapeHtml(item.id)}" class="bad" ${canFail ? '' : 'disabled'}>失败</button>
+          <button type="button" data-release="${escapeHtml(item.id)}" ${canRelease ? '' : 'disabled'}>释放</button>
+        `;
+        return `
+          <tr>
+            <td><strong>${escapeHtml(item.email)}</strong><br><code>${escapeHtml(item.subscription_type || 'null')}</code></td>
+            <td class="${statusClass(status)}">${escapeHtml(statusLabel(status))}<br><code>${escapeHtml(formatDate(item.subscription_claim_expires_at))}</code></td>
+            <td>${checkout}</td>
+            <td>${escapeHtml(claimedBy)}</td>
+            <td><code>${escapeHtml(note || '')}</code></td>
+            <td>${actions}</td>
+          </tr>
+        `;
+      }).join('');
+      document.querySelectorAll('[data-claim]').forEach((button) => {
+        button.addEventListener('click', () => claimAccount(button.dataset.claim).catch((err) => toast(err.message)));
+      });
+      document.querySelectorAll('[data-submitted]').forEach((button) => {
+        button.addEventListener('click', () => markSubmitted(button.dataset.submitted).catch((err) => toast(err.message)));
+      });
+      document.querySelectorAll('[data-failed]').forEach((button) => {
+        button.addEventListener('click', () => markFailed(button.dataset.failed).catch((err) => toast(err.message)));
+      });
+      document.querySelectorAll('[data-release]').forEach((button) => {
+        button.addEventListener('click', () => releaseAccount(button.dataset.release).catch((err) => toast(err.message)));
+      });
+    }
+    async function claimAccount(id) {
+      await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/claim`, {
+        method: 'POST',
+        body: JSON.stringify({ claim_minutes: 30 }),
+      });
+      toast('任务已领取');
+      await loadQueue();
+    }
+    async function markSubmitted(id) {
+      const note = window.prompt('备注（可选）', '');
+      await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/mark-subscribed`, {
+        method: 'POST',
+        body: JSON.stringify({ note: note || '' }),
+      });
+      toast('已标记订阅');
+      await loadQueue();
+    }
+    async function markFailed(id) {
+      const note = window.prompt('失败原因（可选）', '');
+      await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/mark-failed`, {
+        method: 'POST',
+        body: JSON.stringify({ note: note || '' }),
+      });
+      toast('已标记失败');
+      await loadQueue();
+    }
+    async function releaseAccount(id) {
+      await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/release`, {
+        method: 'POST',
+      });
+      toast('已释放任务');
+      await loadQueue();
+    }
+    $('reloadBtn').addEventListener('click', () => loadQueue().catch((err) => toast(err.message)));
+    $('refreshBtn').addEventListener('click', () => loadQueue().catch((err) => toast(err.message)));
+    $('logoutBtn').addEventListener('click', async () => {
+      try { await request('/api/auth/logout', { method: 'POST' }); } catch (err) {}
+      window.location.href = '/login';
+    });
+    loadCurrentUser()
+      .then(loadQueue)
+      .catch((err) => toast(err.message));
   </script>
 </body>
 </html>

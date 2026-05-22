@@ -10,3 +10,7 @@ runtime = WebRuntime(
     license_file=_default_license_file(repo_root),
 )
 app = create_app(runtime=runtime)
+bootstrap_admin = getattr(app.state, "bootstrap_admin", None)
+if isinstance(bootstrap_admin, dict):
+    print(f"[Web] 初始管理员: {bootstrap_admin.get('username')}")
+    print(f"[Web] 初始管理员密码: {bootstrap_admin.get('password')}")

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
+import secrets
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,33 @@ ACCOUNT_STATUS_ABANDONED = "废弃"
 STOCK_STATUS_IN = "未出库"
 STOCK_STATUS_OUT = "出库"
 STOCK_STATUSES = {STOCK_STATUS_IN, STOCK_STATUS_OUT}
+AUTH_ROLE_ADMIN = "admin"
+AUTH_ROLE_OPERATOR = "operator"
+AUTH_ROLES = {AUTH_ROLE_ADMIN, AUTH_ROLE_OPERATOR}
+AUTH_STATUS_ACTIVE = "active"
+AUTH_STATUS_DISABLED = "disabled"
+AUTH_STATUSES = {AUTH_STATUS_ACTIVE, AUTH_STATUS_DISABLED}
+DEFAULT_OPERATOR_PERMISSIONS = (
+    "view_subscription_accounts",
+    "claim_subscription_account",
+    "mark_subscription_done",
+    "mark_subscription_failed",
+)
+ADMIN_PERMISSIONS = ("*",)
+WEB_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
+PASSWORD_HASH_ITERATIONS = 390_000
+SUBSCRIPTION_STATUS_PENDING = "待订阅"
+SUBSCRIPTION_STATUS_CLAIMED = "处理中"
+SUBSCRIPTION_STATUS_MARKED = "已点击订阅"
+SUBSCRIPTION_STATUS_VERIFIED = "已确认订阅"
+SUBSCRIPTION_STATUS_FAILED = "订阅失败"
+SUBSCRIPTION_STATUSES = {
+    SUBSCRIPTION_STATUS_PENDING,
+    SUBSCRIPTION_STATUS_CLAIMED,
+    SUBSCRIPTION_STATUS_MARKED,
+    SUBSCRIPTION_STATUS_VERIFIED,
+    SUBSCRIPTION_STATUS_FAILED,
+}
 _file_write_lock = threading.RLock()
 
 
@@ -36,6 +66,13 @@ def init_accounts_db() -> None:
                 login_session_json TEXT DEFAULT 'null',
                 auth_token_json TEXT DEFAULT 'null',
                 checkout_json TEXT DEFAULT 'null',
+                subscription_status TEXT DEFAULT '待订阅',
+                subscription_operator_id INTEGER,
+                subscription_claimed_at TEXT,
+                subscription_claim_expires_at TEXT,
+                subscription_marked_at TEXT,
+                subscription_verified_at TEXT,
+                subscription_note TEXT DEFAULT 'null',
                 stock_status TEXT DEFAULT '未出库',
                 status TEXT DEFAULT 'active',
                 created_at TEXT NOT NULL,
@@ -49,6 +86,13 @@ def init_accounts_db() -> None:
         _ensure_accounts_column(cursor, "login_session_json", "TEXT DEFAULT 'null'")
         _ensure_accounts_column(cursor, "auth_token_json", "TEXT DEFAULT 'null'")
         _ensure_accounts_column(cursor, "checkout_json", "TEXT DEFAULT 'null'")
+        _ensure_accounts_column(cursor, "subscription_status", "TEXT DEFAULT '待订阅'")
+        _ensure_accounts_column(cursor, "subscription_operator_id", "INTEGER")
+        _ensure_accounts_column(cursor, "subscription_claimed_at", "TEXT")
+        _ensure_accounts_column(cursor, "subscription_claim_expires_at", "TEXT")
+        _ensure_accounts_column(cursor, "subscription_marked_at", "TEXT")
+        _ensure_accounts_column(cursor, "subscription_verified_at", "TEXT")
+        _ensure_accounts_column(cursor, "subscription_note", "TEXT DEFAULT 'null'")
         _ensure_accounts_column(cursor, "stock_status", "TEXT DEFAULT '未出库'")
         _drop_accounts_column(cursor, "source")
         db_manager.execute_sql(
@@ -63,11 +107,31 @@ def init_accounts_db() -> None:
         )
         db_manager.execute_sql(
             cursor,
+            "UPDATE accounts SET subscription_status = ? WHERE subscription_status IS NULL OR subscription_status = '' OR subscription_status NOT IN (?, ?, ?, ?, ?)",
+            (
+                SUBSCRIPTION_STATUS_PENDING,
+                SUBSCRIPTION_STATUS_PENDING,
+                SUBSCRIPTION_STATUS_CLAIMED,
+                SUBSCRIPTION_STATUS_MARKED,
+                SUBSCRIPTION_STATUS_VERIFIED,
+                SUBSCRIPTION_STATUS_FAILED,
+            ),
+        )
+        db_manager.execute_sql(
+            cursor,
             "CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)",
         )
         db_manager.execute_sql(
             cursor,
             "CREATE INDEX IF NOT EXISTS idx_accounts_stock_status ON accounts(stock_status)",
+        )
+        db_manager.execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_status ON accounts(subscription_status)",
+        )
+        db_manager.execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_operator ON accounts(subscription_operator_id)",
         )
         db_manager.execute_sql(
             cursor,
@@ -77,6 +141,67 @@ def init_accounts_db() -> None:
             cursor,
             "CREATE INDEX IF NOT EXISTS idx_accounts_created_at ON accounts(created_at)",
         )
+        _init_web_auth_tables(cursor)
+
+
+def _init_web_auth_tables(cursor: Any) -> None:
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS web_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            display_name TEXT DEFAULT '',
+            role TEXT NOT NULL DEFAULT 'operator',
+            permissions_json TEXT DEFAULT '[]',
+            password_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            must_change_password INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_login_at TEXT,
+            last_login_ip TEXT,
+            last_login_user_agent TEXT
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_web_users_role ON web_users(role)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_web_users_status ON web_users(status)")
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS web_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            session_token_hash TEXT NOT NULL UNIQUE,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            revoked_at TEXT,
+            ip TEXT,
+            user_agent TEXT,
+            FOREIGN KEY(user_id) REFERENCES web_users(id) ON DELETE CASCADE
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_web_sessions_user_id ON web_sessions(user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_web_sessions_expires_at ON web_sessions(expires_at)")
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_user_id INTEGER,
+            action TEXT NOT NULL,
+            target_type TEXT DEFAULT '',
+            target_id TEXT DEFAULT '',
+            detail_json TEXT DEFAULT 'null',
+            ip TEXT DEFAULT '',
+            user_agent TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(actor_user_id) REFERENCES web_users(id) ON DELETE SET NULL
+        )
+        """
+    )
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_actor ON audit_logs(actor_user_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at)")
 
 
 def save_account_storage(
@@ -108,7 +233,10 @@ def load_accounts_db() -> list[dict[str, str]]:
             cursor,
             """
             SELECT email, password, subscription_type, refresh_token, session_json, checkout_url,
-                   login_session_json, auth_token_json, checkout_json, stock_status,
+                   login_session_json, auth_token_json, checkout_json,
+                   subscription_status, subscription_operator_id, subscription_claimed_at,
+                   subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             ORDER BY id ASC
@@ -168,7 +296,10 @@ def list_account_rows(
             cursor,
             f"""
             SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
-                   login_session_json, auth_token_json, checkout_json, stock_status,
+                   login_session_json, auth_token_json, checkout_json,
+                   subscription_status, subscription_operator_id, subscription_claimed_at,
+                   subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             {where_sql}
@@ -209,7 +340,10 @@ def list_account_rows_by_ids(ids: list[int]) -> list[dict[str, str]]:
                 cursor,
                 f"""
                 SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
-                       login_session_json, auth_token_json, checkout_json, stock_status,
+                       login_session_json, auth_token_json, checkout_json,
+                       subscription_status, subscription_operator_id, subscription_claimed_at,
+                       subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                       subscription_note, stock_status,
                        status, created_at, updated_at, last_login_at, last_authorized_at
                 FROM accounts
                 WHERE id IN ({placeholders})
@@ -250,7 +384,10 @@ def get_account_db(account_id: int) -> dict[str, str] | None:
             cursor,
             """
             SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
-                   login_session_json, auth_token_json, checkout_json, stock_status,
+                   login_session_json, auth_token_json, checkout_json,
+                   subscription_status, subscription_operator_id, subscription_claimed_at,
+                   subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             WHERE id = ?
@@ -269,7 +406,10 @@ def _get_account_db_by_email(email: str) -> dict[str, str] | None:
             cursor,
             """
             SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
-                   login_session_json, auth_token_json, checkout_json, stock_status,
+                   login_session_json, auth_token_json, checkout_json,
+                   subscription_status, subscription_operator_id, subscription_claimed_at,
+                   subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             WHERE email = ?
@@ -408,14 +548,46 @@ def update_account_checkout_url_db(
         if normalized_checkout == NULL_VALUE:
             db_manager.execute_sql(
                 cursor,
-                "UPDATE accounts SET checkout_url = ?, updated_at = ? WHERE email = ?",
-                (normalized_url, now, normalized_email),
+                """
+                UPDATE accounts
+                SET checkout_url = ?,
+                    subscription_status = ?,
+                    subscription_operator_id = NULL,
+                    subscription_claimed_at = NULL,
+                    subscription_claim_expires_at = NULL,
+                    subscription_marked_at = NULL,
+                    subscription_verified_at = NULL,
+                    subscription_note = ?,
+                    updated_at = ?
+                WHERE email = ?
+                """,
+                (normalized_url, SUBSCRIPTION_STATUS_PENDING, NULL_VALUE, now, normalized_email),
             )
         else:
             db_manager.execute_sql(
                 cursor,
-                "UPDATE accounts SET checkout_url = ?, checkout_json = ?, updated_at = ? WHERE email = ?",
-                (normalized_url, normalized_checkout, now, normalized_email),
+                """
+                UPDATE accounts
+                SET checkout_url = ?,
+                    checkout_json = ?,
+                    subscription_status = ?,
+                    subscription_operator_id = NULL,
+                    subscription_claimed_at = NULL,
+                    subscription_claim_expires_at = NULL,
+                    subscription_marked_at = NULL,
+                    subscription_verified_at = NULL,
+                    subscription_note = ?,
+                    updated_at = ?
+                WHERE email = ?
+                """,
+                (
+                    normalized_url,
+                    normalized_checkout,
+                    SUBSCRIPTION_STATUS_PENDING,
+                    NULL_VALUE,
+                    now,
+                    normalized_email,
+                ),
             )
         if cursor.rowcount <= 0:
             return None
@@ -547,6 +719,9 @@ def account_stats_db() -> dict[str, Any]:
         stock_statuses = cursor.execute(
             "SELECT stock_status, COUNT(*) FROM accounts GROUP BY stock_status ORDER BY COUNT(*) DESC"
         ).fetchall()
+        subscription_statuses = cursor.execute(
+            "SELECT subscription_status, COUNT(*) FROM accounts GROUP BY subscription_status ORDER BY COUNT(*) DESC"
+        ).fetchall()
     return {
         "total": total,
         "with_rt": with_rt,
@@ -557,7 +732,703 @@ def account_stats_db() -> dict[str, Any]:
         "plans": {str(plan or NULL_VALUE): count for plan, count in plans},
         "statuses": {str(item_status or NULL_VALUE): count for item_status, count in statuses},
         "stock_statuses": _stock_status_counts(stock_statuses),
+        "subscription_statuses": {
+            _normalize_subscription_status(item_status): int(count)
+            for item_status, count in subscription_statuses
+        },
     }
+
+
+def count_subscription_queue_db() -> int:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn() as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT COUNT(*)
+            FROM accounts
+            WHERE stock_status = ?
+              AND checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''
+            """,
+            (STOCK_STATUS_IN,),
+        ).fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def list_subscription_queue_db(
+    *,
+    page: int = 1,
+    page_size: int = 50,
+    operator_user_id: int | None = None,
+    include_processing: bool = True,
+) -> list[dict[str, str]]:
+    init_accounts_db()
+    effective_page = max(1, int(page))
+    effective_page_size = max(1, min(500, int(page_size)))
+    offset = (effective_page - 1) * effective_page_size
+    params: list[Any] = [STOCK_STATUS_IN, SUBSCRIPTION_STATUS_PENDING, SUBSCRIPTION_STATUS_FAILED]
+    operator_clause = ""
+    if operator_user_id is not None:
+        operator_clause = " OR subscription_operator_id = ?"
+        params.append(int(operator_user_id))
+    processing_clause = ""
+    if include_processing:
+        if operator_user_id is None:
+            processing_clause = " OR (subscription_status = ? AND subscription_operator_id IS NOT NULL)"
+            params.append(SUBSCRIPTION_STATUS_CLAIMED)
+        else:
+            processing_clause = " OR (subscription_status = ? AND subscription_operator_id = ?)"
+            params.extend([SUBSCRIPTION_STATUS_CLAIMED, int(operator_user_id)])
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        rows = db_manager.execute_sql(
+            cursor,
+            f"""
+            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
+                   login_session_json, auth_token_json, checkout_json,
+                   subscription_status, subscription_operator_id, subscription_claimed_at,
+                   subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_note, stock_status,
+                   status, created_at, updated_at, last_login_at, last_authorized_at
+            FROM accounts
+            WHERE stock_status = ?
+              AND checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''
+              AND (
+                    subscription_status IN (?, ?)
+                    {operator_clause}
+                    {processing_clause}
+                  )
+            ORDER BY
+                CASE subscription_status
+                    WHEN ? THEN 0
+                    WHEN ? THEN 1
+                    WHEN ? THEN 2
+                    ELSE 3
+                END,
+                created_at DESC,
+                id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (
+                *params,
+                SUBSCRIPTION_STATUS_PENDING,
+                SUBSCRIPTION_STATUS_CLAIMED,
+                SUBSCRIPTION_STATUS_FAILED,
+                effective_page_size,
+                offset,
+            ),
+        ).fetchall()
+    return [_account_from_row(row) for row in rows]
+
+
+def claim_subscription_account_db(account_id: int, operator_user_id: int, *, claim_minutes: int = 30) -> dict[str, str]:
+    init_accounts_db()
+    now = utc_now()
+    operator_id = _field(operator_user_id)
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=max(5, int(claim_minutes)))).isoformat()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT subscription_status, subscription_operator_id, subscription_claim_expires_at
+            FROM accounts
+            WHERE id = ?
+            """,
+            (int(account_id),),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"账号不存在: {account_id}")
+        current_status = _field(row["subscription_status"]) if "subscription_status" in row.keys() else SUBSCRIPTION_STATUS_PENDING
+        current_operator = _field(row["subscription_operator_id"]) if "subscription_operator_id" in row.keys() else NULL_VALUE
+        current_expires = _field(row["subscription_claim_expires_at"]) if "subscription_claim_expires_at" in row.keys() else NULL_VALUE
+        if current_status not in {SUBSCRIPTION_STATUS_PENDING, SUBSCRIPTION_STATUS_FAILED, SUBSCRIPTION_STATUS_CLAIMED}:
+            raise ValueError("账号当前不可领取")
+        if current_status == SUBSCRIPTION_STATUS_CLAIMED:
+            if current_operator == operator_id:
+                pass
+            elif current_operator == NULL_VALUE or not _subscription_claim_is_active(current_expires):
+                pass
+            else:
+                raise ValueError("账号正在被其他操作员处理")
+        db_manager.execute_sql(
+            cursor,
+            """
+            UPDATE accounts
+            SET subscription_status = ?,
+                subscription_operator_id = ?,
+                subscription_claimed_at = ?,
+                subscription_claim_expires_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                SUBSCRIPTION_STATUS_CLAIMED,
+                int(operator_user_id),
+                now,
+                expires_at,
+                now,
+                int(account_id),
+            ),
+        )
+    account = get_account_db(int(account_id))
+    if account is None:
+        raise RuntimeError("账号领取后读取失败")
+    return account
+
+
+def mark_subscription_account_clicked_db(
+    account_id: int,
+    operator_user_id: int,
+    *,
+    note: str = "",
+) -> dict[str, str]:
+    return _update_subscription_account_status(
+        account_id,
+        operator_user_id,
+        SUBSCRIPTION_STATUS_MARKED,
+        note=note,
+        clear_claim=False,
+        marked_field="subscription_marked_at",
+        allowed_current_statuses=(SUBSCRIPTION_STATUS_CLAIMED,),
+        require_operator_claim=True,
+    )
+
+
+def mark_subscription_account_failed_db(
+    account_id: int,
+    operator_user_id: int,
+    *,
+    note: str = "",
+) -> dict[str, str]:
+    return _update_subscription_account_status(
+        account_id,
+        operator_user_id,
+        SUBSCRIPTION_STATUS_FAILED,
+        note=note,
+        clear_claim=False,
+        allowed_current_statuses=(SUBSCRIPTION_STATUS_CLAIMED,),
+        require_operator_claim=True,
+    )
+
+
+def verify_subscription_account_db(account_id: int, *, note: str = "") -> dict[str, str]:
+    return _update_subscription_account_status(
+        account_id,
+        None,
+        SUBSCRIPTION_STATUS_VERIFIED,
+        note=note,
+        clear_claim=False,
+        verified_field="subscription_verified_at",
+        allowed_current_statuses=(SUBSCRIPTION_STATUS_MARKED, SUBSCRIPTION_STATUS_VERIFIED),
+    )
+
+
+def release_subscription_account_db(account_id: int, operator_user_id: int | None = None) -> dict[str, str]:
+    return _update_subscription_account_status(
+        account_id,
+        operator_user_id,
+        SUBSCRIPTION_STATUS_PENDING,
+        note="",
+        clear_claim=True,
+        allowed_current_statuses=(SUBSCRIPTION_STATUS_CLAIMED,),
+        require_operator_claim=operator_user_id is not None,
+    )
+
+
+def _update_subscription_account_status(
+    account_id: int,
+    operator_user_id: int | None,
+    status: str,
+    *,
+    note: str = "",
+    clear_claim: bool = False,
+    marked_field: str = "",
+    verified_field: str = "",
+    allowed_current_statuses: tuple[str, ...] | None = None,
+    require_operator_claim: bool = False,
+) -> dict[str, str]:
+    init_accounts_db()
+    normalized_status = _normalize_subscription_status(status)
+    now = utc_now()
+    normalized_note = _field(note) if note else NULL_VALUE
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        existing = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, subscription_operator_id, subscription_status
+            FROM accounts
+            WHERE id = ?
+            """,
+            (int(account_id),),
+        ).fetchone()
+        if existing is None:
+            raise KeyError(f"账号不存在: {account_id}")
+        current_operator = _field(existing["subscription_operator_id"]) if "subscription_operator_id" in existing.keys() else NULL_VALUE
+        current_status = _normalize_subscription_status(existing["subscription_status"]) if "subscription_status" in existing.keys() else SUBSCRIPTION_STATUS_PENDING
+        if allowed_current_statuses is not None and current_status not in set(allowed_current_statuses):
+            raise ValueError("账号当前状态不可执行该操作")
+        if require_operator_claim and current_operator != _field(operator_user_id):
+            raise ValueError("请先领取该账号")
+        if operator_user_id is not None and current_operator not in {NULL_VALUE, _field(operator_user_id)}:
+            raise ValueError("账号已分配给其他操作员")
+        updates: list[str] = ["subscription_status = ?", "updated_at = ?"]
+        params: list[Any] = [normalized_status, now]
+        if operator_user_id is not None and not clear_claim:
+            updates.append("subscription_operator_id = ?")
+            params.append(int(operator_user_id))
+        if clear_claim:
+            updates.extend(
+                [
+                    "subscription_operator_id = NULL",
+                    "subscription_claimed_at = NULL",
+                    "subscription_claim_expires_at = NULL",
+                ]
+            )
+        if marked_field:
+            updates.append(f"{marked_field} = ?")
+            params.append(now)
+        if verified_field:
+            updates.append(f"{verified_field} = ?")
+            params.append(now)
+        if normalized_note != NULL_VALUE:
+            updates.append("subscription_note = ?")
+            params.append(normalized_note)
+        elif clear_claim:
+            updates.append("subscription_note = ?")
+            params.append(NULL_VALUE)
+        db_manager.execute_sql(
+            cursor,
+            f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?",
+            (*params, int(account_id)),
+        )
+    account = get_account_db(int(account_id))
+    if account is None:
+        raise RuntimeError("账号订阅状态更新后读取失败")
+    return account
+
+
+def ensure_bootstrap_admin_user(
+    username: str = "admin",
+    password: str | None = None,
+    *,
+    display_name: str = "管理员",
+) -> dict[str, str] | None:
+    """在没有任何后台用户时创建初始管理员账号。"""
+
+    init_accounts_db()
+    if any(
+        user.get("role") == AUTH_ROLE_ADMIN and user.get("status") == AUTH_STATUS_ACTIVE
+        for user in list_web_users()
+    ):
+        return None
+
+    bootstrap_password = str(password or "").strip() or secrets.token_urlsafe(12)
+    existing = get_web_user_by_username(username)
+    if existing is not None:
+        saved = update_web_user(
+            int(existing["id"]),
+            display_name=display_name or existing.get("display_name", ""),
+            role=AUTH_ROLE_ADMIN,
+            permissions=list(ADMIN_PERMISSIONS),
+            status=AUTH_STATUS_ACTIVE,
+            must_change_password=False,
+        )
+        set_web_user_password(int(saved["id"]), bootstrap_password, must_change_password=False)
+    else:
+        saved = create_web_user(
+            username=username,
+            password=bootstrap_password,
+            role=AUTH_ROLE_ADMIN,
+            display_name=display_name,
+            permissions=list(ADMIN_PERMISSIONS),
+            must_change_password=False,
+        )
+    return {"username": saved["username"], "password": bootstrap_password}
+
+
+def count_web_users() -> int:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn() as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(cursor, "SELECT COUNT(*) FROM web_users").fetchone()
+    return int(row[0] if row is not None else 0)
+
+
+def list_web_users() -> list[dict[str, str]]:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        rows = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, username, display_name, role, permissions_json, status, must_change_password,
+                   created_at, updated_at, last_login_at, last_login_ip, last_login_user_agent
+            FROM web_users
+            ORDER BY CASE WHEN role = ? THEN 0 ELSE 1 END, id ASC
+            """,
+            (AUTH_ROLE_ADMIN,),
+        ).fetchall()
+    return [_web_user_from_row(row) for row in rows]
+
+
+def get_web_user_by_id(user_id: int) -> dict[str, str] | None:
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, username, display_name, role, permissions_json, status, must_change_password,
+                   created_at, updated_at, last_login_at, last_login_ip, last_login_user_agent
+            FROM web_users
+            WHERE id = ?
+            """,
+            (int(user_id),),
+        ).fetchone()
+    return _web_user_from_row(row) if row is not None else None
+
+
+def get_web_user_by_username(username: str) -> dict[str, str] | None:
+    normalized = _field(username).lower()
+    if normalized == NULL_VALUE:
+        return None
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, username, display_name, role, permissions_json, status, must_change_password,
+                   created_at, updated_at, last_login_at, last_login_ip, last_login_user_agent
+            FROM web_users
+            WHERE username = ?
+            """,
+            (normalized,),
+        ).fetchone()
+    return _web_user_from_row(row) if row is not None else None
+
+
+def create_web_user(
+    *,
+    username: str,
+    password: str,
+    role: str = AUTH_ROLE_OPERATOR,
+    display_name: str = "",
+    permissions: list[str] | tuple[str, ...] | None = None,
+    status: str = AUTH_STATUS_ACTIVE,
+    must_change_password: bool = False,
+) -> dict[str, str]:
+    init_accounts_db()
+    normalized_username = _field(username).lower()
+    if normalized_username == NULL_VALUE:
+        raise ValueError("用户名不能为空")
+    normalized_role = _normalize_auth_role(role)
+    normalized_status = _normalize_auth_status(status)
+    permissions_json = _permissions_json(permissions, normalized_role)
+    password_hash = _hash_password(password)
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        existing = db_manager.execute_sql(
+            cursor,
+            "SELECT id FROM web_users WHERE username = ?",
+            (normalized_username,),
+        ).fetchone()
+        if existing is not None:
+            raise ValueError(f"用户名已存在: {normalized_username}")
+        db_manager.execute_sql(
+            cursor,
+            """
+            INSERT INTO web_users (
+                username, display_name, role, permissions_json, password_hash, status,
+                must_change_password, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_username,
+                str(display_name or "").strip(),
+                normalized_role,
+                permissions_json,
+                password_hash,
+                normalized_status,
+                1 if must_change_password else 0,
+                now,
+                now,
+            ),
+        )
+        user_id = int(cursor.lastrowid)
+    user = get_web_user_by_id(user_id)
+    if user is None:
+        raise RuntimeError("用户创建后读取失败")
+    return user
+
+
+def update_web_user(
+    user_id: int,
+    *,
+    display_name: str | None = None,
+    role: str | None = None,
+    permissions: list[str] | tuple[str, ...] | None = None,
+    status: str | None = None,
+    must_change_password: bool | None = None,
+) -> dict[str, str]:
+    init_accounts_db()
+    current = get_web_user_by_id(user_id)
+    if current is None:
+        raise KeyError(f"用户不存在: {user_id}")
+    next_display_name = current.get("display_name", "")
+    next_role = current.get("role", AUTH_ROLE_OPERATOR)
+    next_status = current.get("status", AUTH_STATUS_ACTIVE)
+    next_permissions = _load_permissions(current.get("permissions_json"))
+    next_must_change = _bool_from_value(current.get("must_change_password"))
+    if display_name is not None:
+        next_display_name = str(display_name or "").strip()
+    if role is not None:
+        next_role = _normalize_auth_role(role)
+    if status is not None:
+        next_status = _normalize_auth_status(status)
+    if permissions is not None:
+        next_permissions = _normalize_permissions(permissions, next_role)
+    else:
+        next_permissions = _normalize_permissions(next_permissions, next_role)
+    if must_change_password is not None:
+        next_must_change = bool(must_change_password)
+    permissions_json = json.dumps(next_permissions, ensure_ascii=False, separators=(",", ":"))
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            """
+            UPDATE web_users
+            SET display_name = ?, role = ?, permissions_json = ?, status = ?,
+                must_change_password = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                next_display_name,
+                next_role,
+                permissions_json,
+                next_status,
+                1 if next_must_change else 0,
+                now,
+                int(user_id),
+            ),
+        )
+    user = get_web_user_by_id(user_id)
+    if user is None:
+        raise RuntimeError("用户更新后读取失败")
+    return user
+
+
+def set_web_user_password(user_id: int, password: str, *, must_change_password: bool = False) -> dict[str, str]:
+    init_accounts_db()
+    password_hash = _hash_password(password)
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            """
+            UPDATE web_users
+            SET password_hash = ?, must_change_password = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (password_hash, 1 if must_change_password else 0, now, int(user_id)),
+        )
+        if cursor.rowcount <= 0:
+            raise KeyError(f"用户不存在: {user_id}")
+    user = get_web_user_by_id(user_id)
+    if user is None:
+        raise RuntimeError("用户密码更新后读取失败")
+    return user
+
+
+def authenticate_web_user(
+    username: str,
+    password: str,
+    *,
+    ip: str = "",
+    user_agent: str = "",
+) -> dict[str, str] | None:
+    user = get_web_user_by_username(username)
+    if user is None or user.get("status") != AUTH_STATUS_ACTIVE:
+        return None
+    stored = _get_web_user_password_hash(user.get("id"))
+    if not stored or not _verify_password(password, stored):
+        return None
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            """
+            UPDATE web_users
+            SET last_login_at = ?, last_login_ip = ?, last_login_user_agent = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (now, _field(ip), _field(user_agent), now, int(user["id"])),
+        )
+    refreshed = get_web_user_by_id(int(user["id"]))
+    return refreshed
+
+
+def create_web_session(
+    user_id: int,
+    *,
+    ip: str = "",
+    user_agent: str = "",
+    ttl_seconds: int = WEB_SESSION_TTL_SECONDS,
+) -> dict[str, str]:
+    init_accounts_db()
+    token = secrets.token_urlsafe(32)
+    token_hash = _web_session_token_hash(token)
+    now = utc_now()
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(60, int(ttl_seconds)))).isoformat()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            """
+            INSERT INTO web_sessions (
+                user_id, session_token_hash, expires_at, created_at, last_seen_at, revoked_at, ip, user_agent
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (int(user_id), token_hash, expires_at, now, now, _field(ip), _field(user_agent)),
+        )
+        session_id = int(cursor.lastrowid)
+    return {"session_id": str(session_id), "token": token, "expires_at": expires_at}
+
+
+def resolve_web_session(token: str) -> dict[str, str] | None:
+    normalized = _field(token)
+    if normalized == NULL_VALUE:
+        return None
+    token_hash = _web_session_token_hash(normalized)
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, user_id, session_token_hash, expires_at, revoked_at
+            FROM web_sessions
+            WHERE session_token_hash = ?
+            """,
+            (token_hash,),
+        ).fetchone()
+        if row is None:
+            return None
+        if _field(row["revoked_at"]) != NULL_VALUE:
+            return None
+        expires_at = _field(row["expires_at"])
+        try:
+            if datetime.fromisoformat(expires_at) <= datetime.now(timezone.utc):
+                return None
+        except Exception:
+            return None
+        user = get_web_user_by_id(int(row["user_id"]))
+        if user is None:
+            return None
+        if user.get("status") != AUTH_STATUS_ACTIVE:
+            return None
+        db_manager.execute_sql(
+            cursor,
+            "UPDATE web_sessions SET last_seen_at = ? WHERE id = ?",
+            (now, int(row["id"])),
+        )
+    return {
+        "session_id": str(row["id"]),
+        "user_id": str(row["user_id"]),
+        "expires_at": expires_at,
+        **user,
+    }
+
+
+def revoke_web_session(token: str) -> bool:
+    normalized = _field(token)
+    if normalized == NULL_VALUE:
+        return False
+    token_hash = _web_session_token_hash(normalized)
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            "UPDATE web_sessions SET revoked_at = ? WHERE session_token_hash = ? AND revoked_at IS NULL",
+            (now, token_hash),
+        )
+        return cursor.rowcount > 0
+
+
+def revoke_web_sessions_for_user(user_id: int) -> int:
+    now = utc_now()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            "UPDATE web_sessions SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL",
+            (now, int(user_id)),
+        )
+        return int(cursor.rowcount or 0)
+
+
+def record_audit_log(
+    actor_user_id: int | None,
+    action: str,
+    *,
+    target_type: str = "",
+    target_id: str = "",
+    detail: dict[str, Any] | None = None,
+    ip: str = "",
+    user_agent: str = "",
+) -> None:
+    init_accounts_db()
+    db_manager = _db_manager()
+    now = utc_now()
+    detail_json = _json_blob(detail if detail is not None else None)
+    with db_manager.get_db_conn(is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        db_manager.execute_sql(
+            cursor,
+            """
+            INSERT INTO audit_logs (
+                actor_user_id, action, target_type, target_id, detail_json, ip, user_agent, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(actor_user_id) if actor_user_id is not None else None,
+                _field(action),
+                _field(target_type),
+                _field(target_id),
+                detail_json,
+                _field(ip),
+                _field(user_agent),
+                now,
+            ),
+        )
 
 
 def import_compact_accounts_to_db(path: Path) -> None:
@@ -971,6 +1842,13 @@ def _account_from_row(row: Any) -> dict[str, str]:
         "login_session": _field(row["login_session_json"]) if "login_session_json" in keys else NULL_VALUE,
         "auth_token": _field(row["auth_token_json"]) if "auth_token_json" in keys else NULL_VALUE,
         "checkout": _field(row["checkout_json"]) if "checkout_json" in keys else NULL_VALUE,
+        "subscription_status": _normalize_subscription_status(row["subscription_status"]) if "subscription_status" in keys else SUBSCRIPTION_STATUS_PENDING,
+        "subscription_operator_id": _field(row["subscription_operator_id"]) if "subscription_operator_id" in keys else NULL_VALUE,
+        "subscription_claimed_at": _field(row["subscription_claimed_at"]) if "subscription_claimed_at" in keys else NULL_VALUE,
+        "subscription_claim_expires_at": _field(row["subscription_claim_expires_at"]) if "subscription_claim_expires_at" in keys else NULL_VALUE,
+        "subscription_marked_at": _field(row["subscription_marked_at"]) if "subscription_marked_at" in keys else NULL_VALUE,
+        "subscription_verified_at": _field(row["subscription_verified_at"]) if "subscription_verified_at" in keys else NULL_VALUE,
+        "subscription_note": _field(row["subscription_note"]) if "subscription_note" in keys else NULL_VALUE,
         "stock_status": _normalize_stock_status(row["stock_status"]) if "stock_status" in keys else STOCK_STATUS_IN,
         "status": _field(row["status"]),
         "created_at": _field(row["created_at"]),
@@ -983,6 +1861,134 @@ def _account_from_row(row: Any) -> dict[str, str]:
     return account
 
 
+def _web_user_from_row(row: Any) -> dict[str, str]:
+    permissions = _load_permissions(row["permissions_json"])
+    return {
+        "id": str(row["id"]),
+        "username": _field(row["username"]).lower(),
+        "display_name": str(row["display_name"] or "").strip(),
+        "role": _normalize_auth_role(row["role"]),
+        "permissions": permissions,
+        "permissions_json": json.dumps(permissions, ensure_ascii=False, separators=(",", ":")),
+        "status": _normalize_auth_status(row["status"]),
+        "must_change_password": "true" if _bool_from_value(row["must_change_password"]) else "false",
+        "created_at": _field(row["created_at"]),
+        "updated_at": _field(row["updated_at"]),
+        "last_login_at": _field(row["last_login_at"]),
+        "last_login_ip": _field(row["last_login_ip"]),
+        "last_login_user_agent": _field(row["last_login_user_agent"]),
+    }
+
+
+def _normalize_auth_role(role: object) -> str:
+    text = str(role or "").strip().lower()
+    return text if text in AUTH_ROLES else AUTH_ROLE_OPERATOR
+
+
+def _normalize_auth_status(status: object) -> str:
+    text = str(status or "").strip().lower()
+    return text if text in AUTH_STATUSES else AUTH_STATUS_ACTIVE
+
+
+def _permissions_json(permissions: list[str] | tuple[str, ...] | None, role: str) -> str:
+    normalized = _normalize_permissions(permissions, role)
+    return json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_permissions(permissions: list[str] | tuple[str, ...] | None, role: str) -> list[str]:
+    if role == AUTH_ROLE_ADMIN:
+        return list(ADMIN_PERMISSIONS)
+    values = list(DEFAULT_OPERATOR_PERMISSIONS if permissions is None else permissions)
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        normalized.append(item)
+    return normalized
+
+
+def _load_permissions(raw: object) -> list[str]:
+    if isinstance(raw, list):
+        return _normalize_permissions([str(item) for item in raw], AUTH_ROLE_OPERATOR)
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, list):
+        return [str(item) for item in data if str(item or "").strip()]
+    return []
+
+
+def _bool_from_value(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "on"}
+
+
+def _get_web_user_password_hash(user_id: object) -> str:
+    try:
+        normalized_id = int(str(user_id))
+    except Exception:
+        return ""
+    init_accounts_db()
+    db_manager = _db_manager()
+    with db_manager.get_db_conn() as conn:
+        cursor = db_manager.get_cursor(conn)
+        row = db_manager.execute_sql(
+            cursor,
+            "SELECT password_hash FROM web_users WHERE id = ?",
+            (normalized_id,),
+        ).fetchone()
+    return str(row[0] or "") if row is not None else ""
+
+
+def _hash_password(password: str) -> str:
+    text = str(password or "")
+    if len(text) < 6:
+        raise ValueError("密码至少需要 6 位")
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        text.encode("utf-8"),
+        bytes.fromhex(salt),
+        PASSWORD_HASH_ITERATIONS,
+    ).hex()
+    return f"pbkdf2_sha256${PASSWORD_HASH_ITERATIONS}${salt}${digest}"
+
+
+def _verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algo, raw_iterations, salt, expected = str(stored_hash or "").split("$", 3)
+        iterations = int(raw_iterations)
+    except Exception:
+        return False
+    if algo != "pbkdf2_sha256" or not salt or not expected:
+        return False
+    try:
+        actual = hashlib.pbkdf2_hmac(
+            "sha256",
+            str(password or "").encode("utf-8"),
+            bytes.fromhex(salt),
+            iterations,
+        ).hex()
+    except Exception:
+        return False
+    return hmac.compare_digest(actual, expected)
+
+
+def _web_session_token_hash(token: str) -> str:
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()
+
+
 def _normalize_stock_status(value: object) -> str:
     text = str(value or "").strip()
     if text in STOCK_STATUSES:
@@ -990,6 +1996,26 @@ def _normalize_stock_status(value: object) -> str:
     if text.lower() in {"out", "sold", "used", "1", "true", "yes"}:
         return STOCK_STATUS_OUT
     return STOCK_STATUS_IN
+
+
+def _normalize_subscription_status(value: object) -> str:
+    text = str(value or "").strip()
+    if text in SUBSCRIPTION_STATUSES:
+        return text
+    return SUBSCRIPTION_STATUS_PENDING
+
+
+def _subscription_claim_is_active(value: object) -> bool:
+    text = _field(value)
+    if text == NULL_VALUE:
+        return False
+    try:
+        expires_at = datetime.fromisoformat(text)
+    except Exception:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at > datetime.now(timezone.utc)
 
 
 def _stock_status_counts(rows: list[Any]) -> dict[str, int]:
