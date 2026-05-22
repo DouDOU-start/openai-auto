@@ -4789,7 +4789,7 @@ ADMIN_USERS_PAGE = r"""
       margin-bottom: 16px;
     }
     label { display: grid; gap: 6px; color: var(--muted); font: 12px/1.2 var(--mono); }
-    input, select {
+    input:not([type="checkbox"]), select {
       width: 100%;
       border: 1px solid rgba(17,16,13,.14);
       background: rgba(255,255,255,.55);
@@ -4801,6 +4801,59 @@ ADMIN_USERS_PAGE = r"""
     }
     .span-2 { grid-column: span 2; }
     .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .permission-field {
+      grid-column: 1 / -1;
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font: 12px/1.2 var(--mono);
+    }
+    .permission-options {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .permission-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 12px;
+      padding: 9px 10px;
+      background: rgba(255,255,255,.4);
+      color: var(--ink);
+      font: 13px/1.2 var(--body);
+      cursor: pointer;
+    }
+    .permission-option input {
+      width: 14px;
+      height: 14px;
+      margin: 0;
+      accent-color: var(--accent);
+    }
+    .permission-option input:disabled + span {
+      color: var(--muted);
+    }
+    .permission-tags {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      max-width: 540px;
+    }
+    .permission-tag {
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 999px;
+      padding: 5px 8px;
+      background: rgba(255,255,255,.42);
+      color: var(--ink);
+      font: 12px/1.1 var(--body);
+      white-space: nowrap;
+    }
+    .permission-tag.all {
+      color: var(--accent-2);
+      background: rgba(15,107,95,.1);
+    }
+    .muted { color: var(--muted); }
     table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 14px; }
     th, td {
       text-align: left;
@@ -4861,7 +4914,10 @@ ADMIN_USERS_PAGE = r"""
           <button class="primary" id="saveBtn" type="button">创建操作员</button>
           <button id="cancelBtn" type="button">清空</button>
         </div>
-        <label class="span-2">权限<input id="permissions" value="view_subscription_accounts, claim_subscription_account, mark_subscription_done, mark_subscription_failed" /></label>
+        <div class="permission-field">
+          <div>权限</div>
+          <div class="permission-options" id="permissionOptions"></div>
+        </div>
       </div>
       <table>
         <thead>
@@ -4883,6 +4939,13 @@ ADMIN_USERS_PAGE = r"""
   <script>
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
+    const PERMISSIONS = [
+      ['view_subscription_accounts', '查看订阅账号'],
+      ['claim_subscription_account', '领取订阅任务'],
+      ['mark_subscription_done', '标记已订阅'],
+      ['mark_subscription_failed', '标记失败'],
+    ];
+    const DEFAULT_PERMISSIONS = PERMISSIONS.map((item) => item[0]);
     let users = [];
     function toast(message) {
       const node = $('toast');
@@ -4901,8 +4964,45 @@ ADMIN_USERS_PAGE = r"""
       if (!response.ok) throw new Error(data.detail || '请求失败');
       return data;
     }
+    function renderPermissionOptions() {
+      $('permissionOptions').innerHTML = PERMISSIONS.map(([key, label]) => `
+        <label class="permission-option" title="${escapeHtml(key)}">
+          <input type="checkbox" data-permission="${escapeHtml(key)}" />
+          <span>${escapeHtml(label)}</span>
+        </label>
+      `).join('');
+    }
+    function setPermissions(values) {
+      const selected = new Set(Array.isArray(values) ? values : DEFAULT_PERMISSIONS);
+      const allSelected = selected.has('*');
+      document.querySelectorAll('[data-permission]').forEach((input) => {
+        input.checked = allSelected || selected.has(input.dataset.permission);
+      });
+    }
+    function setPermissionInputsDisabled(disabled) {
+      document.querySelectorAll('[data-permission]').forEach((input) => {
+        input.disabled = disabled;
+      });
+    }
     function permissionsArray() {
-      return $('permissions').value.split(',').map((item) => item.trim()).filter(Boolean);
+      return Array.from(document.querySelectorAll('[data-permission]:checked'))
+        .map((input) => input.dataset.permission)
+        .filter(Boolean);
+    }
+    function permissionLabel(key) {
+      const match = PERMISSIONS.find((item) => item[0] === key);
+      return match ? match[1] : key;
+    }
+    function permissionTags(permissions) {
+      const values = Array.isArray(permissions) ? permissions : [];
+      if (values.includes('*')) {
+        return '<div class="permission-tags"><span class="permission-tag all" title="*">全部权限</span></div>';
+      }
+      const tags = values
+        .filter((key) => key && key !== '*')
+        .map((key) => `<span class="permission-tag" title="${escapeHtml(key)}">${escapeHtml(permissionLabel(key))}</span>`)
+        .join('');
+      return `<div class="permission-tags">${tags || '<span class="muted">未分配</span>'}</div>`;
     }
     function formatDate(value) {
       if (!value || value === 'null') return '无记录';
@@ -4933,7 +5033,7 @@ ADMIN_USERS_PAGE = r"""
             <td><strong>${escapeHtml(user.username)}</strong><br>${escapeHtml(user.display_name || '')}</td>
             <td>${escapeHtml(user.role)}</td>
             <td class="${statusClass}">${escapeHtml(user.status)}</td>
-            <td><code>${escapeHtml((user.permissions || []).join(', '))}</code></td>
+            <td>${permissionTags(user.permissions || [])}</td>
             <td>${escapeHtml(formatDate(user.last_login_at))}</td>
             <td>${actions}</td>
           </tr>
@@ -4953,7 +5053,8 @@ ADMIN_USERS_PAGE = r"""
       $('displayName').value = '';
       $('password').value = '';
       $('status').value = 'active';
-      $('permissions').value = 'view_subscription_accounts, claim_subscription_account, mark_subscription_done, mark_subscription_failed';
+      setPermissionInputsDisabled(false);
+      setPermissions(DEFAULT_PERMISSIONS);
       $('saveBtn').textContent = '创建操作员';
     }
     function editUser(id) {
@@ -4965,7 +5066,8 @@ ADMIN_USERS_PAGE = r"""
       $('displayName').value = user.display_name || '';
       $('password').value = '';
       $('status').value = user.status || 'active';
-      $('permissions').value = (user.permissions || []).join(', ');
+      setPermissionInputsDisabled(user.role === 'admin');
+      setPermissions(user.permissions || DEFAULT_PERMISSIONS);
       $('saveBtn').textContent = '保存修改';
     }
     async function saveUser() {
@@ -5004,6 +5106,8 @@ ADMIN_USERS_PAGE = r"""
       try { await request('/api/auth/logout', { method: 'POST' }); } catch (err) {}
       window.location.href = '/login';
     });
+    renderPermissionOptions();
+    clearForm();
     loadCurrentUser().then(loadUsers).catch((err) => toast(err.message));
   </script>
 </body>
