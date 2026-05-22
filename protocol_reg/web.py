@@ -4808,10 +4808,21 @@ ADMIN_USERS_PAGE = r"""
       color: var(--muted);
       font: 12px/1.2 var(--mono);
     }
-    .permission-options {
+    .permission-editor {
       display: flex;
-      gap: 8px;
+      align-items: center;
+      gap: 10px;
       flex-wrap: wrap;
+    }
+    .permission-summary {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+    }
+    .permission-options {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
     }
     .permission-option {
       display: inline-flex;
@@ -4854,6 +4865,49 @@ ADMIN_USERS_PAGE = r"""
       background: rgba(15,107,95,.1);
     }
     .muted { color: var(--muted); }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(17,16,13,.34);
+      z-index: 20;
+    }
+    .modal-backdrop.hidden { display: none; }
+    .modal {
+      width: min(520px, calc(100vw - 40px));
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: #f5efe2;
+      box-shadow: var(--shadow);
+      padding: 16px;
+    }
+    .modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .modal-head h2 {
+      margin: 0;
+      font-size: 20px;
+    }
+    .modal-close {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+      border-radius: 999px;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 16px;
+    }
     table { width: 100%; border-collapse: collapse; overflow: hidden; border-radius: 14px; }
     th, td {
       text-align: left;
@@ -4882,6 +4936,7 @@ ADMIN_USERS_PAGE = r"""
     @media (max-width: 860px) {
       .grid { grid-template-columns: 1fr; }
       .span-2 { grid-column: auto; }
+      .permission-options { grid-template-columns: 1fr; }
       table { display: block; overflow-x: auto; }
     }
   </style>
@@ -4916,7 +4971,10 @@ ADMIN_USERS_PAGE = r"""
         </div>
         <div class="permission-field">
           <div>权限</div>
-          <div class="permission-options" id="permissionOptions"></div>
+          <div class="permission-editor">
+            <div class="permission-summary" id="permissionSummary"></div>
+            <button id="openPermissionModalBtn" type="button">编辑权限</button>
+          </div>
         </div>
       </div>
       <table>
@@ -4935,6 +4993,19 @@ ADMIN_USERS_PAGE = r"""
       </table>
     </section>
   </main>
+  <div class="modal-backdrop hidden" id="permissionModal" role="dialog" aria-modal="true" aria-labelledby="permissionModalTitle">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="permissionModalTitle">编辑权限</h2>
+        <button class="modal-close" id="permissionModalClose" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="permission-options" id="permissionModalOptions"></div>
+      <div class="modal-actions">
+        <button id="permissionModalCancel" type="button">取消</button>
+        <button class="primary" id="permissionModalSave" type="button">保存权限</button>
+      </div>
+    </div>
+  </div>
   <div class="toast" id="toast"></div>
   <script>
     const $ = (id) => document.getElementById(id);
@@ -4947,6 +5018,9 @@ ADMIN_USERS_PAGE = r"""
     ];
     const DEFAULT_PERMISSIONS = PERMISSIONS.map((item) => item[0]);
     let users = [];
+    let selectedPermissions = [...DEFAULT_PERMISSIONS];
+    let formRole = 'operator';
+    let permissionModalContext = { type: 'form', userId: '' };
     function toast(message) {
       const node = $('toast');
       node.textContent = message;
@@ -4964,29 +5038,30 @@ ADMIN_USERS_PAGE = r"""
       if (!response.ok) throw new Error(data.detail || '请求失败');
       return data;
     }
-    function renderPermissionOptions() {
-      $('permissionOptions').innerHTML = PERMISSIONS.map(([key, label]) => `
+    function renderPermissionModalOptions(values, disabled = false) {
+      const selected = new Set(Array.isArray(values) ? values : DEFAULT_PERMISSIONS);
+      const allSelected = selected.has('*');
+      $('permissionModalOptions').innerHTML = PERMISSIONS.map(([key, label]) => `
         <label class="permission-option" title="${escapeHtml(key)}">
-          <input type="checkbox" data-permission="${escapeHtml(key)}" />
+          <input type="checkbox" data-modal-permission="${escapeHtml(key)}" ${allSelected || selected.has(key) ? 'checked' : ''} ${disabled ? 'disabled' : ''} />
           <span>${escapeHtml(label)}</span>
         </label>
       `).join('');
     }
     function setPermissions(values) {
-      const selected = new Set(Array.isArray(values) ? values : DEFAULT_PERMISSIONS);
-      const allSelected = selected.has('*');
-      document.querySelectorAll('[data-permission]').forEach((input) => {
-        input.checked = allSelected || selected.has(input.dataset.permission);
-      });
+      selectedPermissions = Array.isArray(values) ? [...values] : [...DEFAULT_PERMISSIONS];
+      renderPermissionSummary();
     }
-    function setPermissionInputsDisabled(disabled) {
-      document.querySelectorAll('[data-permission]').forEach((input) => {
-        input.disabled = disabled;
-      });
+    function renderPermissionSummary() {
+      $('permissionSummary').innerHTML = permissionTags(selectedPermissions);
+      $('openPermissionModalBtn').disabled = formRole === 'admin';
     }
     function permissionsArray() {
-      return Array.from(document.querySelectorAll('[data-permission]:checked'))
-        .map((input) => input.dataset.permission)
+      return [...selectedPermissions];
+    }
+    function modalPermissionsArray() {
+      return Array.from(document.querySelectorAll('[data-modal-permission]:checked'))
+        .map((input) => input.dataset.modalPermission)
         .filter(Boolean);
     }
     function permissionLabel(key) {
@@ -5025,6 +5100,7 @@ ADMIN_USERS_PAGE = r"""
         const statusClass = user.status === 'disabled' ? 'status-disabled' : 'status-active';
         const actions = `
           <button type="button" data-edit="${escapeHtml(user.id)}">编辑</button>
+          ${user.role === 'admin' ? '' : `<button type="button" data-permission-edit="${escapeHtml(user.id)}">权限</button>`}
           <button type="button" data-reset="${escapeHtml(user.id)}">重置密码</button>
         `;
         return `
@@ -5042,18 +5118,21 @@ ADMIN_USERS_PAGE = r"""
       document.querySelectorAll('[data-edit]').forEach((button) => {
         button.addEventListener('click', () => editUser(button.dataset.edit));
       });
+      document.querySelectorAll('[data-permission-edit]').forEach((button) => {
+        button.addEventListener('click', () => openPermissionModalForUser(button.dataset.permissionEdit));
+      });
       document.querySelectorAll('[data-reset]').forEach((button) => {
         button.addEventListener('click', () => resetPassword(button.dataset.reset).catch((err) => toast(err.message)));
       });
     }
     function clearForm() {
+      formRole = 'operator';
       $('userId').value = '';
       $('username').value = '';
       $('username').disabled = false;
       $('displayName').value = '';
       $('password').value = '';
       $('status').value = 'active';
-      setPermissionInputsDisabled(false);
       setPermissions(DEFAULT_PERMISSIONS);
       $('saveBtn').textContent = '创建操作员';
     }
@@ -5066,9 +5145,55 @@ ADMIN_USERS_PAGE = r"""
       $('displayName').value = user.display_name || '';
       $('password').value = '';
       $('status').value = user.status || 'active';
-      setPermissionInputsDisabled(user.role === 'admin');
+      formRole = user.role || 'operator';
       setPermissions(user.permissions || DEFAULT_PERMISSIONS);
       $('saveBtn').textContent = '保存修改';
+    }
+    function openPermissionModalForForm() {
+      if (formRole === 'admin') {
+        toast('管理员默认拥有全部权限');
+        return;
+      }
+      permissionModalContext = { type: 'form', userId: '' };
+      $('permissionModalTitle').textContent = '编辑权限';
+      $('permissionModalSave').disabled = false;
+      renderPermissionModalOptions(selectedPermissions);
+      $('permissionModal').classList.remove('hidden');
+    }
+    function openPermissionModalForUser(id) {
+      const user = users.find((item) => String(item.id) === String(id));
+      if (!user) return;
+      if (user.role === 'admin') {
+        toast('管理员默认拥有全部权限');
+        return;
+      }
+      permissionModalContext = { type: 'user', userId: String(user.id) };
+      $('permissionModalTitle').textContent = `${user.username} · 权限`;
+      $('permissionModalSave').disabled = false;
+      renderPermissionModalOptions(user.permissions || DEFAULT_PERMISSIONS);
+      $('permissionModal').classList.remove('hidden');
+    }
+    function closePermissionModal() {
+      $('permissionModal').classList.add('hidden');
+      permissionModalContext = { type: 'form', userId: '' };
+    }
+    async function savePermissionModal() {
+      const permissions = modalPermissionsArray();
+      if (permissionModalContext.type === 'form') {
+        setPermissions(permissions);
+        closePermissionModal();
+        return;
+      }
+      const id = permissionModalContext.userId;
+      if (!id) return;
+      $('permissionModalSave').disabled = true;
+      await request(`/api/admin/users/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ permissions }),
+      });
+      toast('权限已更新');
+      closePermissionModal();
+      await loadUsers();
     }
     async function saveUser() {
       const id = $('userId').value.trim();
@@ -5100,13 +5225,22 @@ ADMIN_USERS_PAGE = r"""
       });
       toast('密码已重置');
     }
+    $('openPermissionModalBtn').addEventListener('click', openPermissionModalForForm);
+    $('permissionModalClose').addEventListener('click', closePermissionModal);
+    $('permissionModalCancel').addEventListener('click', closePermissionModal);
+    $('permissionModal').addEventListener('click', (event) => {
+      if (event.target === $('permissionModal')) closePermissionModal();
+    });
+    $('permissionModalSave').addEventListener('click', () => savePermissionModal().catch((err) => {
+      $('permissionModalSave').disabled = false;
+      toast(err.message);
+    }));
     $('saveBtn').addEventListener('click', () => saveUser().catch((err) => toast(err.message)));
     $('cancelBtn').addEventListener('click', clearForm);
     $('logoutBtn').addEventListener('click', async () => {
       try { await request('/api/auth/logout', { method: 'POST' }); } catch (err) {}
       window.location.href = '/login';
     });
-    renderPermissionOptions();
     clearForm();
     loadCurrentUser().then(loadUsers).catch((err) => toast(err.message));
   </script>
