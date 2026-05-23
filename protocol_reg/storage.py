@@ -44,6 +44,13 @@ SUBSCRIPTION_STATUSES = {
     SUBSCRIPTION_STATUS_FAILED,
 }
 _file_write_lock = threading.RLock()
+_AIRGATE_EXPORT_TZ = timezone(timedelta(hours=8))
+_AIRGATE_EXPORT_VERSION = 1
+_AIRGATE_EXPORT_PLATFORM = "openai"
+_AIRGATE_EXPORT_TYPE = "oauth"
+_AIRGATE_EXPORT_PRIORITY = 50
+_AIRGATE_EXPORT_MAX_CONCURRENCY = 10
+_AIRGATE_EXPORT_RATE_MULTIPLIER = 1
 
 
 def init_accounts_db() -> None:
@@ -72,6 +79,10 @@ def init_accounts_db() -> None:
                 subscription_claim_expires_at TEXT,
                 subscription_marked_at TEXT,
                 subscription_verified_at TEXT,
+                subscription_verify_attempts INTEGER DEFAULT 0,
+                subscription_verify_last_at TEXT,
+                subscription_verify_next_at TEXT,
+                subscription_verify_last_message TEXT DEFAULT 'null',
                 subscription_note TEXT DEFAULT 'null',
                 stock_status TEXT DEFAULT '未出库',
                 status TEXT DEFAULT 'active',
@@ -92,6 +103,10 @@ def init_accounts_db() -> None:
         _ensure_accounts_column(cursor, "subscription_claim_expires_at", "TEXT")
         _ensure_accounts_column(cursor, "subscription_marked_at", "TEXT")
         _ensure_accounts_column(cursor, "subscription_verified_at", "TEXT")
+        _ensure_accounts_column(cursor, "subscription_verify_attempts", "INTEGER DEFAULT 0")
+        _ensure_accounts_column(cursor, "subscription_verify_last_at", "TEXT")
+        _ensure_accounts_column(cursor, "subscription_verify_next_at", "TEXT")
+        _ensure_accounts_column(cursor, "subscription_verify_last_message", "TEXT DEFAULT 'null'")
         _ensure_accounts_column(cursor, "subscription_note", "TEXT DEFAULT 'null'")
         _ensure_accounts_column(cursor, "stock_status", "TEXT DEFAULT '未出库'")
         _drop_accounts_column(cursor, "source")
@@ -132,6 +147,10 @@ def init_accounts_db() -> None:
         db_manager.execute_sql(
             cursor,
             "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_operator ON accounts(subscription_operator_id)",
+        )
+        db_manager.execute_sql(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_verify_next_at ON accounts(subscription_status, subscription_verify_next_at)",
         )
         db_manager.execute_sql(
             cursor,
@@ -236,6 +255,8 @@ def load_accounts_db() -> list[dict[str, str]]:
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
                    subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_verify_attempts, subscription_verify_last_at, subscription_verify_next_at,
+                   subscription_verify_last_message,
                    subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
@@ -245,16 +266,22 @@ def load_accounts_db() -> list[dict[str, str]]:
     return [_account_from_row(row) for row in rows]
 
 
-def _build_account_filter(search: str, status: str, plan: str, stock_status: str) -> tuple[str, tuple[str, ...]]:
+def _build_account_filter(
+    search: str,
+    status: str,
+    plan: str,
+    stock_status: str,
+    subscription_status: str,
+) -> tuple[str, tuple[str, ...]]:
     where: list[str] = []
     params: list[str] = []
     search_value = search.strip()
     if search_value:
         like = f"%{search_value}%"
         where.append(
-            "(email LIKE ? OR subscription_type LIKE ? OR status LIKE ? OR stock_status LIKE ? OR checkout_url LIKE ?)"
+            "(email LIKE ? OR subscription_type LIKE ? OR status LIKE ? OR stock_status LIKE ? OR checkout_url LIKE ? OR subscription_status LIKE ? OR subscription_note LIKE ?)"
         )
-        params.extend([like, like, like, like, like])
+        params.extend([like, like, like, like, like, like, like])
     if status and status != "all":
         where.append("status = ?")
         params.append(status)
@@ -264,6 +291,9 @@ def _build_account_filter(search: str, status: str, plan: str, stock_status: str
     if stock_status and stock_status != "all":
         where.append("stock_status = ?")
         params.append(_normalize_stock_status(stock_status))
+    if subscription_status and subscription_status != "all":
+        where.append("subscription_status = ?")
+        params.append(_normalize_subscription_status(subscription_status))
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     return where_sql, tuple(params)
 
@@ -273,13 +303,14 @@ def list_account_rows(
     status: str = "",
     plan: str = "",
     stock_status: str = "",
+    subscription_status: str = "",
     page: int = 1,
     page_size: int = 0,
 ) -> list[dict[str, str]]:
     """按条件读取账号管理页列表。page_size=0 表示不分页，返回所有匹配项。"""
 
     init_accounts_db()
-    where_sql, params = _build_account_filter(search, status, plan, stock_status)
+    where_sql, params = _build_account_filter(search, status, plan, stock_status, subscription_status)
 
     limit_sql = ""
     extra_params: tuple[Any, ...] = ()
@@ -299,6 +330,8 @@ def list_account_rows(
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
                    subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_verify_attempts, subscription_verify_last_at, subscription_verify_next_at,
+                   subscription_verify_last_message,
                    subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
@@ -343,6 +376,8 @@ def list_account_rows_by_ids(ids: list[int]) -> list[dict[str, str]]:
                        login_session_json, auth_token_json, checkout_json,
                        subscription_status, subscription_operator_id, subscription_claimed_at,
                        subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                       subscription_verify_attempts, subscription_verify_last_at, subscription_verify_next_at,
+                       subscription_verify_last_message,
                        subscription_note, stock_status,
                        status, created_at, updated_at, last_login_at, last_authorized_at
                 FROM accounts
@@ -359,11 +394,17 @@ def list_account_rows_by_ids(ids: list[int]) -> list[dict[str, str]]:
     return [rows_by_id[account_id] for account_id in clean_ids if account_id in rows_by_id]
 
 
-def count_account_rows(search: str = "", status: str = "", plan: str = "", stock_status: str = "") -> int:
+def count_account_rows(
+    search: str = "",
+    status: str = "",
+    plan: str = "",
+    stock_status: str = "",
+    subscription_status: str = "",
+) -> int:
     """返回按条件过滤后的账号总数。"""
 
     init_accounts_db()
-    where_sql, params = _build_account_filter(search, status, plan, stock_status)
+    where_sql, params = _build_account_filter(search, status, plan, stock_status, subscription_status)
     db_manager = _db_manager()
     with db_manager.get_db_conn() as conn:
         cursor = db_manager.get_cursor(conn)
@@ -387,6 +428,8 @@ def get_account_db(account_id: int) -> dict[str, str] | None:
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
                    subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_verify_attempts, subscription_verify_last_at, subscription_verify_next_at,
+                   subscription_verify_last_message,
                    subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
@@ -409,6 +452,8 @@ def _get_account_db_by_email(email: str) -> dict[str, str] | None:
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
                    subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_verify_attempts, subscription_verify_last_at, subscription_verify_next_at,
+                   subscription_verify_last_message,
                    subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
@@ -557,11 +602,15 @@ def update_account_checkout_url_db(
                     subscription_claim_expires_at = NULL,
                     subscription_marked_at = NULL,
                     subscription_verified_at = NULL,
+                    subscription_verify_attempts = 0,
+                    subscription_verify_last_at = NULL,
+                    subscription_verify_next_at = NULL,
+                    subscription_verify_last_message = ?,
                     subscription_note = ?,
                     updated_at = ?
                 WHERE email = ?
                 """,
-                (normalized_url, SUBSCRIPTION_STATUS_PENDING, NULL_VALUE, now, normalized_email),
+                (normalized_url, SUBSCRIPTION_STATUS_PENDING, "null", NULL_VALUE, now, normalized_email),
             )
         else:
             db_manager.execute_sql(
@@ -576,6 +625,10 @@ def update_account_checkout_url_db(
                     subscription_claim_expires_at = NULL,
                     subscription_marked_at = NULL,
                     subscription_verified_at = NULL,
+                    subscription_verify_attempts = 0,
+                    subscription_verify_last_at = NULL,
+                    subscription_verify_next_at = NULL,
+                    subscription_verify_last_message = ?,
                     subscription_note = ?,
                     updated_at = ?
                 WHERE email = ?
@@ -584,6 +637,7 @@ def update_account_checkout_url_db(
                     normalized_url,
                     normalized_checkout,
                     SUBSCRIPTION_STATUS_PENDING,
+                    "null",
                     NULL_VALUE,
                     now,
                     normalized_email,
@@ -692,7 +746,7 @@ def delete_account_db(account_id: int) -> bool:
 def account_stats_db() -> dict[str, Any]:
     init_accounts_db()
     db_manager = _db_manager()
-    with db_manager.get_db_conn() as conn:
+    with db_manager.get_db_conn(as_dict=True) as conn:
         cursor = db_manager.get_cursor(conn)
         total = cursor.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
         with_rt = cursor.execute(
@@ -722,6 +776,34 @@ def account_stats_db() -> dict[str, Any]:
         subscription_statuses = cursor.execute(
             "SELECT subscription_status, COUNT(*) FROM accounts GROUP BY subscription_status ORDER BY COUNT(*) DESC"
         ).fetchall()
+        operator_stats = cursor.execute(
+            """
+            SELECT
+                a.subscription_operator_id AS operator_id,
+                COALESCE(u.username, '') AS username,
+                COALESCE(u.display_name, '') AS display_name,
+                COALESCE(u.role, '') AS role,
+                COUNT(*) AS total,
+                SUM(CASE WHEN a.subscription_status = ? THEN 1 ELSE 0 END) AS pending_count,
+                SUM(CASE WHEN a.subscription_status = ? THEN 1 ELSE 0 END) AS claimed_count,
+                SUM(CASE WHEN a.subscription_status = ? THEN 1 ELSE 0 END) AS marked_count,
+                SUM(CASE WHEN a.subscription_status = ? THEN 1 ELSE 0 END) AS verified_count,
+                SUM(CASE WHEN a.subscription_status = ? THEN 1 ELSE 0 END) AS failed_count,
+                MAX(COALESCE(a.subscription_verified_at, a.subscription_marked_at, a.subscription_claimed_at, a.updated_at)) AS last_activity_at
+            FROM accounts a
+            LEFT JOIN web_users u ON u.id = a.subscription_operator_id
+            WHERE a.subscription_operator_id IS NOT NULL
+            GROUP BY a.subscription_operator_id, u.username, u.display_name, u.role
+            ORDER BY total DESC, last_activity_at DESC, operator_id ASC
+            """,
+            (
+                SUBSCRIPTION_STATUS_PENDING,
+                SUBSCRIPTION_STATUS_CLAIMED,
+                SUBSCRIPTION_STATUS_MARKED,
+                SUBSCRIPTION_STATUS_VERIFIED,
+                SUBSCRIPTION_STATUS_FAILED,
+            ),
+        ).fetchall()
     return {
         "total": total,
         "with_rt": with_rt,
@@ -736,6 +818,22 @@ def account_stats_db() -> dict[str, Any]:
             _normalize_subscription_status(item_status): int(count)
             for item_status, count in subscription_statuses
         },
+        "operator_stats": [
+            {
+                "operator_id": str(row["operator_id"] or ""),
+                "username": str(row["username"] or ""),
+                "display_name": str(row["display_name"] or ""),
+                "role": str(row["role"] or AUTH_ROLE_OPERATOR),
+                "total": int(row["total"] or 0),
+                "pending_count": int(row["pending_count"] or 0),
+                "claimed_count": int(row["claimed_count"] or 0),
+                "marked_count": int(row["marked_count"] or 0),
+                "verified_count": int(row["verified_count"] or 0),
+                "failed_count": int(row["failed_count"] or 0),
+                "last_activity_at": str(row["last_activity_at"] or NULL_VALUE),
+            }
+            for row in operator_stats
+        ],
     }
 
 
@@ -769,11 +867,14 @@ def list_subscription_queue_db(
     effective_page = max(1, int(page))
     effective_page_size = max(1, min(500, int(page_size)))
     offset = (effective_page - 1) * effective_page_size
+    status_values = [SUBSCRIPTION_STATUS_PENDING, SUBSCRIPTION_STATUS_FAILED]
+    if operator_user_id is None:
+        status_values.extend([SUBSCRIPTION_STATUS_MARKED, SUBSCRIPTION_STATUS_VERIFIED])
+    status_placeholders = ",".join("?" for _ in status_values)
     params: list[Any] = [
         STOCK_STATUS_IN,
         ACCOUNT_STATUS_ABANDONED,
-        SUBSCRIPTION_STATUS_PENDING,
-        SUBSCRIPTION_STATUS_FAILED,
+        *status_values,
     ]
     operator_clause = ""
     if operator_user_id is not None:
@@ -797,6 +898,8 @@ def list_subscription_queue_db(
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
                    subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_verify_attempts, subscription_verify_last_at, subscription_verify_next_at,
+                   subscription_verify_last_message,
                    subscription_note, stock_status,
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
@@ -804,7 +907,7 @@ def list_subscription_queue_db(
               AND COALESCE(status, '') != ?
               AND checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''
               AND (
-                    subscription_status IN (?, ?)
+                    subscription_status IN ({status_placeholders})
                     {operator_clause}
                     {processing_clause}
                   )
@@ -813,7 +916,9 @@ def list_subscription_queue_db(
                     WHEN ? THEN 0
                     WHEN ? THEN 1
                     WHEN ? THEN 2
-                    ELSE 3
+                    WHEN ? THEN 3
+                    WHEN ? THEN 4
+                    ELSE 5
                 END,
                 created_at DESC,
                 id DESC
@@ -823,9 +928,107 @@ def list_subscription_queue_db(
                 *params,
                 SUBSCRIPTION_STATUS_PENDING,
                 SUBSCRIPTION_STATUS_CLAIMED,
+                SUBSCRIPTION_STATUS_MARKED,
+                SUBSCRIPTION_STATUS_VERIFIED,
                 SUBSCRIPTION_STATUS_FAILED,
                 effective_page_size,
                 offset,
+            ),
+        ).fetchall()
+    return [_account_from_row(row) for row in rows]
+
+
+def update_subscription_verification_tracking_db(
+    account_id: int,
+    *,
+    attempts: int | None = None,
+    last_checked_at: str | None = None,
+    next_check_at: str | None = None,
+    last_message: str | None = None,
+) -> dict[str, str]:
+    init_accounts_db()
+    db_manager = _db_manager()
+    now = utc_now()
+    updates: list[str] = []
+    params: list[Any] = []
+    if attempts is not None:
+        updates.append("subscription_verify_attempts = ?")
+        params.append(max(0, int(attempts)))
+    if last_checked_at is not None:
+        updates.append("subscription_verify_last_at = ?")
+        params.append(_field(last_checked_at))
+    if next_check_at is not None:
+        updates.append("subscription_verify_next_at = ?")
+        params.append(_field(next_check_at))
+    if last_message is not None:
+        updates.append("subscription_verify_last_message = ?")
+        params.append(_field(last_message))
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(now)
+        with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+            cursor = db_manager.get_cursor(conn)
+            db_manager.execute_sql(
+                cursor,
+                f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?",
+                (*params, int(account_id)),
+            )
+            if cursor.rowcount <= 0:
+                raise KeyError(f"账号不存在: {account_id}")
+    account = get_account_db(int(account_id))
+    if account is None:
+        raise RuntimeError("账号核实追踪更新后读取失败")
+    return account
+
+
+def list_due_subscription_verification_accounts_db(
+    *,
+    limit: int = 20,
+    max_attempts: int = 12,
+    now: str | None = None,
+) -> list[dict[str, str]]:
+    init_accounts_db()
+    effective_limit = max(1, min(200, int(limit)))
+    effective_max_attempts = max(1, int(max_attempts))
+    now_value = _field(now or utc_now())
+    db_manager = _db_manager()
+    with db_manager.get_db_conn(as_dict=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        rows = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
+                   login_session_json, auth_token_json, checkout_json,
+                   subscription_status, subscription_operator_id, subscription_claimed_at,
+                   subscription_claim_expires_at, subscription_marked_at, subscription_verified_at,
+                   subscription_verify_attempts, subscription_verify_last_at, subscription_verify_next_at,
+                   subscription_verify_last_message,
+                   subscription_note, stock_status,
+                   status, created_at, updated_at, last_login_at, last_authorized_at
+            FROM accounts
+            WHERE subscription_status = ?
+              AND COALESCE(subscription_verify_attempts, 0) < ?
+              AND (
+                    subscription_verify_next_at IS NULL
+                    OR subscription_verify_next_at = ''
+                    OR subscription_verify_next_at = 'null'
+                    OR subscription_verify_next_at <= ?
+                  )
+            ORDER BY
+                CASE
+                    WHEN subscription_verify_next_at IS NULL OR subscription_verify_next_at = '' OR subscription_verify_next_at = 'null' THEN 0
+                    ELSE 1
+                END,
+                subscription_verify_next_at ASC,
+                subscription_marked_at ASC,
+                id ASC
+            LIMIT ?
+            """,
+            (
+                SUBSCRIPTION_STATUS_MARKED,
+                effective_max_attempts,
+                now_value,
+                effective_limit,
             ),
         ).fetchall()
     return [_account_from_row(row) for row in rows]
@@ -885,7 +1088,13 @@ def claim_subscription_account_db(account_id: int, operator_user_id: int, *, cla
                 int(account_id),
             ),
         )
-    account = get_account_db(int(account_id))
+    account = update_subscription_verification_tracking_db(
+        account_id,
+        attempts=0,
+        last_checked_at=NULL_VALUE,
+        next_check_at=NULL_VALUE,
+        last_message=NULL_VALUE,
+    )
     if account is None:
         raise RuntimeError("账号领取后读取失败")
     return account
@@ -897,7 +1106,7 @@ def mark_subscription_account_clicked_db(
     *,
     note: str = "",
 ) -> dict[str, str]:
-    return _update_subscription_account_status(
+    _update_subscription_account_status(
         account_id,
         operator_user_id,
         SUBSCRIPTION_STATUS_MARKED,
@@ -907,6 +1116,13 @@ def mark_subscription_account_clicked_db(
         allowed_current_statuses=(SUBSCRIPTION_STATUS_CLAIMED,),
         require_operator_claim=True,
     )
+    return update_subscription_verification_tracking_db(
+        account_id,
+        attempts=0,
+        last_checked_at=NULL_VALUE,
+        next_check_at=NULL_VALUE,
+        last_message="自动核实中",
+    )
 
 
 def mark_subscription_account_failed_db(
@@ -915,7 +1131,7 @@ def mark_subscription_account_failed_db(
     *,
     note: str = "",
 ) -> dict[str, str]:
-    return _update_subscription_account_status(
+    _update_subscription_account_status(
         account_id,
         operator_user_id,
         SUBSCRIPTION_STATUS_FAILED,
@@ -924,10 +1140,17 @@ def mark_subscription_account_failed_db(
         allowed_current_statuses=(SUBSCRIPTION_STATUS_CLAIMED,),
         require_operator_claim=True,
     )
+    return update_subscription_verification_tracking_db(
+        account_id,
+        attempts=0,
+        last_checked_at=NULL_VALUE,
+        next_check_at=NULL_VALUE,
+        last_message=NULL_VALUE,
+    )
 
 
 def verify_subscription_account_db(account_id: int, *, note: str = "") -> dict[str, str]:
-    return _update_subscription_account_status(
+    _update_subscription_account_status(
         account_id,
         None,
         SUBSCRIPTION_STATUS_VERIFIED,
@@ -936,10 +1159,16 @@ def verify_subscription_account_db(account_id: int, *, note: str = "") -> dict[s
         verified_field="subscription_verified_at",
         allowed_current_statuses=(SUBSCRIPTION_STATUS_MARKED, SUBSCRIPTION_STATUS_VERIFIED),
     )
+    return update_subscription_verification_tracking_db(
+        account_id,
+        last_checked_at=utc_now(),
+        next_check_at=NULL_VALUE,
+        last_message=note or "已确认订阅",
+    )
 
 
 def release_subscription_account_db(account_id: int, operator_user_id: int | None = None) -> dict[str, str]:
-    return _update_subscription_account_status(
+    _update_subscription_account_status(
         account_id,
         operator_user_id,
         SUBSCRIPTION_STATUS_PENDING,
@@ -947,6 +1176,13 @@ def release_subscription_account_db(account_id: int, operator_user_id: int | Non
         clear_claim=True,
         allowed_current_statuses=(SUBSCRIPTION_STATUS_CLAIMED,),
         require_operator_claim=operator_user_id is not None,
+    )
+    return update_subscription_verification_tracking_db(
+        account_id,
+        attempts=0,
+        last_checked_at=NULL_VALUE,
+        next_check_at=NULL_VALUE,
+        last_message=NULL_VALUE,
     )
 
 
@@ -1611,6 +1847,107 @@ def build_checkout_db_jsonl() -> str:
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def build_airgate_accounts_json(accounts: list[dict[str, str]] | None = None) -> tuple[str, int, int]:
+    if accounts is None:
+        accounts = load_accounts_db()
+
+    exported_accounts: list[dict[str, Any]] = []
+    skipped = 0
+    for account in accounts:
+        item = _airgate_account_export_item(account)
+        if item is None:
+            skipped += 1
+            continue
+        exported_accounts.append(item)
+
+    if not exported_accounts:
+        return "", 0, skipped
+
+    payload = {
+        "version": _AIRGATE_EXPORT_VERSION,
+        "exported_at": datetime.now(_AIRGATE_EXPORT_TZ).isoformat(timespec="seconds"),
+        "count": len(exported_accounts),
+        "accounts": exported_accounts,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n", len(exported_accounts), skipped
+
+
+def _airgate_account_export_item(account: dict[str, str]) -> dict[str, Any] | None:
+    session_payload = _airgate_session_payload(account)
+    auth_payload = _airgate_auth_payload(account)
+
+    access_token = _airgate_first_text(
+        _airgate_nested_text(session_payload, "accessToken"),
+        _airgate_nested_text(session_payload, "access_token"),
+        _airgate_nested_text(auth_payload, "access_token"),
+        _airgate_nested_text(auth_payload, "accessToken"),
+    )
+    if not access_token:
+        return None
+
+    account_name = _airgate_first_text(
+        _airgate_nested_text(session_payload, "user", "name"),
+        _airgate_nested_text(auth_payload, "account_name"),
+        _airgate_nested_text(auth_payload, "name"),
+        _field(account.get("email")),
+    )
+    if not account_name:
+        account_name = _field(account.get("email"))
+
+    email = _airgate_first_text(
+        _airgate_nested_text(session_payload, "user", "email"),
+        _airgate_nested_text(auth_payload, "email"),
+        _field(account.get("email")),
+    )
+
+    chatgpt_account_id = _airgate_first_text(
+        _airgate_nested_text(session_payload, "account", "id"),
+        _airgate_nested_text(auth_payload, "chatgpt_account_id"),
+        _airgate_nested_text(auth_payload, "account_id"),
+    )
+    plan_type = _airgate_first_text(
+        _airgate_nested_text(session_payload, "account", "planType"),
+        _airgate_nested_text(session_payload, "account", "plan_type"),
+        _airgate_nested_text(auth_payload, "plan_type"),
+        _field(account.get("subscription_type")),
+    )
+    refresh_token = _airgate_first_text(
+        _airgate_nested_text(auth_payload, "refresh_token"),
+        _field(account.get("refresh_token")),
+    )
+    session_token = _airgate_first_text(
+        _airgate_nested_text(session_payload, "sessionToken"),
+        _airgate_nested_text(session_payload, "session_token"),
+        _airgate_nested_text(auth_payload, "session_token"),
+        _airgate_nested_text(auth_payload, "sessionToken"),
+    )
+    subscription_active_until = _airgate_first_text(
+        _airgate_nested_text(auth_payload, "subscription_active_until"),
+        _airgate_nested_text(auth_payload, "subscriptionActiveUntil"),
+    )
+
+    credentials = {
+        "access_token": access_token,
+        "base_url": "",
+        "chatgpt_account_id": chatgpt_account_id,
+        "email": email,
+        "plan_type": plan_type,
+        "provider": "",
+        "refresh_token": refresh_token,
+        "session_token": session_token,
+        "subscription_active_until": subscription_active_until,
+    }
+    return {
+        "name": account_name,
+        "platform": _AIRGATE_EXPORT_PLATFORM,
+        "type": _AIRGATE_EXPORT_TYPE,
+        "credentials": credentials,
+        "priority": _AIRGATE_EXPORT_PRIORITY,
+        "max_concurrency": _AIRGATE_EXPORT_MAX_CONCURRENCY,
+        "rate_multiplier": _AIRGATE_EXPORT_RATE_MULTIPLIER,
+    }
+
+
 def load_compact_accounts(path: Path) -> list[dict[str, str]]:
     normalize_compact_accounts_txt(path)
     accounts: list[dict[str, str]] = []
@@ -1925,6 +2262,10 @@ def _account_from_row(row: Any) -> dict[str, str]:
         "subscription_claim_expires_at": _field(row["subscription_claim_expires_at"]) if "subscription_claim_expires_at" in keys else NULL_VALUE,
         "subscription_marked_at": _field(row["subscription_marked_at"]) if "subscription_marked_at" in keys else NULL_VALUE,
         "subscription_verified_at": _field(row["subscription_verified_at"]) if "subscription_verified_at" in keys else NULL_VALUE,
+        "subscription_verify_attempts": int(row["subscription_verify_attempts"] or 0) if "subscription_verify_attempts" in keys else 0,
+        "subscription_verify_last_at": _field(row["subscription_verify_last_at"]) if "subscription_verify_last_at" in keys else NULL_VALUE,
+        "subscription_verify_next_at": _field(row["subscription_verify_next_at"]) if "subscription_verify_next_at" in keys else NULL_VALUE,
+        "subscription_verify_last_message": _field(row["subscription_verify_last_message"]) if "subscription_verify_last_message" in keys else NULL_VALUE,
         "subscription_note": _field(row["subscription_note"]) if "subscription_note" in keys else NULL_VALUE,
         "stock_status": _normalize_stock_status(row["stock_status"]) if "stock_status" in keys else STOCK_STATUS_IN,
         "status": _field(row["status"]),
@@ -2333,6 +2674,59 @@ def _has_session_blob(value: object) -> bool:
     except json.JSONDecodeError:
         return False
     return isinstance(loaded, (dict, list))
+
+
+def _airgate_auth_payload(account: dict[str, str]) -> dict[str, Any] | None:
+    payload = _load_json_blob(account.get("auth_token"))
+    if not isinstance(payload, dict):
+        return None
+    token_data = payload.get("token_data")
+    if isinstance(token_data, dict):
+        return token_data
+    if any(key in payload for key in ("access_token", "refresh_token", "chatgpt_session", "id_token")):
+        return payload
+    return None
+
+
+def _airgate_session_payload(account: dict[str, str]) -> dict[str, Any] | None:
+    session = _load_json_blob(account.get("session"))
+    if isinstance(session, dict):
+        data = session.get("data")
+        if isinstance(data, dict):
+            return data
+        if any(key in session for key in ("accessToken", "access_token", "user", "account", "sessionToken", "session_token")):
+            return session
+
+    auth_payload = _airgate_auth_payload(account)
+    if not isinstance(auth_payload, dict):
+        return None
+    chatgpt_session = auth_payload.get("chatgpt_session")
+    if isinstance(chatgpt_session, dict):
+        data = chatgpt_session.get("data")
+        if isinstance(data, dict):
+            return data
+        if any(key in chatgpt_session for key in ("accessToken", "access_token", "user", "account", "sessionToken", "session_token")):
+            return chatgpt_session
+    return None
+
+
+def _airgate_nested_text(value: object, *path: str) -> str:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return ""
+        current = current.get(key)
+    if isinstance(current, (dict, list)):
+        return ""
+    return _field(current)
+
+
+def _airgate_first_text(*values: str) -> str:
+    for value in values:
+        text = _field(value)
+        if text != NULL_VALUE:
+            return text
+    return ""
 
 
 def _db_manager() -> Any:

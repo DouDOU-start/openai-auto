@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import secrets
 import sqlite3
@@ -39,6 +40,7 @@ from .storage import (
     SUBSCRIPTION_STATUS_PENDING,
     SUBSCRIPTION_STATUS_VERIFIED,
     WEB_SESSION_TTL_SECONDS,
+    build_airgate_accounts_json,
     build_accounts_db_txt,
     build_checkout_db_jsonl,
     build_tokens_db_jsonl,
@@ -50,6 +52,7 @@ from .storage import (
     delete_web_user,
     init_accounts_db,
     get_account_db,
+    list_due_subscription_verification_accounts_db,
     list_account_rows,
     list_account_rows_by_ids,
     list_subscription_queue_db,
@@ -76,6 +79,8 @@ from .storage import (
     update_account_status_db,
     update_account_subscription_type_db,
     update_account_stock_status_db,
+    utc_now,
+    update_subscription_verification_tracking_db,
 )
 from .utils import make_password, make_random_email
 
@@ -636,6 +641,192 @@ class AutoRegisterScheduler:
             self._last_job_ids = [job.id for job in jobs]
 
 
+class SubscriptionVerifyScheduler:
+    def __init__(self, runtime: WebRuntime):
+        self.runtime = runtime
+        self._lock = threading.RLock()
+        self._wake = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._enabled = False
+        self._poll_interval_seconds = 3
+        self._batch_size = 12
+        self._max_attempts = 12
+        self._run_count = 0
+        self._last_run_at: float | None = None
+        self._next_run_at: float | None = None
+        self._last_error = ""
+        self._last_account_ids: list[str] = []
+        self._last_processed_count = 0
+
+    def start(self) -> dict[str, Any]:
+        with self._lock:
+            self._enabled = True
+            self._last_error = ""
+            self._next_run_at = time.time()
+            if self._thread is None or not self._thread.is_alive():
+                self._wake.clear()
+                self._thread = threading.Thread(target=self._loop, daemon=True)
+                self._thread.start()
+            else:
+                self._wake.set()
+            return self.status()
+
+    def stop(self) -> dict[str, Any]:
+        with self._lock:
+            self._enabled = False
+            self._next_run_at = None
+            self._wake.set()
+            return self.status()
+
+    def run_soon(self) -> None:
+        with self._lock:
+            if not self._enabled:
+                return
+            self._next_run_at = time.time()
+            self._wake.set()
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "enabled": self._enabled,
+                "poll_interval_seconds": self._poll_interval_seconds,
+                "batch_size": self._batch_size,
+                "max_attempts": self._max_attempts,
+                "run_count": self._run_count,
+                "last_run_at": self._last_run_at,
+                "next_run_at": self._next_run_at,
+                "last_error": self._last_error,
+                "last_account_ids": self._last_account_ids[-20:],
+                "last_processed_count": self._last_processed_count,
+            }
+
+    def _loop(self) -> None:
+        while True:
+            with self._lock:
+                if not self._enabled:
+                    return
+                next_run_at = self._next_run_at or time.time()
+                delay = max(0.0, next_run_at - time.time())
+            if self._wake.wait(delay):
+                self._wake.clear()
+                continue
+            self._run_once()
+            with self._lock:
+                if not self._enabled:
+                    return
+                self._next_run_at = time.time() + self._poll_interval_seconds
+
+    def _run_once(self) -> None:
+        with self._lock:
+            batch_size = self._batch_size
+            max_attempts = self._max_attempts
+        try:
+            accounts = list_due_subscription_verification_accounts_db(
+                limit=batch_size,
+                max_attempts=max_attempts,
+            )
+        except Exception as exc:
+            with self._lock:
+                self._last_error = str(exc)
+                self._last_run_at = time.time()
+                self._last_processed_count = 0
+            return
+        processed_ids: list[str] = []
+        last_error = ""
+        for account in accounts:
+            account_id = str(account.get("id") or "")
+            if not account_id:
+                continue
+            try:
+                self._process_account(account)
+                processed_ids.append(account_id)
+            except Exception as exc:
+                last_error = str(exc)
+        with self._lock:
+            self._run_count += 1
+            self._last_run_at = time.time()
+            self._last_error = last_error
+            self._last_account_ids = processed_ids
+            self._last_processed_count = len(processed_ids)
+
+    def _process_account(self, account: dict[str, Any]) -> None:
+        account_id = int(account.get("id") or 0)
+        if account_id <= 0:
+            return
+        current_attempts = max(0, int(account.get("subscription_verify_attempts") or 0))
+        next_attempt = current_attempts + 1
+        now = utc_now()
+        try:
+            refreshed = _refresh_account_subscription_type(
+                account_id,
+                self.runtime,
+                proxy=_next_proxy_for_runtime(self.runtime),
+            )
+            plan_type = str(refreshed.get("subscription_type") or NULL_VALUE).strip() or NULL_VALUE
+        except Exception as exc:
+            message = f"核实失败：{exc}"
+            next_check_at = _utc_after_seconds(_subscription_verify_delay_seconds(next_attempt))
+            update_subscription_verification_tracking_db(
+                account_id,
+                attempts=next_attempt,
+                last_checked_at=now,
+                next_check_at=next_check_at,
+                last_message=message,
+            )
+            return
+        if _is_paid_subscription_plan(plan_type):
+            verify_subscription_account_db(account_id)
+            update_subscription_verification_tracking_db(
+                account_id,
+                attempts=next_attempt,
+                last_checked_at=now,
+                next_check_at=NULL_VALUE,
+                last_message=f"已确认订阅 · {plan_type}",
+            )
+            record_audit_log(
+                None,
+                "auto_verify_subscription",
+                target_type="account",
+                target_id=str(account_id),
+                detail={
+                    "attempts": next_attempt,
+                    "plan_type": plan_type,
+                    "status": "verified",
+                },
+            )
+            return
+        message = f"当前订阅类型为 {plan_type}"
+        if next_attempt >= self._max_attempts:
+            update_subscription_verification_tracking_db(
+                account_id,
+                attempts=next_attempt,
+                last_checked_at=now,
+                next_check_at=NULL_VALUE,
+                last_message=f"自动核实已暂停：{message}",
+            )
+            record_audit_log(
+                None,
+                "auto_verify_subscription_stopped",
+                target_type="account",
+                target_id=str(account_id),
+                detail={
+                    "attempts": next_attempt,
+                    "plan_type": plan_type,
+                    "status": "stopped",
+                    "message": message,
+                },
+            )
+            return
+        next_check_at = _utc_after_seconds(_subscription_verify_delay_seconds(next_attempt))
+        update_subscription_verification_tracking_db(
+            account_id,
+            attempts=next_attempt,
+            last_checked_at=now,
+            next_check_at=next_check_at,
+            last_message=message,
+        )
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -650,6 +841,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         )
     manager = JobManager(runtime)
     auto_scheduler = AutoRegisterScheduler(manager)
+    subscription_verify_scheduler = SubscriptionVerifyScheduler(runtime)
 
     app = FastAPI(title="Protocol Reg 账号管理", version="0.1.0")
     app.state.bootstrap_admin = ensure_bootstrap_admin_user()
@@ -744,10 +936,12 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     @app.on_event("startup")
     def startup() -> None:
         init_accounts_db()
+        subscription_verify_scheduler.start()
 
     @app.on_event("shutdown")
     def shutdown() -> None:
         auto_scheduler.stop()
+        subscription_verify_scheduler.stop()
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page() -> str:
@@ -931,11 +1125,12 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     ) -> dict[str, Any]:
         user = _require_operator_permission(request, "view_subscription_accounts")
         operator_id = int(user["id"]) if str(user.get("role") or "").strip().lower() == AUTH_ROLE_OPERATOR else None
+        operator_labels = _operator_label_map()
         items = list_subscription_queue_db(page=page, page_size=page_size, operator_user_id=operator_id)
         rendered_items = []
         for item in items:
             expose_checkout = operator_id is None or str(item.get("subscription_operator_id") or "") == str(operator_id)
-            rendered_items.append(_subscription_queue_item(item, expose_checkout_url=expose_checkout))
+            rendered_items.append(_subscription_queue_item(item, expose_checkout_url=expose_checkout, operator_labels=operator_labels))
         return {
             "items": rendered_items,
             "stats": account_stats_db(),
@@ -951,7 +1146,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         record_audit_log(int(user["id"]), "claim_subscription", target_type="account", target_id=str(account_id), detail={"status": saved.get("subscription_status")}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
-        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True, operator_labels=_operator_label_map()), "stats": account_stats_db()}
 
     @app.post("/api/operator/subscriptions/{account_id}/mark-subscribed")
     def api_operator_mark_subscribed(account_id: int, payload: SubscriptionActionPayload, request: Request) -> dict[str, Any]:
@@ -962,8 +1157,72 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        record_audit_log(int(user["id"]), "mark_subscribed", target_type="account", target_id=str(account_id), detail={"note": payload.note}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
-        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+        plan_type = str(saved.get("subscription_type") or NULL_VALUE).strip() or NULL_VALUE
+        verification_message = ""
+        try:
+            saved, plan_type, verification_error = _try_auto_verify_subscription_account(
+                account_id,
+                runtime,
+                proxy=_next_proxy_for_runtime(runtime),
+            )
+            verification_message = verification_error or ""
+            if verification_error:
+                saved = update_subscription_verification_tracking_db(
+                    account_id,
+                    attempts=1,
+                    last_checked_at=_utc_after_seconds(0),
+                    next_check_at=_utc_after_seconds(_subscription_verify_delay_seconds(1)),
+                    last_message=verification_message,
+                )
+            else:
+                saved = update_subscription_verification_tracking_db(
+                    account_id,
+                    attempts=1,
+                    last_checked_at=_utc_after_seconds(0),
+                    next_check_at=NULL_VALUE,
+                    last_message=f"已确认订阅 · {plan_type}",
+                )
+        except Exception as exc:
+            verification_message = str(exc)
+            saved = get_account_db(account_id) or saved
+            saved = update_subscription_verification_tracking_db(
+                account_id,
+                attempts=1,
+                last_checked_at=_utc_after_seconds(0),
+                next_check_at=_utc_after_seconds(_subscription_verify_delay_seconds(1)),
+                last_message=f"核实失败：{verification_message}",
+            )
+        auto_verified = not bool(verification_message)
+        if not auto_verified:
+            subscription_verify_scheduler.run_soon()
+        detail = {"note": payload.note, "auto_verified": auto_verified, "plan_type": plan_type}
+        if verification_message:
+            detail["verification_message"] = verification_message
+        record_audit_log(int(user["id"]), "mark_subscribed", target_type="account", target_id=str(account_id), detail=detail, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        record_audit_log(
+            int(user["id"]),
+            "auto_verify_subscription",
+            target_type="account",
+            target_id=str(account_id),
+            detail={
+                "plan_type": plan_type,
+                "success": auto_verified,
+                "verification_message": verification_message if verification_message else NULL_VALUE,
+            },
+            ip=_request_ip(request),
+            user_agent=str(request.headers.get("user-agent") or ""),
+        )
+        return {
+            "item": _subscription_queue_item(saved, expose_checkout_url=True, operator_labels=_operator_label_map()),
+            "stats": account_stats_db(),
+            "marked": True,
+            "verified": auto_verified,
+            "auto_verified": auto_verified,
+            "verification_pending": not auto_verified,
+            "plan_type": plan_type,
+            "verification_error": verification_message,
+            "verification_message": verification_message,
+        }
 
     @app.post("/api/operator/subscriptions/{account_id}/mark-failed")
     def api_operator_mark_failed(account_id: int, payload: SubscriptionActionPayload, request: Request) -> dict[str, Any]:
@@ -975,7 +1234,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         record_audit_log(int(user["id"]), "mark_failed", target_type="account", target_id=str(account_id), detail={"note": payload.note}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
-        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True, operator_labels=_operator_label_map()), "stats": account_stats_db()}
 
     @app.post("/api/operator/subscriptions/{account_id}/release")
     def api_operator_release(account_id: int, request: Request) -> dict[str, Any]:
@@ -987,19 +1246,23 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         record_audit_log(int(user["id"]), "release_subscription", target_type="account", target_id=str(account_id), detail=None, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
-        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True, operator_labels=_operator_label_map()), "stats": account_stats_db()}
 
     @app.post("/api/admin/subscriptions/{account_id}/verify")
     def api_admin_verify_subscription(account_id: int, request: Request) -> dict[str, Any]:
         user = _require_admin_user(request)
         try:
-            saved = verify_subscription_account_db(account_id)
+            saved, plan_type = _refresh_and_verify_subscription_account(
+                account_id,
+                runtime,
+                proxy=_next_proxy_for_runtime(runtime),
+            )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        record_audit_log(int(user["id"]), "verify_subscription", target_type="account", target_id=str(account_id), detail=None, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
-        return {"item": _subscription_queue_item(saved, expose_checkout_url=True), "stats": account_stats_db()}
+        record_audit_log(int(user["id"]), "verify_subscription", target_type="account", target_id=str(account_id), detail={"plan_type": plan_type}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db(), "verified": True, "plan_type": plan_type}
 
     @app.get("/api/accounts")
     def api_accounts(
@@ -1007,10 +1270,12 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         status: str = Query("all"),
         plan: str = Query("all"),
         stock_status: str = Query("all"),
+        subscription_status: str = Query("all"),
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=500),
     ) -> dict[str, Any]:
-        total = count_account_rows(search=search, status=status, plan=plan, stock_status=stock_status)
+        operator_labels = _operator_label_map()
+        total = count_account_rows(search=search, status=status, plan=plan, stock_status=stock_status, subscription_status=subscription_status)
         total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
         effective_page = min(max(1, page), total_pages)
         rows = list_account_rows(
@@ -1018,11 +1283,12 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             status=status,
             plan=plan,
             stock_status=stock_status,
+            subscription_status=subscription_status,
             page=effective_page,
             page_size=page_size,
         )
         return {
-            "items": [_account_summary(row) for row in rows],
+            "items": [_account_summary(row, operator_labels) for row in rows],
             "stats": account_stats_db(),
             "pagination": {
                 "page": effective_page,
@@ -1035,12 +1301,13 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     @app.patch("/api/accounts/batch/stock-status")
     def api_batch_update_stock_status(payload: BatchStockStatusPayload) -> dict[str, Any]:
         ids = _unique_positive_ids(payload.ids)
+        operator_labels = _operator_label_map()
         results: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for account_id in ids:
             try:
                 saved = update_account_stock_status_db(account_id, payload.stock_status)
-                results.append(_account_summary(saved))
+                results.append(_account_summary(saved, operator_labels))
             except Exception as exc:
                 errors.append({"id": account_id, "error": str(exc)})
         return {"updated": len(results), "failed": errors, "items": results, "stats": account_stats_db()}
@@ -1049,6 +1316,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     def api_batch_refresh_subscription_type(payload: BatchIdsPayload) -> dict[str, Any]:
         ids = _unique_positive_ids(payload.ids)
         proxy_pool = _resolve_runtime_proxy_pool(runtime)
+        operator_labels = _operator_label_map()
         results: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
         for account_id in ids:
@@ -1058,7 +1326,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
                     runtime,
                     proxy=pick_proxy_from_pool(proxy_pool),
                 )
-                results.append(_account_summary(saved))
+                results.append(_account_summary(saved, operator_labels))
             except Exception as exc:
                 errors.append({"id": account_id, "error": str(exc)})
         return {"updated": len(results), "failed": errors, "items": results, "stats": account_stats_db()}
@@ -1103,12 +1371,29 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         }
         return Response(content=content, media_type="application/x-ndjson; charset=utf-8", headers=headers)
 
+    @app.post("/api/accounts/batch/export-airgate")
+    def api_batch_export_accounts_airgate(payload: BatchIdsPayload) -> Response:
+        ids = _unique_positive_ids(payload.ids)
+        accounts = list_account_rows_by_ids(ids)
+        if not accounts:
+            raise HTTPException(status_code=404, detail="没有找到可导出的账号")
+        content, exported_count, skipped = build_airgate_accounts_json(accounts)
+        if not content:
+            raise HTTPException(status_code=404, detail="所选账号没有可导出的 OpenAI 账号")
+        filename = f"airgate-accounts_selected_{time.strftime('%Y%m%d%H%M%S')}.json"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Exported-Count": str(exported_count),
+            "X-Skipped-Count": str(skipped),
+        }
+        return Response(content=content, media_type="application/json; charset=utf-8", headers=headers)
+
     @app.get("/api/accounts/{account_id}")
     def api_account_detail(account_id: int) -> dict[str, Any]:
         account = get_account_db(account_id)
         if account is None:
             raise HTTPException(status_code=404, detail="账号不存在")
-        return {"item": _account_detail(account)}
+        return {"item": _account_detail(account, _operator_label_map())}
 
     @app.post("/api/accounts")
     def api_create_account(payload: AccountPayload) -> dict[str, Any]:
@@ -1119,7 +1404,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="邮箱已存在，不能保存重复账号") from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"item": _account_detail(saved), "stats": account_stats_db()}
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db()}
 
     @app.put("/api/accounts/{account_id}")
     def api_update_account(account_id: int, payload: AccountPayload) -> dict[str, Any]:
@@ -1132,7 +1417,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"item": _account_detail(saved), "stats": account_stats_db()}
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db()}
 
     @app.patch("/api/accounts/{account_id}/stock-status")
     def api_update_stock_status(account_id: int, payload: StockStatusPayload) -> dict[str, Any]:
@@ -1142,7 +1427,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        return {"item": _account_detail(saved), "stats": account_stats_db()}
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db()}
 
     @app.patch("/api/accounts/{account_id}/subscription-type/refresh")
     def api_refresh_subscription_type(account_id: int) -> dict[str, Any]:
@@ -1158,12 +1443,12 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        return {"item": _account_detail(saved), "stats": account_stats_db()}
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db()}
 
     @app.patch("/api/accounts/{account_id}/subscription-type/mark-subscribed")
     def api_mark_account_subscribed(account_id: int) -> dict[str, Any]:
         try:
-            saved = _refresh_account_subscription_type(
+            saved, plan_type = _refresh_and_verify_subscription_account(
                 account_id,
                 runtime,
                 proxy=_next_proxy_for_runtime(runtime),
@@ -1174,9 +1459,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        plan_type = str(saved.get("subscription_type") or NULL_VALUE).strip() or NULL_VALUE
-        marked = plan_type.lower() == "plus"
-        return {"item": _account_detail(saved), "stats": account_stats_db(), "marked": marked, "plan_type": plan_type}
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db(), "marked": True, "verified": True, "plan_type": plan_type}
 
     @app.patch("/api/accounts/{account_id}/status/abandon")
     def api_mark_account_abandoned(account_id: int) -> dict[str, Any]:
@@ -1189,7 +1472,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
                 saved = update_account_stock_status_db(account_id, STOCK_STATUS_IN)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        return {"item": _account_detail(saved), "stats": account_stats_db(), "marked": True}
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db(), "marked": True}
 
     @app.delete("/api/accounts/{account_id}")
     def api_delete_account(account_id: int) -> dict[str, Any]:
@@ -1233,6 +1516,19 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             "X-Exported-Count": str(len([line for line in content.splitlines() if line.strip()])),
         }
         return Response(content=content, media_type="application/x-ndjson; charset=utf-8", headers=headers)
+
+    @app.post("/api/export/airgate")
+    def api_export_airgate() -> Response:
+        content, exported_count, skipped = build_airgate_accounts_json()
+        if not content:
+            raise HTTPException(status_code=404, detail="没有可导出的 OpenAI 账号")
+        filename = f"airgate-accounts_{time.strftime('%Y%m%d%H%M%S')}.json"
+        headers = {
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Exported-Count": str(exported_count),
+            "X-Skipped-Count": str(skipped),
+        }
+        return Response(content=content, media_type="application/json; charset=utf-8", headers=headers)
 
     @app.post("/api/ops/jobs")
     def api_start_job(payload: OperationPayload) -> dict[str, Any]:
@@ -1304,6 +1600,10 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     def api_auto_register_stop() -> dict[str, Any]:
         return {"auto": auto_scheduler.stop(), "queue": manager.stats()}
 
+    @app.get("/api/ops/subscription-verify")
+    def api_subscription_verify_status() -> dict[str, Any]:
+        return {"verification": subscription_verify_scheduler.status(), "stats": account_stats_db()}
+
     return app
 
 
@@ -1367,7 +1667,37 @@ def _public_web_user(user: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _subscription_queue_item(account: dict[str, Any], *, expose_checkout_url: bool = True) -> dict[str, Any]:
+def _operator_label_map() -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for user in list_web_users():
+        user_id = str(user.get("id") or "").strip()
+        if not user_id:
+            continue
+        display_name = str(user.get("display_name") or "").strip()
+        username = str(user.get("username") or "").strip()
+        labels[user_id] = display_name or username or f"#{user_id}"
+    return labels
+
+
+def _operator_label(operator_id: object, labels: dict[str, str] | None = None) -> str:
+    text = str(operator_id or "").strip()
+    if not text or text.lower() == NULL_VALUE:
+        return "未领取"
+    label_map = labels or {}
+    return label_map.get(text, f"#{text}")
+
+
+def _is_paid_subscription_plan(plan_type: object) -> bool:
+    normalized = str(plan_type or "").strip().lower()
+    return bool(normalized and normalized not in {"null", "none", "free"})
+
+
+def _subscription_queue_item(
+    account: dict[str, Any],
+    *,
+    expose_checkout_url: bool = True,
+    operator_labels: dict[str, str] | None = None,
+) -> dict[str, Any]:
     status = str(account.get("subscription_status") or SUBSCRIPTION_STATUS_PENDING)
     operator_id = str(account.get("subscription_operator_id") or "")
     checkout_url = str(account.get("checkout_url") or NULL_VALUE)
@@ -1380,10 +1710,15 @@ def _subscription_queue_item(account: dict[str, Any], *, expose_checkout_url: bo
         "checkout_url": checkout_url,
         "subscription_status": status,
         "subscription_operator_id": operator_id,
+        "subscription_operator_name": _operator_label(operator_id, operator_labels),
         "subscription_claimed_at": str(account.get("subscription_claimed_at") or NULL_VALUE),
         "subscription_claim_expires_at": str(account.get("subscription_claim_expires_at") or NULL_VALUE),
         "subscription_marked_at": str(account.get("subscription_marked_at") or NULL_VALUE),
         "subscription_verified_at": str(account.get("subscription_verified_at") or NULL_VALUE),
+        "subscription_verify_attempts": int(account.get("subscription_verify_attempts") or 0),
+        "subscription_verify_last_at": str(account.get("subscription_verify_last_at") or NULL_VALUE),
+        "subscription_verify_next_at": str(account.get("subscription_verify_next_at") or NULL_VALUE),
+        "subscription_verify_last_message": str(account.get("subscription_verify_last_message") or NULL_VALUE),
         "subscription_note": str(account.get("subscription_note") or NULL_VALUE),
         "stock_status": str(account.get("stock_status") or STOCK_STATUS_IN),
         "created_at": str(account.get("created_at") or NULL_VALUE),
@@ -1437,6 +1772,45 @@ def _refresh_account_subscription_type(
     return update_account_subscription_type_db(account_id, plan_type)
 
 
+def _refresh_and_verify_subscription_account(
+    account_id: int,
+    runtime: WebRuntime,
+    *,
+    proxy: str | None = None,
+) -> tuple[dict[str, str], str]:
+    refreshed = _refresh_account_subscription_type(account_id, runtime, proxy=proxy)
+    plan_type = str(refreshed.get("subscription_type") or NULL_VALUE).strip() or NULL_VALUE
+    if not _is_paid_subscription_plan(plan_type):
+        raise ValueError(f"核实未通过，当前订阅类型为 {plan_type}")
+    verified = verify_subscription_account_db(account_id)
+    return verified, plan_type
+
+
+def _try_auto_verify_subscription_account(
+    account_id: int,
+    runtime: WebRuntime,
+    *,
+    proxy: str | None = None,
+) -> tuple[dict[str, str], str, str | None]:
+    refreshed = _refresh_account_subscription_type(account_id, runtime, proxy=proxy)
+    plan_type = str(refreshed.get("subscription_type") or NULL_VALUE).strip() or NULL_VALUE
+    if not _is_paid_subscription_plan(plan_type):
+        return refreshed, plan_type, f"当前订阅类型为 {plan_type}"
+    verified = verify_subscription_account_db(account_id)
+    return verified, plan_type, None
+
+
+def _utc_after_seconds(seconds: int) -> str:
+    delay = max(0, int(seconds))
+    return (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+
+
+def _subscription_verify_delay_seconds(attempts: int) -> int:
+    attempt = max(1, int(attempts))
+    delay = 3 * (2 ** (attempt - 1))
+    return min(120, delay)
+
+
 def _has_value(value: object) -> bool:
     text = str(value or "").strip()
     return bool(text and text.lower() != NULL_VALUE)
@@ -1451,17 +1825,23 @@ def _secret_preview(value: object) -> str:
     return f"{text[:4]}…{text[-4:]} · {len(text)} 字符"
 
 
-def _account_summary(account: dict[str, str]) -> dict[str, Any]:
+def _account_summary(account: dict[str, str], operator_labels: dict[str, str] | None = None) -> dict[str, Any]:
+    operator_id = account.get("subscription_operator_id", NULL_VALUE)
     return {
         "id": int(account.get("id") or 0),
         "email": account.get("email", ""),
         "subscription_type": account.get("subscription_type", NULL_VALUE),
         "subscription_status": account.get("subscription_status", SUBSCRIPTION_STATUS_PENDING),
-        "subscription_operator_id": account.get("subscription_operator_id", NULL_VALUE),
+        "subscription_operator_id": operator_id,
+        "subscription_operator_name": _operator_label(operator_id, operator_labels),
         "subscription_claimed_at": account.get("subscription_claimed_at", NULL_VALUE),
         "subscription_claim_expires_at": account.get("subscription_claim_expires_at", NULL_VALUE),
         "subscription_marked_at": account.get("subscription_marked_at", NULL_VALUE),
         "subscription_verified_at": account.get("subscription_verified_at", NULL_VALUE),
+        "subscription_verify_attempts": int(account.get("subscription_verify_attempts") or 0),
+        "subscription_verify_last_at": account.get("subscription_verify_last_at", NULL_VALUE),
+        "subscription_verify_next_at": account.get("subscription_verify_next_at", NULL_VALUE),
+        "subscription_verify_last_message": account.get("subscription_verify_last_message", NULL_VALUE),
         "subscription_note": account.get("subscription_note", NULL_VALUE),
         "status": account.get("status", NULL_VALUE),
         "stock_status": account.get("stock_status", STOCK_STATUS_IN),
@@ -1482,8 +1862,8 @@ def _account_summary(account: dict[str, str]) -> dict[str, Any]:
     }
 
 
-def _account_detail(account: dict[str, str]) -> dict[str, Any]:
-    detail = _account_summary(account)
+def _account_detail(account: dict[str, str], operator_labels: dict[str, str] | None = None) -> dict[str, Any]:
+    detail = _account_summary(account, operator_labels)
     detail.update(
         {
             "password": account.get("password", NULL_VALUE),
@@ -1496,6 +1876,10 @@ def _account_detail(account: dict[str, str]) -> dict[str, Any]:
             "subscription_claim_expires_at": account.get("subscription_claim_expires_at", NULL_VALUE),
             "subscription_marked_at": account.get("subscription_marked_at", NULL_VALUE),
             "subscription_verified_at": account.get("subscription_verified_at", NULL_VALUE),
+            "subscription_verify_attempts": int(account.get("subscription_verify_attempts") or 0),
+            "subscription_verify_last_at": account.get("subscription_verify_last_at", NULL_VALUE),
+            "subscription_verify_next_at": account.get("subscription_verify_next_at", NULL_VALUE),
+            "subscription_verify_last_message": account.get("subscription_verify_last_message", NULL_VALUE),
             "subscription_note": account.get("subscription_note", NULL_VALUE),
             "login_session_json": account.get("login_session", NULL_VALUE),
             "auth_token_json": account.get("auth_token", NULL_VALUE),
@@ -2092,7 +2476,7 @@ HTML_PAGE = r"""
       font-family: var(--display);
       font-size: 24px;
       line-height: 1;
-      letter-spacing: -.03em;
+      letter-spacing: 0;
     }
 
     .eyebrow {
@@ -2116,9 +2500,10 @@ HTML_PAGE = r"""
     .top-actions {
       display: flex;
       align-items: center;
-      justify-content: flex-end;
-      gap: 12px;
+      justify-content: space-between;
+      gap: 16px;
       flex-wrap: wrap;
+      flex: 1 1 auto;
       position: relative;
       z-index: 1;
     }
@@ -2130,9 +2515,18 @@ HTML_PAGE = r"""
       align-items: center;
     }
 
+    .nav-main {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
     .page-nav {
       min-height: 42px;
       padding-inline: 16px;
+      border-radius: 12px;
     }
 
     .page-nav.is-active {
@@ -2164,10 +2558,11 @@ HTML_PAGE = r"""
     }
 
     .stat-value {
-      font-family: var(--display);
+      font-family: var(--mono);
       font-size: 22px;
       line-height: 1;
-      letter-spacing: -.04em;
+      letter-spacing: 0;
+      font-variant-numeric: tabular-nums;
     }
 
     .workspace {
@@ -2407,7 +2802,7 @@ HTML_PAGE = r"""
     .confirm-title {
       font-family: var(--display);
       font-size: 22px;
-      letter-spacing: -.03em;
+      letter-spacing: 0;
       line-height: 1.2;
     }
     .confirm-message {
@@ -2425,7 +2820,7 @@ HTML_PAGE = r"""
     }
 
     .modal {
-      width: min(560px, 100%);
+      width: min(680px, 100%);
       max-height: calc(100vh - 48px);
       background: var(--paper);
       border: 1px solid var(--line);
@@ -2480,6 +2875,7 @@ HTML_PAGE = r"""
     }
 
     textarea { resize: vertical; min-height: 140px; font-family: var(--mono); font-size: 12px; line-height: 1.6; }
+    #subscriptionNote { min-height: 72px; }
 
     input:focus, select:focus, textarea:focus {
       border-color: rgba(216, 97, 44, .72);
@@ -2751,7 +3147,7 @@ HTML_PAGE = r"""
     .editor-title {
       font-family: var(--display);
       font-size: 28px;
-      letter-spacing: -.04em;
+      letter-spacing: 0;
     }
 
     .header-actions {
@@ -3021,7 +3417,7 @@ HTML_PAGE = r"""
       font-family: var(--display);
       font-size: 20px;
       line-height: 1;
-      letter-spacing: -.04em;
+      letter-spacing: 0;
     }
 
     .auto-controls {
@@ -3154,8 +3550,10 @@ HTML_PAGE = r"""
 
     @media (max-width: 760px) {
       .shell { width: min(100vw - 20px, 1440px); padding-top: 10px; }
-      .topbar { flex-wrap: wrap; }
+      .topbar { align-items: stretch; }
       .stats { justify-content: flex-start; }
+      .top-actions { justify-content: flex-start; }
+      .nav-main { justify-content: flex-start; width: 100%; }
       .grid-2 { grid-template-columns: 1fr; }
       .ops-row { grid-template-columns: 1fr; }
       .auto-controls { grid-template-columns: 1fr; }
@@ -3180,24 +3578,29 @@ HTML_PAGE = r"""
         <div class="brand-mark" id="brandMark">账号库控制台</div>
       </div>
       <div class="top-actions">
-        <div class="stats" id="stats"></div>
         <nav class="page-links" aria-label="页面导航">
           <a class="button-link ghost page-nav" id="accountsNavLink" href="/">账号管理</a>
           <a class="button-link ghost page-nav" id="tasksNavLink" href="/tasks">任务页面</a>
           <a class="button-link ghost page-nav" id="settingsNavLink" href="/settings">设置</a>
+          <a class="button-link ghost page-nav" id="operatorNavLink" href="/operator">订阅处理</a>
           <a class="button-link ghost page-nav" id="adminUsersNavLink" href="/admin/users">用户管理</a>
         </nav>
-        <span class="tab-badge" id="currentUserBadge">未登录</span>
-        <button class="ghost" type="button" id="logoutBtn">退出</button>
+        <div class="nav-main">
+          <span class="tab-badge" id="currentUserBadge">未登录</span>
+          <button class="ghost" type="button" id="logoutBtn">退出</button>
+        </div>
       </div>
     </header>
+
+    <div class="stats" id="stats"></div>
 
     <section class="workspace">
       <div class="panel">
         <div class="toolbar">
-          <input id="search" placeholder="搜索邮箱 / 类型 / 出库状态" autocomplete="off" />
+          <input id="search" placeholder="搜索邮箱 / 类型 / 订阅 / 出库状态" autocomplete="off" />
           <select id="planFilter"><option value="all">全部类型</option></select>
           <select id="statusFilter"><option value="all">全部状态</option></select>
+          <select id="subscriptionFilter"><option value="all">全部订阅</option></select>
           <select id="stockFilter"><option value="all">全部库存</option></select>
           <select id="pageSizeSelect" title="每页条数">
             <option value="20">20 / 页</option>
@@ -3209,6 +3612,7 @@ HTML_PAGE = r"""
           <button class="ghost" id="exportBtn">导出 TXT</button>
           <button class="ghost" id="exportTokensBtn">导出 Token</button>
           <button class="ghost" id="exportCheckoutsBtn">导出 Checkout</button>
+          <button class="secondary" id="exportAirgateBtn">导出 AirGate JSON</button>
           <a class="button-link secondary" id="runBtn" href="/tasks">任务页面</a>
         </div>
         <div class="batchbar" id="batchBar">
@@ -3218,6 +3622,7 @@ HTML_PAGE = r"""
           <button class="ghost" type="button" id="batchStockInBtn">恢复未出库</button>
           <button class="secondary" type="button" id="batchRefreshPlanBtn">自动获取类型</button>
           <button class="secondary" type="button" id="batchExportJsonlBtn">导出 Session JSONL</button>
+          <button class="secondary" type="button" id="batchExportAirgateBtn">导出 AirGate JSON</button>
           <button class="danger" type="button" id="batchDeleteBtn">批量删除</button>
           <button class="ghost" type="button" id="batchClearBtn">清空选择</button>
         </div>
@@ -3263,6 +3668,46 @@ HTML_PAGE = r"""
               <input id="stockStatus" class="copy-on-click" readonly placeholder="未出库 / 出库" />
             </div>
           </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>订阅状态</label>
+              <input id="subscriptionStatus" class="copy-on-click" readonly placeholder="待订阅 / 处理中 / 已点击订阅 / 已确认订阅" />
+            </div>
+            <div class="field">
+              <label>领取人</label>
+              <input id="subscriptionOperator" class="copy-on-click" readonly placeholder="未领取" />
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>领取时间</label>
+              <input id="subscriptionClaimedAt" class="copy-on-click" readonly placeholder="无记录" />
+            </div>
+            <div class="field">
+              <label>点击时间</label>
+              <input id="subscriptionMarkedAt" class="copy-on-click" readonly placeholder="无记录" />
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>确认时间</label>
+              <input id="subscriptionVerifiedAt" class="copy-on-click" readonly placeholder="无记录" />
+            </div>
+            <div class="field">
+              <label>备注</label>
+              <textarea id="subscriptionNote" readonly spellcheck="false" placeholder="无备注"></textarea>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label>自动核实进度</label>
+              <input id="subscriptionVerifyProgress" class="copy-on-click" readonly placeholder="自动核实中 / 已确认 / 已暂停" />
+            </div>
+            <div class="field">
+              <label>下次核实</label>
+              <input id="subscriptionVerifyNextAt" class="copy-on-click" readonly placeholder="无待执行" />
+            </div>
+          </div>
           <div class="field">
             <label>状态</label>
             <input id="status" class="copy-on-click" readonly placeholder="active" />
@@ -3288,7 +3733,7 @@ HTML_PAGE = r"""
           </div>
           <div class="button-row">
             <button class="accent" type="button" id="stockToggleBtn">标记出库</button>
-            <button class="secondary" type="button" id="markSubscribedBtn">标记已订阅</button>
+            <button class="secondary" type="button" id="markSubscribedBtn">系统核实订阅</button>
             <button class="ghost" type="button" id="abandonBtn">标记废弃</button>
             <button class="ghost" type="button" id="copyLineBtn">复制账号行</button>
             <button class="danger" type="button" id="deleteBtn">删除</button>
@@ -3393,6 +3838,7 @@ HTML_PAGE = r"""
       totalPages: 1,
       total: 0,
     };
+    let accountsTimer = null;
     const STOCK_IN = '未出库';
     const STOCK_OUT = '出库';
     const STATUS_ABANDONED = '废弃';
@@ -3413,13 +3859,13 @@ HTML_PAGE = r"""
         },
         tasks: {
           title: '任务控制台',
-          brand: '任务控制台',
+          brand: '账号库控制台',
           opsTitle: '执行任务',
           opsHint: '手动投放注册、登录与授权',
         },
         settings: {
           title: '设置',
-          brand: '设置中心',
+          brand: '账号库控制台',
           opsTitle: '自动注册设置',
           opsHint: '保存配置并启停自动注册',
         },
@@ -3428,6 +3874,7 @@ HTML_PAGE = r"""
         ['accountsNavLink', '/'],
         ['tasksNavLink', '/tasks'],
         ['settingsNavLink', '/settings'],
+        ['operatorNavLink', '/operator'],
         ['adminUsersNavLink', '/admin/users'],
       ];
       const resolved = titles[pageMode] || titles.accounts;
@@ -3491,15 +3938,18 @@ HTML_PAGE = r"""
     }
 
     function renderStats(stats) {
-      const plans = stats.plans || {};
-      const topPlan = Object.entries(plans).sort((a, b) => b[1] - a[1])[0];
       const stock = stats.stock_statuses || {};
+      const subscription = stats.subscription_statuses || {};
+      const operatorStats = Array.isArray(stats.operator_stats) ? stats.operator_stats : [];
       const cards = [
         ['账号总数', stats.total ?? 0],
+        ['待订阅', subscription['待订阅'] ?? 0],
+        ['处理中', subscription['处理中'] ?? 0],
+        ['待核实', subscription['已点击订阅'] ?? 0],
+        ['已确认', subscription['已确认订阅'] ?? 0],
+        ['活跃操作员', operatorStats.length],
         ['未出库', stock[STOCK_IN] ?? 0],
         ['已出库', stock[STOCK_OUT] ?? 0],
-        ['有 Checkout', stats.with_checkout ?? 0],
-        ['有 RT', stats.with_rt ?? 0],
       ];
       $('stats').innerHTML = cards.map(([label, value]) => `
         <div class="stat-card">
@@ -3512,15 +3962,19 @@ HTML_PAGE = r"""
     function renderFilters(stats) {
       const currentPlan = $('planFilter').value || 'all';
       const currentStatus = $('statusFilter').value || 'all';
+      const currentSubscription = $('subscriptionFilter').value || 'all';
       const currentStock = $('stockFilter').value || 'all';
       const planOptions = ['all', ...Object.keys(stats.plans || {}).filter(hasValue)];
       const statusOptions = ['all', ...Object.keys(stats.statuses || {}).filter(hasValue)];
+      const subscriptionOptions = ['all', ...Object.keys(stats.subscription_statuses || {}).filter(hasValue)];
       const stockOptions = Array.from(new Set(['all', STOCK_IN, STOCK_OUT, ...Object.keys(stats.stock_statuses || {}).filter(hasValue)]));
       $('planFilter').innerHTML = planOptions.map((value) => `<option value="${escapeHtml(value)}">${value === 'all' ? '全部类型' : escapeHtml(value)}</option>`).join('');
       $('statusFilter').innerHTML = statusOptions.map((value) => `<option value="${escapeHtml(value)}">${value === 'all' ? '全部状态' : escapeHtml(value)}</option>`).join('');
+      $('subscriptionFilter').innerHTML = subscriptionOptions.map((value) => `<option value="${escapeHtml(value)}">${value === 'all' ? '全部订阅' : escapeHtml(value)}</option>`).join('');
       $('stockFilter').innerHTML = stockOptions.map((value) => `<option value="${escapeHtml(value)}">${value === 'all' ? '全部库存' : escapeHtml(value)}</option>`).join('');
       $('planFilter').value = planOptions.includes(currentPlan) ? currentPlan : 'all';
       $('statusFilter').value = statusOptions.includes(currentStatus) ? currentStatus : 'all';
+      $('subscriptionFilter').value = subscriptionOptions.includes(currentSubscription) ? currentSubscription : 'all';
       $('stockFilter').value = stockOptions.includes(currentStock) ? currentStock : 'all';
     }
 
@@ -3538,6 +3992,9 @@ HTML_PAGE = r"""
         const checkoutClass = item.has_checkout_url ? 'good' : 'warn';
         const stockStatus = item.stock_status || STOCK_IN;
         const accountStatus = item.status || 'active';
+        const subscriptionStatus = item.subscription_status || '待订阅';
+        const subscriptionClass = subscriptionStatus === '已确认订阅' ? 'good' : (subscriptionStatus === '订阅失败' ? 'bad' : 'warn');
+        const operatorLabel = item.subscription_operator_name || (hasValue(item.subscription_operator_id) ? `#${item.subscription_operator_id}` : '未领取');
         const stockClass = stockStatus === STOCK_OUT ? 'bad' : 'good';
         const stockButtonText = accountStatus === STATUS_ABANDONED
           ? (stockStatus === STOCK_OUT ? '恢复未出库' : '废弃')
@@ -3554,6 +4011,8 @@ HTML_PAGE = r"""
               </div>
             </div>
             <div class="meta">
+              <span class="pill ${subscriptionClass}">订阅 · ${escapeHtml(subscriptionStatus)}</span>
+              <span class="pill">领取人 · ${escapeHtml(operatorLabel)}</span>
               <span class="pill">${escapeHtml(item.subscription_type || 'null')}</span>
               <span class="pill">${escapeHtml(item.status || 'null')}</span>
               <span class="pill ${stockClass}">库存 · ${escapeHtml(stockStatus)}</span>
@@ -3605,7 +4064,7 @@ HTML_PAGE = r"""
       $('batchCount').textContent = `已选择 ${ids.length} 个`;
       $('selectAllVisible').checked = allVisibleSelected;
       $('selectAllVisible').indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < state.items.length;
-      for (const id of ['batchStockOutBtn', 'batchStockInBtn', 'batchRefreshPlanBtn', 'batchExportJsonlBtn', 'batchDeleteBtn', 'batchClearBtn']) {
+      for (const id of ['batchStockOutBtn', 'batchStockInBtn', 'batchRefreshPlanBtn', 'batchExportJsonlBtn', 'batchExportAirgateBtn', 'batchDeleteBtn', 'batchClearBtn']) {
         $(id).disabled = ids.length === 0;
       }
     }
@@ -3629,6 +4088,7 @@ HTML_PAGE = r"""
         search: $('search').value.trim(),
         plan: $('planFilter').value || 'all',
         status: $('statusFilter').value || 'all',
+        subscription_status: $('subscriptionFilter').value || 'all',
         stock_status: $('stockFilter').value || 'all',
         page: String(state.page),
         page_size: String(state.pageSize),
@@ -3652,6 +4112,22 @@ HTML_PAGE = r"""
           selectAccount(accountId).catch((err) => toast(err.message));
         }
       }
+    }
+
+    function startAccountsPolling() {
+      if (accountsTimer) return;
+      accountsTimer = setInterval(() => {
+        if (!document.hidden) {
+          loadAccounts()
+            .then(() => {
+              if (state.selectedId !== null) {
+                return selectAccount(Number(state.selectedId)).catch(() => {});
+              }
+              return null;
+            })
+            .catch(() => {});
+        }
+      }, 20000);
     }
 
     function renderPagination() {
@@ -3697,6 +4173,14 @@ HTML_PAGE = r"""
       $('password').value = item.password === 'null' ? '' : item.password || '';
       $('subscriptionType').value = item.subscription_type === 'null' ? '' : item.subscription_type || '';
       $('stockStatus').value = item.stock_status || STOCK_IN;
+      $('subscriptionStatus').value = item.subscription_status || '待订阅';
+      $('subscriptionOperator').value = item.subscription_operator_name || (item.subscription_operator_id ? `#${item.subscription_operator_id}` : '未领取');
+      $('subscriptionClaimedAt').value = fmtDate(item.subscription_claimed_at);
+      $('subscriptionMarkedAt').value = fmtDate(item.subscription_marked_at);
+      $('subscriptionVerifiedAt').value = fmtDate(item.subscription_verified_at);
+      $('subscriptionNote').value = item.subscription_note === 'null' ? '' : item.subscription_note || '';
+      $('subscriptionVerifyProgress').value = subscriptionVerifyProgress(item);
+      $('subscriptionVerifyNextAt').value = subscriptionVerifyNextLabel(item);
       $('refreshToken').value = item.refresh_token === 'null' ? '' : item.refresh_token || '';
       $('checkoutUrl').value = item.checkout_url === 'null' ? '' : item.checkout_url || '';
       $('status').value = item.status === 'null' ? 'active' : item.status || 'active';
@@ -3704,12 +4188,12 @@ HTML_PAGE = r"""
       $('opEmail').value = item.email || '';
       $('opPassword').value = item.password === 'null' ? '' : item.password || '';
       $('editorTitle').textContent = item.email || '编辑账号';
-      $('editorHint').textContent = `创建 ${fmtDate(item.created_at)} · 更新 ${fmtDate(item.updated_at)}`;
+      $('editorHint').textContent = accountEditorHint(item);
       updateStockButton(item.stock_status || STOCK_IN, item.id, item.status);
       updateCheckoutButton(item.id);
       updateSessionButton(item.id);
       updatePlanButton(item.id);
-      updateMarkSubscribedButton(item.id);
+      updateMarkSubscribedButton(item.id, '系统核实订阅', item.subscription_status);
       updateAbandonButton(item.id, item.subscription_type, item.status);
       renderList(state.items);
     }
@@ -3718,6 +4202,50 @@ HTML_PAGE = r"""
       if (!hasValue(value)) return '';
       try { return JSON.stringify(JSON.parse(value), null, 2); }
       catch { return value; }
+    }
+
+    function subscriptionVerifyProgress(item) {
+      const status = item.subscription_status || '待订阅';
+      const attempts = Number(item.subscription_verify_attempts || 0);
+      const lastMessage = hasValue(item.subscription_verify_last_message) ? item.subscription_verify_last_message : '';
+      const readableMessage = lastMessage.startsWith('当前订阅类型为 ')
+        ? `当前仍为 ${lastMessage.replace('当前订阅类型为 ', '')}`
+        : lastMessage;
+      if (status === '已点击订阅') {
+        const parts = ['自动核实中'];
+        if (attempts > 0) parts.push(`第 ${attempts} 次`);
+        if (readableMessage) parts.push(readableMessage);
+        return parts.join(' · ');
+      }
+      if (status === '已确认订阅') {
+        return readableMessage || '已确认';
+      }
+      if (status === '订阅失败') {
+        return readableMessage ? `已暂停 · ${readableMessage}` : '已暂停';
+      }
+      if (attempts > 0 || readableMessage) {
+        const parts = [];
+        if (attempts > 0) parts.push(`核实 ${attempts} 次`);
+        if (readableMessage) parts.push(readableMessage);
+        return parts.join(' · ');
+      }
+      return '无自动核实记录';
+    }
+
+    function subscriptionVerifyNextLabel(item) {
+      const value = item.subscription_verify_next_at;
+      return hasValue(value) ? fmtDate(value) : '无待执行';
+    }
+
+    function accountEditorHint(item) {
+      const operator = item.subscription_operator_name || (item.subscription_operator_id ? `#${item.subscription_operator_id}` : '未领取');
+      return [
+        `创建 ${fmtDate(item.created_at)}`,
+        `更新 ${fmtDate(item.updated_at)}`,
+        `订阅 ${item.subscription_status || '待订阅'}`,
+        subscriptionVerifyProgress(item),
+        `领取人 ${operator}`,
+      ].join(' · ');
     }
 
     function formPayload() {
@@ -3759,10 +4287,13 @@ HTML_PAGE = r"""
       $('refreshPlanBtn').disabled = !id;
     }
 
-    function updateMarkSubscribedButton(id = $('accountId').value, label = '标记已订阅') {
+    function updateMarkSubscribedButton(id = $('accountId').value, label = '系统核实订阅', subscriptionStatus = $('subscriptionStatus').value) {
       const button = $('markSubscribedBtn');
-      button.disabled = !id;
+      const status = String(subscriptionStatus || '').trim();
+      const allowed = status === '已点击订阅' || status === '已确认订阅';
+      button.disabled = !id || !allowed;
       button.textContent = label;
+      button.title = allowed ? '' : '仅在已点击订阅后可核实';
     }
 
     function updateAbandonButton(id = $('accountId').value, subscriptionType = $('subscriptionType').value, status = $('status').value) {
@@ -3781,6 +4312,14 @@ HTML_PAGE = r"""
       $('accountId').value = '';
       $('status').value = 'active';
       $('stockStatus').value = STOCK_IN;
+      $('subscriptionStatus').value = '待订阅';
+      $('subscriptionOperator').value = '未领取';
+      $('subscriptionClaimedAt').value = '';
+      $('subscriptionMarkedAt').value = '';
+      $('subscriptionVerifiedAt').value = '';
+      $('subscriptionNote').value = '';
+      $('subscriptionVerifyProgress').value = '';
+      $('subscriptionVerifyNextAt').value = '';
       $('checkoutUrl').value = '';
       $('opEmail').value = '';
       $('opPassword').value = '';
@@ -3790,7 +4329,7 @@ HTML_PAGE = r"""
       updateCheckoutButton('');
       updateSessionButton('');
       updatePlanButton('');
-      updateMarkSubscribedButton('');
+      updateMarkSubscribedButton('', '系统核实订阅', '待订阅');
       updateAbandonButton('', '', 'active');
       renderList(state.items);
     }
@@ -3818,7 +4357,9 @@ HTML_PAGE = r"""
       if (selectedId === Number(accountId)) {
         const item = data.item;
         $('stockStatus').value = item.stock_status || STOCK_IN;
-        $('editorHint').textContent = `创建 ${fmtDate(item.created_at)} · 更新 ${fmtDate(item.updated_at)}`;
+        $('subscriptionVerifyProgress').value = subscriptionVerifyProgress(item);
+        $('subscriptionVerifyNextAt').value = subscriptionVerifyNextLabel(item);
+        $('editorHint').textContent = accountEditorHint(item);
         updateStockButton(item.stock_status || STOCK_IN, item.id, item.status);
       }
     }
@@ -3833,7 +4374,9 @@ HTML_PAGE = r"""
         const data = await request(`/api/accounts/${accountId}/subscription-type/refresh`, { method: 'PATCH' });
         const item = data.item;
         $('subscriptionType').value = item.subscription_type === 'null' ? '' : item.subscription_type || '';
-        $('editorHint').textContent = `创建 ${fmtDate(item.created_at)} · 更新 ${fmtDate(item.updated_at)}`;
+        $('subscriptionVerifyProgress').value = subscriptionVerifyProgress(item);
+        $('subscriptionVerifyNextAt').value = subscriptionVerifyNextLabel(item);
+        $('editorHint').textContent = accountEditorHint(item);
         updateAbandonButton(item.id, item.subscription_type, item.status);
         toast(`订阅类型已更新为 ${item.subscription_type || 'null'}`);
         await loadAccounts();
@@ -3850,20 +4393,28 @@ HTML_PAGE = r"""
       if (!accountId) return toast('请先选择账号');
       const button = $('markSubscribedBtn');
       button.disabled = true;
-      button.textContent = '确认中...';
+      button.textContent = '核实中...';
       try {
-        const data = await request(`/api/accounts/${accountId}/subscription-type/mark-subscribed`, { method: 'PATCH' });
+        const data = await request(`/api/admin/subscriptions/${accountId}/verify`, { method: 'POST' });
         const item = data.item;
         $('subscriptionType').value = item.subscription_type === 'null' ? '' : item.subscription_type || '';
-        $('editorHint').textContent = `创建 ${fmtDate(item.created_at)} · 更新 ${fmtDate(item.updated_at)}`;
+        $('subscriptionStatus').value = item.subscription_status || '已确认订阅';
+        $('subscriptionOperator').value = item.subscription_operator_name || (item.subscription_operator_id ? `#${item.subscription_operator_id}` : '未领取');
+        $('subscriptionClaimedAt').value = fmtDate(item.subscription_claimed_at);
+        $('subscriptionMarkedAt').value = fmtDate(item.subscription_marked_at);
+        $('subscriptionVerifiedAt').value = fmtDate(item.subscription_verified_at);
+        $('subscriptionNote').value = item.subscription_note === 'null' ? '' : item.subscription_note || '';
+        $('subscriptionVerifyProgress').value = subscriptionVerifyProgress(item);
+        $('subscriptionVerifyNextAt').value = subscriptionVerifyNextLabel(item);
+        $('editorHint').textContent = accountEditorHint(item);
         updateAbandonButton(item.id, item.subscription_type, item.status);
         await loadAccounts();
         state.selectedId = item.id;
         renderList(state.items);
-        if (data.marked) toast('已确认 Plus，标记成功');
-        else toast(`刷新后仍是 ${data.plan_type || 'null'}，标记失败`);
+        if (data.verified) toast(`已核实为 ${data.plan_type || '已确认订阅'}`);
+        else toast(`刷新后仍是 ${data.plan_type || 'null'}`);
       } finally {
-        updateMarkSubscribedButton();
+        updateMarkSubscribedButton(undefined, '系统核实订阅', $('subscriptionStatus').value);
       }
     }
 
@@ -3882,7 +4433,9 @@ HTML_PAGE = r"""
         const item = data.item;
         $('status').value = item.status === 'null' ? 'active' : item.status || 'active';
         $('stockStatus').value = item.stock_status || STOCK_IN;
-        $('editorHint').textContent = `创建 ${fmtDate(item.created_at)} · 更新 ${fmtDate(item.updated_at)}`;
+        $('subscriptionVerifyProgress').value = subscriptionVerifyProgress(item);
+        $('subscriptionVerifyNextAt').value = subscriptionVerifyNextLabel(item);
+        $('editorHint').textContent = accountEditorHint(item);
         updateStockButton(item.stock_status || STOCK_IN, item.id, item.status);
         updateAbandonButton(item.id, item.subscription_type, item.status);
         toast('已标记废弃');
@@ -3975,6 +4528,35 @@ HTML_PAGE = r"""
         : `已导出 ${exported} 个 session`);
     }
 
+    async function batchExportAirgateJson() {
+      const ids = selectedIds();
+      if (!ids.length) return toast('请先选择账号');
+      const response = await fetch('/api/accounts/batch/export-airgate', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ids }),
+      });
+      if (response.status === 401) {
+        window.location.href = '/login';
+        throw new Error('未登录或会话已过期');
+      }
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.detail || '导出失败');
+      }
+      const blob = await response.blob();
+      const filename = filenameFromDisposition(
+        response.headers.get('content-disposition'),
+        `airgate-accounts_selected_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.json`,
+      );
+      downloadBlob(blob, filename);
+      const exported = Number(response.headers.get('x-exported-count') || ids.length) || ids.length;
+      const skipped = Number(response.headers.get('x-skipped-count') || 0) || 0;
+      toast(skipped > 0
+        ? `已导出 ${exported} 个 AirGate 账号，跳过 ${skipped} 个无效账号`
+        : `已导出 ${exported} 个 AirGate 账号`);
+    }
+
     async function exportDownload(endpoint, fallbackFilename, successLabel) {
       const response = await fetch(endpoint, { method: 'POST' });
       if (response.status === 401) {
@@ -4016,6 +4598,14 @@ HTML_PAGE = r"""
         '/api/export/checkouts',
         `checkout_urls_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.jsonl`,
         'checkout',
+      );
+    }
+
+    async function exportAirgateJson() {
+      return exportDownload(
+        '/api/export/airgate',
+        `airgate-accounts_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.json`,
+        'AirGate 账号',
       );
     }
 
@@ -4447,6 +5037,7 @@ HTML_PAGE = r"""
     });
     $('planFilter').addEventListener('change', reloadFromFirstPage);
     $('statusFilter').addEventListener('change', reloadFromFirstPage);
+    $('subscriptionFilter').addEventListener('change', reloadFromFirstPage);
     $('stockFilter').addEventListener('change', reloadFromFirstPage);
     $('pageSizeSelect').addEventListener('change', () => {
       state.pageSize = Number($('pageSizeSelect').value) || 50;
@@ -4501,6 +5092,7 @@ HTML_PAGE = r"""
     $('batchStockInBtn').addEventListener('click', () => batchUpdateStockStatus(STOCK_IN).catch((err) => toast(err.message)));
     $('batchRefreshPlanBtn').addEventListener('click', () => batchRefreshSubscriptionTypes().catch((err) => toast(err.message)));
     $('batchExportJsonlBtn').addEventListener('click', () => batchExportSessionJsonl().catch((err) => toast(err.message)));
+    $('batchExportAirgateBtn').addEventListener('click', () => batchExportAirgateJson().catch((err) => toast(err.message)));
     $('batchDeleteBtn').addEventListener('click', () => batchDeleteAccounts().catch((err) => toast(err.message)));
     $('batchClearBtn').addEventListener('click', clearSelection);
     $('copyLineBtn').addEventListener('click', () => copyText(compactLine(), '账号行已复制'));
@@ -4518,6 +5110,7 @@ HTML_PAGE = r"""
     $('exportBtn').addEventListener('click', () => exportAccountsTxt().catch((err) => toast(err.message)));
     $('exportTokensBtn').addEventListener('click', () => exportTokensJsonl().catch((err) => toast(err.message)));
     $('exportCheckoutsBtn').addEventListener('click', () => exportCheckoutsJsonl().catch((err) => toast(err.message)));
+    $('exportAirgateBtn').addEventListener('click', () => exportAirgateJson().catch((err) => toast(err.message)));
     $('logoutBtn').addEventListener('click', async () => {
       try {
         await request('/api/auth/logout', { method: 'POST' });
@@ -4605,6 +5198,7 @@ HTML_PAGE = r"""
       } else {
         resetForm();
         await loadAccounts();
+        startAccountsPolling();
       }
     }
     initApp().catch((err) => toast(err.message));
@@ -4620,7 +5214,7 @@ LOGIN_PAGE = r"""
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Protocol Reg 登录</title>
+  <title>Protocol Reg 登录平台</title>
   <style>
     :root {
       --ink: #11100d;
@@ -4712,7 +5306,7 @@ LOGIN_PAGE = r"""
 <body>
   <main class="login">
     <div class="eyebrow">Protocol Reg</div>
-    <h1>管理员登录</h1>
+    <h1>平台登录</h1>
     <form id="loginForm">
       <label for="username">用户名</label>
       <input id="username" autocomplete="username" value="admin" />
@@ -4767,6 +5361,7 @@ ADMIN_USERS_PAGE = r"""
     :root {
       --ink: #11100d;
       --paper: #f5efe2;
+      --paper-2: #ebe1cf;
       --line: rgba(17, 16, 13, .16);
       --muted: #6f6659;
       --accent: #d8612c;
@@ -4775,6 +5370,7 @@ ADMIN_USERS_PAGE = r"""
       --bad: #a33b2f;
       --shadow: 0 24px 80px rgba(48, 39, 25, .16);
       --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+      --display: "Fraunces", "Iowan Old Style", Georgia, serif;
       --body: "Aptos", "Gill Sans", "Trebuchet MS", sans-serif;
     }
     * { box-sizing: border-box; }
@@ -4783,9 +5379,25 @@ ADMIN_USERS_PAGE = r"""
       min-height: 100vh;
       color: var(--ink);
       font-family: var(--body);
-      background: linear-gradient(135deg, #f8f0df 0%, #efe4d2 52%, #e3d3bd 100%);
+      background:
+        radial-gradient(circle at 20% 10%, rgba(216, 97, 44, .22), transparent 30%),
+        radial-gradient(circle at 95% 0%, rgba(15, 107, 95, .18), transparent 28%),
+        linear-gradient(135deg, #f8f0df 0%, #efe4d2 52%, #e3d3bd 100%);
+      overflow-x: hidden;
     }
-    .shell { width: min(1200px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 36px; }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .35;
+      background-image:
+        linear-gradient(rgba(17,16,13,.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(17,16,13,.045) 1px, transparent 1px);
+      background-size: 26px 26px;
+      mask-image: linear-gradient(to bottom, black, transparent 85%);
+    }
+    .shell { width: min(1440px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 36px; position: relative; }
     .topbar, .panel {
       border: 1px solid var(--line);
       background: rgba(245, 239, 226, .78);
@@ -4797,22 +5409,97 @@ ADMIN_USERS_PAGE = r"""
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 14px;
-      padding: 12px 16px;
+      gap: 18px;
+      padding: 12px 20px;
       margin-bottom: 16px;
+      overflow: hidden;
+      position: relative;
+      border-radius: 22px;
+      animation: rise .45s ease both;
+    }
+    .topbar::after {
+      content: "";
+      position: absolute;
+      width: 120px;
+      height: 120px;
+      right: -50px;
+      top: -55px;
+      border-radius: 50%;
+      border: 22px solid rgba(216, 97, 44, .14);
+      pointer-events: none;
+    }
+    .brand {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      flex: 0 0 auto;
+      position: relative;
+      z-index: 1;
+    }
+    .brand-eyebrow {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .18em;
+      color: var(--accent-2);
+      text-transform: uppercase;
+    }
+    .brand-mark {
+      font-family: var(--display);
+      font-size: 24px;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      flex: 1 1 auto;
+      position: relative;
+      z-index: 1;
+    }
+    .page-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .nav-main {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
       flex-wrap: wrap;
     }
-    .brand { font-size: 24px; font-weight: 800; }
-    .nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .page-nav {
+      min-height: 42px;
+      padding-inline: 16px;
+      border-radius: 12px;
+    }
+    .page-nav.is-active {
+      background: var(--ink);
+      color: #fff;
+      box-shadow: 0 12px 28px rgba(17,16,13,.18);
+    }
     a, button {
       border: 1px solid rgba(17,16,13,.12);
-      border-radius: 12px;
-      padding: 9px 12px;
+      border-radius: 999px;
+      min-height: 36px;
+      padding: 8px 12px;
       background: rgba(255,255,255,.38);
       color: var(--ink);
       text-decoration: none;
       font: 13px/1.2 inherit;
       cursor: pointer;
+      white-space: nowrap;
+      transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease;
+    }
+    button:hover:not(:disabled), a:hover { transform: translateY(-1px); }
+    button:disabled {
+      opacity: .42;
+      cursor: not-allowed;
+      transform: none;
     }
     button.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
     button.danger { color: #fff; background: var(--bad); border-color: var(--bad); }
@@ -4822,6 +5509,119 @@ ADMIN_USERS_PAGE = r"""
       padding: 8px 10px;
       color: var(--muted);
       font: 12px/1 var(--mono);
+    }
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .stat-card {
+      border: 1px solid rgba(17,16,13,.1);
+      border-radius: 14px;
+      padding: 10px 12px;
+      min-width: 120px;
+      background: rgba(255,255,255,.34);
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .stat-label {
+      color: var(--muted);
+      font: 11px/1.1 var(--mono);
+    }
+    .stat-value {
+      font-weight: 800;
+      font-size: 18px;
+      line-height: 1.1;
+      font-family: var(--mono);
+      letter-spacing: 0;
+      font-variant-numeric: tabular-nums;
+    }
+    .section-head {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 12px;
+      margin: 16px 0 10px;
+    }
+    .section-title {
+      color: var(--ink);
+      font-size: 16px;
+      font-weight: 800;
+    }
+    .section-subtitle {
+      color: var(--muted);
+      font: 12px/1.2 var(--mono);
+      margin-top: 3px;
+    }
+    .operator-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 10px;
+      margin-bottom: 16px;
+    }
+    .operator-card {
+      border: 1px solid rgba(17,16,13,.1);
+      border-radius: 14px;
+      background: rgba(255,255,255,.34);
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .operator-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .operator-name {
+      font-weight: 800;
+      font-size: 15px;
+    }
+    .operator-role {
+      color: var(--muted);
+      font: 11px/1.2 var(--mono);
+      margin-top: 4px;
+    }
+    .operator-metrics {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .operator-metric {
+      border-radius: 12px;
+      background: rgba(248,241,229,.84);
+      border: 1px solid rgba(17,16,13,.08);
+      padding: 8px 10px;
+    }
+    .operator-metric-label {
+      color: var(--muted);
+      font: 11px/1.1 var(--mono);
+    }
+    .operator-metric-value {
+      margin-top: 4px;
+      font-family: var(--mono);
+      font-size: 16px;
+      font-weight: 800;
+      line-height: 1;
+      font-variant-numeric: tabular-nums;
+    }
+    .operator-foot {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted);
+      font: 12px/1.2 var(--mono);
+    }
+    .empty {
+      padding: 18px 14px;
+      color: var(--muted);
+      text-align: center;
+      border: 1px dashed rgba(17,16,13,.14);
+      border-radius: 14px;
+      background: rgba(255,255,255,.28);
     }
     .panel { padding: 16px; }
     .grid {
@@ -4982,10 +5782,18 @@ ADMIN_USERS_PAGE = r"""
       transition: .18s ease;
     }
     .toast.show { opacity: 1; transform: translateY(0); }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
     @media (max-width: 860px) {
       .grid { grid-template-columns: 1fr; }
       .span-2 { grid-column: auto; }
       .permission-options { grid-template-columns: 1fr; }
+      .operator-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .topbar { align-items: stretch; }
+      .top-actions { justify-content: flex-start; }
+      .nav-main { justify-content: flex-start; width: 100%; }
       table { display: block; overflow-x: auto; }
     }
   </style>
@@ -4993,16 +5801,27 @@ ADMIN_USERS_PAGE = r"""
 <body>
   <main class="shell">
     <header class="topbar">
-      <div class="brand">用户管理</div>
-      <nav class="nav">
-        <a href="/">账号管理</a>
-        <a href="/tasks">任务页面</a>
-        <a href="/settings">设置</a>
-        <span class="badge" id="currentUser">加载中</span>
-        <button id="logoutBtn" type="button">退出</button>
-      </nav>
+      <div class="brand">
+        <div class="brand-eyebrow">Protocol Reg</div>
+        <div class="brand-mark" id="brandMark">账号库控制台</div>
+      </div>
+      <div class="top-actions">
+        <nav class="page-links" id="pageLinks" aria-label="页面导航"></nav>
+        <div class="nav-main">
+          <span class="badge" id="currentUser">加载中</span>
+          <button id="logoutBtn" type="button">退出</button>
+        </div>
+      </div>
     </header>
     <section class="panel">
+      <div class="stats" id="userStats"></div>
+      <div class="section-head">
+        <div>
+          <div class="section-title">订阅操作员概览</div>
+          <div class="section-subtitle">按领取、点击、确认、失败记录统计</div>
+        </div>
+      </div>
+      <div class="operator-grid" id="operatorStats"></div>
       <div class="toolbar" style="display:flex;justify-content:flex-end;margin-bottom:16px;">
         <button class="primary" id="newUserBtn" type="button">新增操作员</button>
       </div>
@@ -5077,6 +5896,7 @@ ADMIN_USERS_PAGE = r"""
     ];
     const DEFAULT_PERMISSIONS = PERMISSIONS.map((item) => item[0]);
     let users = [];
+    let overviewStats = {};
     let currentUserId = '';
     let selectedPermissions = [...DEFAULT_PERMISSIONS];
     let formRole = 'operator';
@@ -5151,17 +5971,111 @@ ADMIN_USERS_PAGE = r"""
       if (Number.isNaN(date.getTime())) return value;
       return date.toLocaleString('zh-CN', { hour12: false });
     }
+    function renderPageLinks(user) {
+      const role = String(user?.role || '').toLowerCase();
+      const links = role === 'admin'
+        ? [
+            ['/', '账号管理'],
+            ['/tasks', '任务页面'],
+            ['/settings', '设置'],
+            ['/operator', '订阅处理'],
+            ['/admin/users', '用户管理'],
+          ]
+        : [
+            ['/operator', '订阅处理'],
+          ];
+      $('pageLinks').innerHTML = links.map(([href, label]) => `
+        <a class="page-nav${href === window.location.pathname ? ' is-active' : ''}" href="${escapeHtml(href)}">${escapeHtml(label)}</a>
+      `).join('');
+    }
     async function loadCurrentUser() {
       const data = await request('/api/auth/me');
       const user = data.user || {};
       currentUserId = String(user.id || '');
       $('currentUser').textContent = `${user.username || '未知'} · ${roleLabel(user.role)}`;
+      renderPageLinks(user);
       return user;
     }
     async function loadUsers() {
-      const data = await request('/api/admin/users');
-      users = data.items || [];
+      const [usersData, overviewData] = await Promise.all([
+        request('/api/admin/users'),
+        request('/api/accounts?search=&status=all&plan=all&stock_status=all&subscription_status=all&page=1&page_size=1'),
+      ]);
+      users = usersData.items || [];
+      overviewStats = overviewData.stats || {};
+      renderOverview();
+      renderOperatorStats();
       renderUsers();
+    }
+    function renderOverview() {
+      const subscription = overviewStats.subscription_statuses || {};
+      const operatorStats = Array.isArray(overviewStats.operator_stats) ? overviewStats.operator_stats : [];
+      const activeOperators = users.filter((user) => user.role === 'operator' && user.status !== 'disabled').length;
+      const enabledAdmins = users.filter((user) => user.role === 'admin' && user.status !== 'disabled').length;
+      const disabledUsers = users.filter((user) => user.status === 'disabled').length;
+      const cards = [
+        ['账号总数', overviewStats.total ?? 0],
+        ['待订阅', subscription['待订阅'] ?? 0],
+        ['待核实', subscription['已点击订阅'] ?? 0],
+        ['已确认', subscription['已确认订阅'] ?? 0],
+        ['活跃操作员', activeOperators],
+        ['启用管理员', enabledAdmins],
+        ['停用用户', disabledUsers],
+        ['有领取记录', operatorStats.length],
+      ];
+      $('userStats').innerHTML = cards.map(([label, value]) => `
+        <div class="stat-card">
+          <div class="stat-label">${escapeHtml(label)}</div>
+          <div class="stat-value">${escapeHtml(value)}</div>
+        </div>
+      `).join('');
+    }
+    function renderOperatorStats() {
+      const operatorStats = Array.isArray(overviewStats.operator_stats) ? overviewStats.operator_stats : [];
+      if (!operatorStats.length) {
+        $('operatorStats').innerHTML = '<div class="empty">暂无订阅操作记录。</div>';
+        return;
+      }
+      $('operatorStats').innerHTML = operatorStats.map((row) => {
+        const name = row.display_name || row.username || `#${row.operator_id}`;
+        return `
+          <article class="operator-card">
+            <div class="operator-card-head">
+              <div>
+                <div class="operator-name">${escapeHtml(name)}</div>
+                <div class="operator-role">${escapeHtml(row.username || `#${row.operator_id}`)} · ${escapeHtml(roleLabel(row.role))}</div>
+              </div>
+              <span class="badge">${escapeHtml(row.total || 0)} 单</span>
+            </div>
+            <div class="operator-metrics">
+              <div class="operator-metric">
+                <div class="operator-metric-label">待订阅</div>
+                <div class="operator-metric-value">${escapeHtml(row.pending_count || 0)}</div>
+              </div>
+              <div class="operator-metric">
+                <div class="operator-metric-label">处理中</div>
+                <div class="operator-metric-value">${escapeHtml(row.claimed_count || 0)}</div>
+              </div>
+              <div class="operator-metric">
+                <div class="operator-metric-label">待核实</div>
+                <div class="operator-metric-value">${escapeHtml(row.marked_count || 0)}</div>
+              </div>
+              <div class="operator-metric">
+                <div class="operator-metric-label">已确认</div>
+                <div class="operator-metric-value">${escapeHtml(row.verified_count || 0)}</div>
+              </div>
+              <div class="operator-metric">
+                <div class="operator-metric-label">失败</div>
+                <div class="operator-metric-value">${escapeHtml(row.failed_count || 0)}</div>
+              </div>
+            </div>
+            <div class="operator-foot">
+              <span>最近活动</span>
+              <strong>${escapeHtml(formatDate(row.last_activity_at))}</strong>
+            </div>
+          </article>
+        `;
+      }).join('');
     }
     function renderUsers() {
       $('userRows').innerHTML = users.map((user) => {
@@ -5370,6 +6284,8 @@ OPERATOR_PAGE = r"""
   <style>
     :root {
       --ink: #11100d;
+      --paper: #f5efe2;
+      --paper-2: #ebe1cf;
       --line: rgba(17, 16, 13, .16);
       --muted: #6f6659;
       --accent: #d8612c;
@@ -5378,6 +6294,7 @@ OPERATOR_PAGE = r"""
       --bad: #a33b2f;
       --shadow: 0 24px 80px rgba(48, 39, 25, .16);
       --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+      --display: "Fraunces", "Iowan Old Style", Georgia, serif;
       --body: "Aptos", "Gill Sans", "Trebuchet MS", sans-serif;
     }
     * { box-sizing: border-box; }
@@ -5386,9 +6303,25 @@ OPERATOR_PAGE = r"""
       min-height: 100vh;
       color: var(--ink);
       font-family: var(--body);
-      background: linear-gradient(135deg, #f8f0df 0%, #efe4d2 52%, #e3d3bd 100%);
+      background:
+        radial-gradient(circle at 20% 10%, rgba(216, 97, 44, .22), transparent 30%),
+        radial-gradient(circle at 95% 0%, rgba(15, 107, 95, .18), transparent 28%),
+        linear-gradient(135deg, #f8f0df 0%, #efe4d2 52%, #e3d3bd 100%);
+      overflow-x: hidden;
     }
-    .shell { width: min(1360px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 36px; }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .35;
+      background-image:
+        linear-gradient(rgba(17,16,13,.045) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(17,16,13,.045) 1px, transparent 1px);
+      background-size: 26px 26px;
+      mask-image: linear-gradient(to bottom, black, transparent 85%);
+    }
+    .shell { width: min(1440px, calc(100vw - 32px)); margin: 0 auto; padding: 28px 0 36px; position: relative; }
     .topbar, .panel {
       border: 1px solid var(--line);
       background: rgba(245, 239, 226, .78);
@@ -5400,13 +6333,69 @@ OPERATOR_PAGE = r"""
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 14px;
-      padding: 12px 16px;
+      gap: 18px;
+      padding: 12px 20px;
       margin-bottom: 16px;
+      position: relative;
+      overflow: hidden;
+      border-radius: 22px;
+      animation: rise .45s ease both;
+    }
+    .topbar::after {
+      content: "";
+      position: absolute;
+      width: 120px;
+      height: 120px;
+      right: -50px;
+      top: -55px;
+      border-radius: 50%;
+      border: 22px solid rgba(216, 97, 44, .14);
+      pointer-events: none;
+    }
+    .brand {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      flex: 0 0 auto;
+      position: relative;
+      z-index: 1;
+    }
+    .brand-eyebrow {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: .18em;
+      color: var(--accent-2);
+      text-transform: uppercase;
+    }
+    .brand-mark {
+      font-family: var(--display);
+      font-size: 24px;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+    .page-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .nav-main {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 12px;
       flex-wrap: wrap;
     }
-    .brand { font-size: 24px; font-weight: 800; }
-    .nav { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+    .top-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+      flex: 1 1 auto;
+      position: relative;
+      z-index: 1;
+    }
     a, button {
       border: 1px solid rgba(17,16,13,.12);
       border-radius: 999px;
@@ -5419,6 +6408,17 @@ OPERATOR_PAGE = r"""
       cursor: pointer;
       white-space: nowrap;
       transition: background .16s ease, border-color .16s ease, color .16s ease, transform .16s ease;
+    }
+    .page-nav {
+      min-height: 42px;
+      padding-inline: 16px;
+      border-radius: 12px;
+    }
+    .page-nav.is-active {
+      background: var(--ink);
+      color: #fff;
+      border-color: var(--ink);
+      box-shadow: 0 12px 28px rgba(17,16,13,.18);
     }
     button:hover:not(:disabled), a:hover { transform: translateY(-1px); }
     button:disabled {
@@ -5480,7 +6480,7 @@ OPERATOR_PAGE = r"""
     input[type="number"] { width: 78px; }
     .queue-summary {
       display: grid;
-      grid-template-columns: repeat(4, minmax(92px, 1fr));
+      grid-template-columns: repeat(5, minmax(92px, 1fr));
       gap: 8px;
       min-width: min(520px, 100%);
     }
@@ -5540,6 +6540,7 @@ OPERATOR_PAGE = r"""
     tbody tr:hover { background: rgba(255,255,255,.34); }
     tbody tr.is-claimed { box-shadow: inset 3px 0 0 rgba(216,97,44,.72); }
     tbody tr.is-marked { box-shadow: inset 3px 0 0 rgba(45,122,70,.72); }
+    tbody tr.is-verified { box-shadow: inset 3px 0 0 rgba(45,122,70,.86); }
     tbody tr.is-failed { box-shadow: inset 3px 0 0 rgba(163,59,47,.72); }
     td code { font-family: var(--mono); font-size: 12px; word-break: break-all; }
     .email-main {
@@ -5573,6 +6574,7 @@ OPERATOR_PAGE = r"""
     .status-pending { color: var(--accent-2); background: rgba(15,107,95,.09); border-color: rgba(15,107,95,.18); }
     .status-claimed { color: var(--accent); background: rgba(216,97,44,.11); border-color: rgba(216,97,44,.22); }
     .status-marked { color: var(--good); background: rgba(45,122,70,.1); border-color: rgba(45,122,70,.2); }
+    .status-verified { color: var(--good); background: rgba(45,122,70,.1); border-color: rgba(45,122,70,.24); }
     .status-failed { color: var(--bad); background: rgba(163,59,47,.1); border-color: rgba(163,59,47,.2); }
     .checkout-link {
       color: var(--accent-2);
@@ -5583,6 +6585,12 @@ OPERATOR_PAGE = r"""
       display: flex;
       flex-direction: column;
       gap: 6px;
+    }
+    .checkout-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      align-items: center;
     }
     .checkout-copy {
       color: #fff;
@@ -5619,6 +6627,17 @@ OPERATOR_PAGE = r"""
       padding-inline: 11px;
       font-weight: 800;
     }
+    .action-stack {
+      display: grid;
+      gap: 8px;
+    }
+    .row-note {
+      width: 100%;
+      min-height: 34px;
+      border-radius: 12px;
+      padding: 8px 10px;
+      font: 13px/1.2 var(--body);
+    }
     .empty {
       padding: 42px 16px;
       color: var(--muted);
@@ -5638,24 +6657,37 @@ OPERATOR_PAGE = r"""
       transition: .18s ease;
     }
     .toast.show { opacity: 1; transform: translateY(0); }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(18px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
     @media (max-width: 920px) {
       .workspace-head { align-items: stretch; }
       .toolbar { width: 100%; }
       .queue-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 0; width: 100%; }
       .table-shell { max-height: none; }
+      .topbar { align-items: stretch; }
+      .top-actions { justify-content: flex-start; }
+      .nav-main { justify-content: flex-start; width: 100%; }
     }
   </style>
 </head>
 <body>
   <main class="shell">
     <header class="topbar">
-      <div class="brand">操作员工作台</div>
-      <nav class="nav">
-        <span class="badge" id="currentUser">加载中</span>
-        <span class="badge" id="queueCount">待加载</span>
-        <button id="refreshBtn" type="button">刷新</button>
-        <button id="logoutBtn" type="button">退出</button>
-      </nav>
+      <div class="brand">
+        <div class="brand-eyebrow">Protocol Reg</div>
+        <div class="brand-mark" id="brandMark">账号库控制台</div>
+      </div>
+      <div class="top-actions">
+        <nav class="page-links" id="pageLinks" aria-label="页面导航"></nav>
+        <div class="nav-main">
+          <span class="badge" id="currentUser">加载中</span>
+          <span class="badge" id="queueCount">待加载</span>
+          <button id="refreshBtn" type="button">刷新</button>
+          <button id="logoutBtn" type="button">退出</button>
+        </div>
+      </div>
     </header>
     <section class="panel">
       <div class="workspace-head">
@@ -5699,6 +6731,8 @@ OPERATOR_PAGE = r"""
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
     let items = [];
     let currentUser = {};
+    let queueTimer = null;
+    let queueLoadingPromise = null;
     function hasValue(value) {
       const text = String(value ?? '').trim();
       return Boolean(text && text.toLowerCase() !== 'null');
@@ -5731,7 +6765,7 @@ OPERATOR_PAGE = r"""
         '待订阅': 'pending',
         '处理中': 'claimed',
         '已点击订阅': 'marked',
-        '已确认订阅': 'marked',
+        '已确认订阅': 'verified',
         '订阅失败': 'failed',
       }[value] || 'pending';
     }
@@ -5740,6 +6774,23 @@ OPERATOR_PAGE = r"""
     }
     function statusLabel(value) {
       return value || '待订阅';
+    }
+    function renderPageLinks(user) {
+      const role = String(user?.role || '').toLowerCase();
+      const links = role === 'admin'
+        ? [
+            ['/', '账号管理'],
+            ['/tasks', '任务页面'],
+            ['/settings', '设置'],
+            ['/operator', '订阅处理'],
+            ['/admin/users', '用户管理'],
+          ]
+        : [
+            ['/operator', '订阅处理'],
+          ];
+      $('pageLinks').innerHTML = links.map(([href, label]) => `
+        <a class="page-nav${href === window.location.pathname ? ' is-active' : ''}" href="${escapeHtml(href)}">${escapeHtml(label)}</a>
+      `).join('');
     }
     function hasPermission(name) {
       if (currentUser.role === 'admin') return true;
@@ -5758,14 +6809,28 @@ OPERATOR_PAGE = r"""
     }
     function statusMeta(item) {
       const status = item.subscription_status || '待订阅';
+      const attempts = Number(item.subscription_verify_attempts || 0);
+      const lastMessage = hasValue(item.subscription_verify_last_message) ? item.subscription_verify_last_message : '';
       if (status === '处理中') {
         return hasValue(item.subscription_claim_expires_at)
           ? `到期 ${formatDate(item.subscription_claim_expires_at)}`
           : '处理中';
       }
       if (status === '订阅失败') return '可重新领取';
-      if (status === '已点击订阅') return '等待确认';
-      if (status === '已确认订阅') return '已确认';
+      if (status === '已点击订阅') {
+        const parts = ['自动核实中'];
+        if (attempts > 0) parts.push(`第 ${attempts} 次`);
+        if (hasValue(item.subscription_verify_next_at)) parts.push(`下次 ${formatDate(item.subscription_verify_next_at)}`);
+        if (lastMessage) {
+          parts.push(lastMessage.startsWith('当前订阅类型为 ')
+            ? `当前仍为 ${lastMessage.replace('当前订阅类型为 ', '')}`
+            : lastMessage);
+        }
+        return parts.join(' · ');
+      }
+      if (status === '已确认订阅') {
+        return lastMessage || '已确认';
+      }
       return '等待领取';
     }
     async function clipboardWrite(text) {
@@ -5802,7 +6867,7 @@ OPERATOR_PAGE = r"""
       const text = String(value || '').trim();
       if (!hasValue(text)) return toast('没有可复制内容');
       await clipboardWrite(text);
-      toast('Checkout 链接已复制，请用无痕浏览器打开');
+      toast('Checkout 链接已复制');
       if (node) {
         node.classList.add('copied');
         setTimeout(() => node.classList.remove('copied'), 700);
@@ -5812,18 +6877,28 @@ OPERATOR_PAGE = r"""
       const data = await request('/api/auth/me');
       const user = data.user || {};
       currentUser = user;
+      renderPageLinks(user);
       $('currentUser').textContent = `${user.username || '未知'} · ${user.role === 'admin' ? '管理员' : '操作员'}`;
     }
     async function loadQueue() {
-      const pageSize = Number($('pageSize').value || 30);
-      const data = await request(`/api/operator/subscriptions?page=1&page_size=${encodeURIComponent(pageSize)}`);
-      items = data.items || [];
-      $('queueCount').textContent = `数量 ${items.length}`;
-      renderQueueSummary();
-      renderRows();
+      if (queueLoadingPromise) return queueLoadingPromise;
+      queueLoadingPromise = (async () => {
+        const pageSize = Number($('pageSize').value || 30);
+        const data = await request(`/api/operator/subscriptions?page=1&page_size=${encodeURIComponent(pageSize)}`);
+        items = data.items || [];
+        const verifyingCount = items.filter((item) => (item.subscription_status || '待订阅') === '已点击订阅').length;
+        $('queueCount').textContent = verifyingCount > 0 ? `数量 ${items.length} · 自动核实 ${verifyingCount}` : `数量 ${items.length}`;
+        renderQueueSummary();
+        renderRows();
+      })();
+      try {
+        return await queueLoadingPromise;
+      } finally {
+        queueLoadingPromise = null;
+      }
     }
     function renderQueueSummary() {
-      const counts = { pending: 0, claimed: 0, marked: 0, failed: 0 };
+      const counts = { pending: 0, claimed: 0, marked: 0, verified: 0, failed: 0 };
       for (const item of items) {
         const tone = statusTone(item.subscription_status || '待订阅');
         if (tone in counts) counts[tone] += 1;
@@ -5831,7 +6906,8 @@ OPERATOR_PAGE = r"""
       const cards = [
         ['待订阅', counts.pending],
         ['处理中', counts.claimed],
-        ['已完成', counts.marked],
+        ['待核实', counts.marked],
+        ['已确认', counts.verified],
         ['失败', counts.failed],
       ];
       $('queueSummary').innerHTML = cards.map(([label, value]) => `
@@ -5851,8 +6927,9 @@ OPERATOR_PAGE = r"""
         const tone = statusTone(status);
         const owned = sameOperator(item);
         const claimedByRaw = item.subscription_operator_id;
+        const operatorName = item.subscription_operator_name || (hasValue(claimedByRaw) ? `#${claimedByRaw}` : '未领取');
         const claimedBy = hasValue(claimedByRaw)
-          ? (owned ? '我' : `#${escapeHtml(claimedByRaw)}`)
+          ? (owned ? '我' : operatorName)
           : '未领取';
         const note = hasValue(item.subscription_note)
           ? `<code>${escapeHtml(item.subscription_note)}</code>`
@@ -5860,8 +6937,10 @@ OPERATOR_PAGE = r"""
         const checkout = hasValue(item.checkout_url)
           ? `
             <div class="checkout-stack">
-              <button type="button" class="checkout-copy" data-copy-checkout="${escapeHtml(item.checkout_url)}">复制链接</button>
-              <span class="muted">建议用无痕浏览器打开</span>
+              <div class="checkout-actions">
+                <a class="checkout-link" href="${escapeHtml(item.checkout_url)}" target="_blank" rel="noopener noreferrer">打开链接</a>
+                <button type="button" class="checkout-copy" data-copy-checkout="${escapeHtml(item.checkout_url)}">复制链接</button>
+              </div>
             </div>
           `
           : '<span class="muted">领取后可复制</span>';
@@ -5871,17 +6950,25 @@ OPERATOR_PAGE = r"""
         const canRelease = status === '处理中' && owned && hasPermission('claim_subscription_account');
         const actions = (() => {
           if (status === '处理中') {
-            if (!owned && !hasPermission('claim_subscription_account')) {
-              return '<span class="muted">处理中</span>';
+            if (owned) {
+              return `
+                <div class="action-stack">
+                  <input class="row-note" data-note-for="${escapeHtml(item.id)}" value="${hasValue(item.subscription_note) ? escapeHtml(item.subscription_note) : ''}" placeholder="备注（可选）" />
+                  <div class="action-row">
+                    <button type="button" data-submitted="${escapeHtml(item.id)}" class="good" ${canFinish ? '' : 'disabled'}>已订阅</button>
+                    <button type="button" data-failed="${escapeHtml(item.id)}" class="bad" ${canFail ? '' : 'disabled'}>失败</button>
+                    <button type="button" data-release="${escapeHtml(item.id)}" ${canRelease ? '' : 'disabled'}>释放</button>
+                  </div>
+                </div>
+              `;
             }
-            return `
-              <div class="action-row">
-                <button type="button" data-submitted="${escapeHtml(item.id)}" class="good" ${canFinish ? '' : 'disabled'}>已订阅</button>
-                <button type="button" data-failed="${escapeHtml(item.id)}" class="bad" ${canFail ? '' : 'disabled'}>失败</button>
-                <button type="button" data-release="${escapeHtml(item.id)}" ${canRelease ? '' : 'disabled'}>释放</button>
-              </div>
-            `;
+            if (canClaim) {
+              return `<button type="button" data-claim="${escapeHtml(item.id)}" class="claim">${status === '订阅失败' ? '重新领取' : '领取'}</button>`;
+            }
+            return '<span class="muted">处理中</span>';
           }
+          if (status === '已点击订阅') return '<span class="muted">自动核实中</span>';
+          if (status === '已确认订阅') return '<span class="muted">已确认</span>';
           if (canClaim) {
             return `<button type="button" data-claim="${escapeHtml(item.id)}" class="claim">${status === '订阅失败' ? '重新领取' : (owned ? '续领' : '领取')}</button>`;
           }
@@ -5928,17 +7015,32 @@ OPERATOR_PAGE = r"""
       toast('任务已领取');
       await loadQueue();
     }
+    function noteForRow(id) {
+      const input = document.querySelector(`[data-note-for="${String(id)}"]`);
+      return input ? input.value.trim() : '';
+    }
     async function markSubmitted(id) {
-      const note = window.prompt('备注（可选）', '');
-      await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/mark-subscribed`, {
+      const note = noteForRow(id);
+      const data = await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/mark-subscribed`, {
         method: 'POST',
         body: JSON.stringify({ note: note || '' }),
       });
-      toast('已标记订阅');
+      if (data.auto_verified) {
+        toast(`系统已核实为 ${data.plan_type || '已确认订阅'}`);
+      } else if (data.verification_pending) {
+        const reason = data.verification_message || '';
+        if (reason.startsWith('当前订阅类型为 ')) {
+          toast(`已标记，自动核实中：当前仍为 ${reason.replace('当前订阅类型为 ', '')}`);
+        } else {
+          toast(reason ? `已标记，自动核实中：${reason}` : '已标记，自动核实中');
+        }
+      } else {
+        toast('已标记订阅');
+      }
       await loadQueue();
     }
     async function markFailed(id) {
-      const note = window.prompt('失败原因（可选）', '');
+      const note = noteForRow(id);
       await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/mark-failed`, {
         method: 'POST',
         body: JSON.stringify({ note: note || '' }),
@@ -5959,8 +7061,17 @@ OPERATOR_PAGE = r"""
       try { await request('/api/auth/logout', { method: 'POST' }); } catch (err) {}
       window.location.href = '/login';
     });
+    function startQueuePolling() {
+      if (queueTimer) return;
+      queueTimer = setInterval(() => {
+        if (!document.hidden) {
+          loadQueue().catch(() => {});
+        }
+      }, 3000);
+    }
     loadCurrentUser()
       .then(loadQueue)
+      .then(startQueuePolling)
       .catch((err) => toast(err.message));
   </script>
 </body>
