@@ -18,6 +18,7 @@ class AirGateMonitorConfig:
     poll_interval_seconds: int = 300
     account_cooldown_seconds: int = 1800
     page_size: int = 100
+    relogin_concurrency: int = 3
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,7 @@ def save_airgate_monitor_config(path: Path, config: AirGateMonitorConfig) -> Non
         "poll_interval_seconds": max(10, int(config.poll_interval_seconds or 300)),
         "account_cooldown_seconds": max(60, int(config.account_cooldown_seconds or 1800)),
         "page_size": min(100, max(1, int(config.page_size or 100))),
+        "relogin_concurrency": min(10, max(1, int(config.relogin_concurrency or 3))),
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -156,6 +158,7 @@ def config_template() -> dict[str, Any]:
             "poll_interval_seconds": 300,
             "account_cooldown_seconds": 1800,
             "page_size": 100,
+            "relogin_concurrency": 3,
         },
     }
 
@@ -176,6 +179,8 @@ def _load_airgate_monitor(value: object) -> AirGateMonitorConfig:
         cooldown = 60
     page_size = _positive_int(value.get("page_size"), 100)
     page_size = min(100, max(1, page_size))
+    relogin_concurrency = _positive_int(value.get("relogin_concurrency"), 3)
+    relogin_concurrency = min(10, max(1, relogin_concurrency))
     return AirGateMonitorConfig(
         enabled=_bool(value.get("enabled"), False),
         core_url=_s("core_url"),
@@ -184,6 +189,7 @@ def _load_airgate_monitor(value: object) -> AirGateMonitorConfig:
         poll_interval_seconds=poll,
         account_cooldown_seconds=cooldown,
         page_size=page_size,
+        relogin_concurrency=relogin_concurrency,
     )
 
 

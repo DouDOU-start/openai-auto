@@ -183,6 +183,7 @@ airgate_monitor:
   poll_interval_seconds: 300
   account_cooldown_seconds: 1800
   page_size: 100
+  relogin_concurrency: 3
 ```
 
 它会轮询 core 的 disabled OpenAI 账号，遇到 401 导致失效的账号后，回到本地账号池重新登录并把新 session 回写到 core。

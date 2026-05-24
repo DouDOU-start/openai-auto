@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import time
 from typing import Any, Callable
@@ -26,6 +27,7 @@ class AirGateMonitorConfig:
     poll_interval_seconds: int = 300
     account_cooldown_seconds: int = 1800
     page_size: int = 100
+    relogin_concurrency: int = 3
 
 
 class AirGateAdminError(RuntimeError):
@@ -196,6 +198,7 @@ class AirGate401Monitor:
                 "poll_interval_seconds": self._config.poll_interval_seconds,
                 "account_cooldown_seconds": self._config.account_cooldown_seconds,
                 "page_size": self._config.page_size,
+                "relogin_concurrency": self._config.relogin_concurrency,
                 "run_count": self._run_count,
                 "last_run_at": self._last_run_at,
                 "next_run_at": self._next_run_at,
@@ -248,6 +251,7 @@ class AirGate401Monitor:
         skipped: list[str] = []
         failed: list[str] = []
         processed = 0
+        jobs: list[tuple[dict[str, Any], str]] = []
         for account in candidates:
             if not isinstance(account, dict):
                 continue
@@ -267,15 +271,27 @@ class AirGate401Monitor:
                 print(f"[AirGate] 跳过冷却中的账号: {email} (id={account.get('id')})")
                 continue
             self._cooldowns[cooldown_key] = now
-            try:
-                result = self._relogin_and_update(account, email, config)
-            except Exception as exc:
-                failed.append(f"{_describe_account(account, 'failed')}: {exc}")
-                print(f"[AirGate] 修复失败: {email} (id={account.get('id')}) -> {exc}")
-                continue
-            if result:
-                success.append(result)
-                print(f"[AirGate] 修复完成: {result}")
+
+            jobs.append((account, email))
+
+        if jobs:
+            workers = min(max(1, int(config.relogin_concurrency or 1)), len(jobs))
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="airgate-relogin") as pool:
+                future_map = {
+                    pool.submit(self._relogin_and_update, account, email, config): (account, email)
+                    for account, email in jobs
+                }
+                for future in as_completed(future_map):
+                    account, email = future_map[future]
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        failed.append(f"{_describe_account(account, 'failed')}: {exc}")
+                        print(f"[AirGate] 修复失败: {email} (id={account.get('id')}) -> {exc}")
+                        continue
+                    if result:
+                        success.append(result)
+                        print(f"[AirGate] 修复完成: {result}")
 
         with self._lock:
             self._run_count += 1
@@ -509,6 +525,7 @@ def _merge_config(current: AirGateMonitorConfig, incoming: AirGateMonitorConfig)
         poll_interval_seconds=_prefer_int(incoming.poll_interval_seconds, current.poll_interval_seconds, minimum=10),
         account_cooldown_seconds=_prefer_int(incoming.account_cooldown_seconds, current.account_cooldown_seconds, minimum=60),
         page_size=min(100, max(1, _prefer_int(incoming.page_size, current.page_size, minimum=1))),
+        relogin_concurrency=min(10, max(1, _prefer_int(incoming.relogin_concurrency, current.relogin_concurrency, minimum=1))),
     )
 
 

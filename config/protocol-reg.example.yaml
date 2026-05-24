@@ -41,3 +41,5 @@ airgate_monitor:
   account_cooldown_seconds: 1800
   # 每次巡检拉取的账号页大小，最大 100。
   page_size: 100
+  # 同时重新登录的并发数，建议 2~5。
+  relogin_concurrency: 3
