@@ -174,6 +174,19 @@ email_code:
 
 这个开关也兼容 `use_proxy_for_email` 写法。
 
+AirGate 401 自动修复也支持放进同一个配置文件里：
+
+```yaml
+airgate_monitor:
+  core_url: "http://127.0.0.1:8080"
+  admin_key: "admin-..."
+  poll_interval_seconds: 300
+  account_cooldown_seconds: 1800
+  page_size: 100
+```
+
+它会轮询 core 的 disabled OpenAI 账号，遇到 401 导致失效的账号后，回到本地账号池重新登录并把新 session 回写到 core。
+
 账号主存储：
 
 ```text

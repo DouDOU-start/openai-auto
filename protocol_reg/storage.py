@@ -440,6 +440,10 @@ def get_account_db(account_id: int) -> dict[str, str] | None:
     return _account_from_row(row) if row is not None else None
 
 
+def get_account_db_by_email(email: str) -> dict[str, str] | None:
+    return _get_account_db_by_email(email)
+
+
 def _get_account_db_by_email(email: str) -> dict[str, str] | None:
     init_accounts_db()
     db_manager = _db_manager()

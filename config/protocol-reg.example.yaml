@@ -28,3 +28,16 @@ email_code:
   otp_poll_max_attempts: 20
   # cloudflare-email API 是否也走当前任务代理；自建邮箱 API 通常保持 false。兼容 use_proxy_for_email 写法。
   use_proxy: false
+airgate_monitor:
+  # AirGate core 的 admin API 基地址，例如 http://127.0.0.1:8080
+  core_url: ""
+  # AirGate admin key，用于读取和更新账号。
+  admin_key: ""
+  # 监控时可选代理；留空则沿用当前任务代理。
+  proxy: ""
+  # 轮询间隔秒数。
+  poll_interval_seconds: 300
+  # 同一个账号触发 401 后的最小重试冷却秒数。
+  account_cooldown_seconds: 1800
+  # 每次巡检拉取的账号页大小，最大 100。
+  page_size: 100

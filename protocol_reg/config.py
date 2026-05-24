@@ -10,6 +10,17 @@ from .settings import parse_proxy_list
 
 
 @dataclass(frozen=True)
+class AirGateMonitorConfig:
+    enabled: bool = False
+    core_url: str = ""
+    admin_key: str = ""
+    proxy: str = ""
+    poll_interval_seconds: int = 300
+    account_cooldown_seconds: int = 1800
+    page_size: int = 100
+
+
+@dataclass(frozen=True)
 class AppConfig:
     # 协议请求代理
     proxy: str = ""
@@ -31,6 +42,8 @@ class AppConfig:
     otp_poll_max_attempts: int = 20
     # 邮箱验证码 API 是否也走代理
     use_proxy_for_email: bool = False
+    # AirGate core 401 账号自动修复
+    airgate_monitor: AirGateMonitorConfig = AirGateMonitorConfig()
 
 
 def load_app_config(path: Path) -> AppConfig:
@@ -80,6 +93,7 @@ def load_app_config(path: Path) -> AppConfig:
     if use_proxy_value in {None, ""} and "use_proxy_for_email" in mail:
         use_proxy_value = mail.get("use_proxy_for_email")
     use_proxy_for_email = _bool(use_proxy_value, False)
+    airgate_monitor = _load_airgate_monitor(raw.get("airgate_monitor"))
 
     return AppConfig(
         proxy=proxy,
@@ -94,6 +108,7 @@ def load_app_config(path: Path) -> AppConfig:
         otp_max_retries=otp_max_retries,
         otp_poll_max_attempts=otp_poll_max_attempts,
         use_proxy_for_email=use_proxy_for_email,
+        airgate_monitor=airgate_monitor,
     )
 
 
@@ -112,8 +127,44 @@ def config_template() -> dict[str, Any]:
             "max_otp_retries": 5,
             "otp_poll_max_attempts": 20,
             "use_proxy": False,
-        }
+        },
+        "airgate_monitor": {
+            "enabled": False,
+            "core_url": "",
+            "admin_key": "",
+            "proxy": "",
+            "poll_interval_seconds": 300,
+            "account_cooldown_seconds": 1800,
+            "page_size": 100,
+        },
     }
+
+
+def _load_airgate_monitor(value: object) -> AirGateMonitorConfig:
+    if not isinstance(value, dict):
+        return AirGateMonitorConfig()
+
+    def _s(key: str, default: str = "") -> str:
+        v = value.get(key)
+        return str(v).strip() if v is not None else default
+
+    poll = _positive_int(value.get("poll_interval_seconds"), 300)
+    if poll < 10:
+        poll = 10
+    cooldown = _positive_int(value.get("account_cooldown_seconds"), 1800)
+    if cooldown < 60:
+        cooldown = 60
+    page_size = _positive_int(value.get("page_size"), 100)
+    page_size = min(100, max(1, page_size))
+    return AirGateMonitorConfig(
+        enabled=_bool(value.get("enabled"), False),
+        core_url=_s("core_url"),
+        admin_key=_s("admin_key"),
+        proxy=_s("proxy"),
+        poll_interval_seconds=poll,
+        account_cooldown_seconds=cooldown,
+        page_size=page_size,
+    )
 
 
 def _load_email_suffixes(value: object) -> tuple[str, ...]:

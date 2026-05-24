@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 from pydantic import BaseModel
 
 from .config import AppConfig, load_app_config
+from .airgate_monitor import AirGate401Monitor, AirGateMonitorConfig
 from .flow import RegisterFlow
 from .proxy_pool import pick_proxy_from_pool
 from .settings import Settings, proxy_preview, resolve_proxy_pool
@@ -126,6 +127,15 @@ class AutoRegisterPayload(BaseModel):
     interval_seconds: int = 300
     batch_count: int = 1
     create_checkout: bool = True
+
+
+class AirGateMonitorPayload(BaseModel):
+    core_url: str = ""
+    admin_key: str = ""
+    proxy: str = ""
+    poll_interval_seconds: int = 300
+    account_cooldown_seconds: int = 1800
+    page_size: int = 100
 
 
 class PromptPayload(BaseModel):
@@ -839,12 +849,18 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             config_path=(repo_root / "config" / "protocol-reg.yaml").resolve(),
             license_file=_default_license_file(repo_root),
         )
+    app_cfg = load_app_config(runtime.config_path)
     manager = JobManager(runtime)
     auto_scheduler = AutoRegisterScheduler(manager)
     subscription_verify_scheduler = SubscriptionVerifyScheduler(runtime)
+    airgate_monitor = AirGate401Monitor(
+        app_cfg.airgate_monitor,
+        lambda: _settings_from_runtime(runtime, proxy=_airgate_monitor_proxy(airgate_monitor)),
+    )
 
     app = FastAPI(title="Protocol Reg 账号管理", version="0.1.0")
     app.state.bootstrap_admin = ensure_bootstrap_admin_user()
+    app.state.airgate_monitor = airgate_monitor
 
     def _current_user_from_request(request: Request) -> dict[str, Any] | None:
         current = getattr(request.state, "current_user", None)
@@ -937,11 +953,14 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     def startup() -> None:
         init_accounts_db()
         subscription_verify_scheduler.start()
+        if app_cfg.airgate_monitor.enabled and app_cfg.airgate_monitor.core_url.strip() and app_cfg.airgate_monitor.admin_key.strip():
+            airgate_monitor.start(app_cfg.airgate_monitor)
 
     @app.on_event("shutdown")
     def shutdown() -> None:
         auto_scheduler.stop()
         subscription_verify_scheduler.stop()
+        airgate_monitor.stop()
 
     @app.get("/login", response_class=HTMLResponse)
     def login_page() -> str:
@@ -1565,6 +1584,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             "items": [_job_view(job) for job in manager.list_recent()],
             "queue": manager.stats(),
             "auto": auto_scheduler.status(),
+            "airgate": airgate_monitor.status(),
         }
 
     @app.get("/api/ops/jobs/{job_id}")
@@ -1572,7 +1592,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         job = manager.get(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="任务不存在")
-        return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status()}
+        return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status(), "airgate": airgate_monitor.status()}
 
     @app.post("/api/ops/jobs/{job_id}/input")
     def api_job_input(job_id: str, payload: PromptPayload) -> dict[str, Any]:
@@ -1582,23 +1602,43 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         if job.status != "waiting":
             raise HTTPException(status_code=400, detail="任务当前不在等待输入状态")
         job.submit_input(payload.value)
-        return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status()}
+        return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status(), "airgate": airgate_monitor.status()}
 
     @app.get("/api/ops/auto-register")
     def api_auto_register_status() -> dict[str, Any]:
-        return {"auto": auto_scheduler.status(), "queue": manager.stats()}
+        return {"auto": auto_scheduler.status(), "queue": manager.stats(), "airgate": airgate_monitor.status()}
 
     @app.post("/api/ops/auto-register/start")
     def api_auto_register_start(payload: AutoRegisterPayload) -> dict[str, Any]:
-        return {"auto": auto_scheduler.start(payload), "queue": manager.stats()}
+        return {"auto": auto_scheduler.start(payload), "queue": manager.stats(), "airgate": airgate_monitor.status()}
 
     @app.post("/api/ops/auto-register/config")
     def api_auto_register_config(payload: AutoRegisterPayload) -> dict[str, Any]:
-        return {"auto": auto_scheduler.configure(payload), "queue": manager.stats()}
+        return {"auto": auto_scheduler.configure(payload), "queue": manager.stats(), "airgate": airgate_monitor.status()}
 
     @app.post("/api/ops/auto-register/stop")
     def api_auto_register_stop() -> dict[str, Any]:
-        return {"auto": auto_scheduler.stop(), "queue": manager.stats()}
+        return {"auto": auto_scheduler.stop(), "queue": manager.stats(), "airgate": airgate_monitor.status()}
+
+    @app.get("/api/ops/airgate-monitor")
+    def api_airgate_monitor_status() -> dict[str, Any]:
+        return {"airgate": airgate_monitor.status()}
+
+    @app.post("/api/ops/airgate-monitor/start")
+    def api_airgate_monitor_start(payload: AirGateMonitorPayload) -> dict[str, Any]:
+        return {"airgate": airgate_monitor.start(_airgate_monitor_config_from_payload(payload)), "queue": manager.stats()}
+
+    @app.post("/api/ops/airgate-monitor/config")
+    def api_airgate_monitor_config(payload: AirGateMonitorPayload) -> dict[str, Any]:
+        return {"airgate": airgate_monitor.configure(_airgate_monitor_config_from_payload(payload)), "queue": manager.stats()}
+
+    @app.post("/api/ops/airgate-monitor/stop")
+    def api_airgate_monitor_stop() -> dict[str, Any]:
+        return {"airgate": airgate_monitor.stop(), "queue": manager.stats()}
+
+    @app.post("/api/ops/airgate-monitor/run-once")
+    def api_airgate_monitor_run_once() -> dict[str, Any]:
+        return {"airgate": airgate_monitor.run_once(), "queue": manager.stats()}
 
     @app.get("/api/ops/subscription-verify")
     def api_subscription_verify_status() -> dict[str, Any]:
@@ -1969,6 +2009,26 @@ def _settings_from_runtime(runtime: WebRuntime, *, proxy: str | None = None) -> 
     )
 
 
+def _airgate_monitor_proxy(monitor: AirGate401Monitor) -> str:
+    try:
+        config = monitor.current_config()
+    except Exception:
+        return ""
+    return str(config.proxy or "").strip()
+
+
+def _airgate_monitor_config_from_payload(payload: AirGateMonitorPayload) -> AirGateMonitorConfig:
+    return AirGateMonitorConfig(
+        enabled=True,
+        core_url=str(payload.core_url or "").strip(),
+        admin_key=str(payload.admin_key or "").strip(),
+        proxy=str(payload.proxy or "").strip(),
+        poll_interval_seconds=max(10, int(payload.poll_interval_seconds or 10)),
+        account_cooldown_seconds=max(60, int(payload.account_cooldown_seconds or 60)),
+        page_size=min(100, max(1, int(payload.page_size or 100))),
+    )
+
+
 def _positive_int(value: object, default: int) -> int:
     try:
         parsed = int(value)
@@ -2323,6 +2383,8 @@ def main() -> None:
         print(f"[Web] 代理池: {len(proxy_pool)} 个，任务按轮询分配")
     elif proxy_pool:
         print(f"[Web] 代理: {proxy_preview(proxy_pool[0])}")
+    if app_cfg.airgate_monitor.core_url.strip() and app_cfg.airgate_monitor.admin_key.strip():
+        print(f"[Web] AirGate 401 监控: {app_cfg.airgate_monitor.core_url.strip()}，已启用配置")
     if args.open:
         webbrowser.open(urls[0])
     uvicorn.run(app, host=args.host, port=args.port)
@@ -2622,6 +2684,10 @@ HTML_PAGE = r"""
       display: none;
     }
 
+    body[data-page="tasks"] .airgate-panel {
+      display: none;
+    }
+
     body[data-page="tasks"] .ops {
       grid-template-columns: minmax(340px, 430px) minmax(0, 1fr);
       align-items: stretch;
@@ -2706,6 +2772,11 @@ HTML_PAGE = r"""
     }
 
     body[data-page="settings"] .auto-panel {
+      border-radius: 24px;
+      padding: 18px;
+    }
+
+    body[data-page="settings"] .airgate-panel {
       border-radius: 24px;
       padding: 18px;
     }
@@ -3406,6 +3477,18 @@ HTML_PAGE = r"""
       min-width: 0;
     }
 
+    .airgate-panel {
+      display: grid;
+      gap: 12px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 20px;
+      padding: 14px;
+      background:
+        linear-gradient(135deg, rgba(15,107,95,.10), rgba(216,97,44,.08)),
+        rgba(255,255,255,.34);
+      min-width: 0;
+    }
+
     .auto-head {
       display: flex;
       justify-content: space-between;
@@ -3427,6 +3510,13 @@ HTML_PAGE = r"""
       align-items: end;
     }
 
+    .airgate-controls {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(110px, 1fr)) repeat(4, auto);
+      gap: 10px;
+      align-items: end;
+    }
+
     .auto-field {
       display: grid;
       gap: 6px;
@@ -3435,6 +3525,7 @@ HTML_PAGE = r"""
     }
 
     .auto-field input { width: 100%; }
+    .airgate-controls .auto-field input { width: 100%; }
 
     .auto-summary {
       color: var(--muted);
@@ -3556,7 +3647,8 @@ HTML_PAGE = r"""
       .nav-main { justify-content: flex-start; width: 100%; }
       .grid-2 { grid-template-columns: 1fr; }
       .ops-row { grid-template-columns: 1fr; }
-      .auto-controls { grid-template-columns: 1fr; }
+      .auto-controls,
+      .airgate-controls { grid-template-columns: 1fr; }
       .auto-head { align-items: flex-start; flex-direction: column; }
       body[data-page="tasks"] #opsModalBackdrop,
       body[data-page="settings"] #opsModalBackdrop {
@@ -3792,6 +3884,27 @@ HTML_PAGE = r"""
               <button class="ghost" type="button" id="autoStopBtn">停止</button>
             </div>
           </div>
+          <div class="airgate-panel">
+            <div class="auto-head">
+              <div>
+                <div class="auto-title">AirGate 401 监控</div>
+                <div class="auto-summary" id="airgateSummary">未配置</div>
+              </div>
+              <span class="tab-badge" id="airgateState" data-status="idle">未配置</span>
+            </div>
+            <div class="airgate-controls">
+              <label class="auto-field">Core 地址<input id="airgateCoreUrl" type="text" placeholder="http://127.0.0.1:8080" /></label>
+              <label class="auto-field">Admin Key<input id="airgateAdminKey" type="password" placeholder="admin-..." /></label>
+              <label class="auto-field">代理<input id="airgateProxy" type="text" placeholder="可选，留空使用当前任务代理" /></label>
+              <label class="auto-field">轮询秒数<input id="airgateInterval" type="number" min="10" value="300" /></label>
+              <label class="auto-field">账号冷却<input id="airgateCooldown" type="number" min="60" value="1800" /></label>
+              <label class="auto-field">页大小<input id="airgatePageSize" type="number" min="1" max="100" value="100" /></label>
+              <button class="ghost" type="button" id="airgateSaveBtn">保存配置</button>
+              <button class="secondary" type="button" id="airgateStartBtn">启动监控</button>
+              <button class="ghost" type="button" id="airgateRunOnceBtn">立即巡检</button>
+              <button class="ghost" type="button" id="airgateStopBtn">停止</button>
+            </div>
+          </div>
           <div class="ops-meta">
             <div class="ops-summary" id="queueSummary">当前没有运行中的任务</div>
             <div class="job-list" id="jobList"></div>
@@ -3825,6 +3938,7 @@ HTML_PAGE = r"""
       jobs: [],
       queue: {},
       auto: {},
+      airgate: {},
       currentJobId: null,
       initialJobId: new URLSearchParams(window.location.search).get('job') || '',
       initialAccountId: new URLSearchParams(window.location.search).get('account') || '',
@@ -4729,6 +4843,42 @@ HTML_PAGE = r"""
       $('autoSummary').textContent = `每 ${auto.interval_seconds}s 投放 ${auto.batch_count} 个注册任务 · ${checkoutText} · 已投放 ${auto.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`;
     }
 
+    function renderAirgatePanel() {
+      const airgate = state.airgate || {};
+      const enabled = Boolean(airgate.enabled);
+      const configured = Boolean(airgate.configured);
+      const badge = $('airgateState');
+      if (document.activeElement !== $('airgateCoreUrl') && airgate.core_url) {
+        $('airgateCoreUrl').value = airgate.core_url;
+      }
+      if (document.activeElement !== $('airgateProxy') && hasValue(airgate.proxy)) {
+        $('airgateProxy').value = airgate.proxy;
+      }
+      if (document.activeElement !== $('airgateInterval') && airgate.poll_interval_seconds) {
+        $('airgateInterval').value = String(airgate.poll_interval_seconds);
+      }
+      if (document.activeElement !== $('airgateCooldown') && airgate.account_cooldown_seconds) {
+        $('airgateCooldown').value = String(airgate.account_cooldown_seconds);
+      }
+      if (document.activeElement !== $('airgatePageSize') && airgate.page_size) {
+        $('airgatePageSize').value = String(airgate.page_size);
+      }
+      badge.textContent = enabled ? '运行中' : (configured ? '已配置' : '未配置');
+      badge.dataset.status = enabled ? 'running' : (configured ? 'idle' : 'danger');
+      $('airgateStartBtn').textContent = enabled ? '已启用' : '启动监控';
+      $('airgateStartBtn').disabled = enabled || !configured;
+      $('airgateStopBtn').disabled = !enabled;
+      $('airgateRunOnceBtn').disabled = !configured;
+      $('airgateSaveBtn').disabled = false;
+      const core = airgate.core_url || '未配置';
+      const last = fmtUnixSeconds(airgate.last_run_at);
+      const nextLeft = secondsLeft(airgate.next_run_at);
+      const error = airgate.last_error ? ` · 最近错误：${airgate.last_error}` : '';
+      $('airgateSummary').textContent = configured
+        ? `Core ${core} · 冷却 ${airgate.account_cooldown_seconds || 1800}s · 周期 ${airgate.poll_interval_seconds || 300}s · 已巡检 ${airgate.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`
+        : '请先配置 core 地址和 admin key';
+    }
+
     function renderQueueSummary() {
       const queue = state.queue || {};
       const active = Number(queue.active || 0);
@@ -4781,6 +4931,7 @@ HTML_PAGE = r"""
       state.jobs = data.items || [];
       state.queue = data.queue || {};
       state.auto = data.auto || {};
+      state.airgate = data.airgate || state.airgate;
       if (!state.initialJobApplied && state.initialJobId && state.jobs.some((job) => String(job.id) === String(state.initialJobId))) {
         state.currentJobId = state.initialJobId;
         state.initialJobApplied = true;
@@ -4802,6 +4953,7 @@ HTML_PAGE = r"""
       }
       renderQueueSummary();
       renderAutoPanel();
+      renderAirgatePanel();
       renderJobList();
       renderJob(currentJob());
       const selected = currentJob();
@@ -4906,6 +5058,61 @@ HTML_PAGE = r"""
       renderAutoPanel();
       renderQueueSummary();
       toast('自动注册已停止');
+      await loadJobBoard();
+    }
+
+    function airgateMonitorPayload() {
+      return {
+        core_url: $('airgateCoreUrl').value.trim(),
+        admin_key: $('airgateAdminKey').value.trim(),
+        proxy: $('airgateProxy').value.trim(),
+        poll_interval_seconds: Math.max(10, Math.trunc(Number($('airgateInterval').value || 10))),
+        account_cooldown_seconds: Math.max(60, Math.trunc(Number($('airgateCooldown').value || 60))),
+        page_size: Math.min(100, Math.max(1, Math.trunc(Number($('airgatePageSize').value || 100)))),
+      };
+    }
+
+    async function saveAirgateMonitorConfig() {
+      const data = await request('/api/ops/airgate-monitor/config', {
+        method: 'POST',
+        body: JSON.stringify(airgateMonitorPayload()),
+      });
+      state.airgate = data.airgate || {};
+      state.queue = data.queue || state.queue;
+      renderAirgatePanel();
+      renderQueueSummary();
+      toast('AirGate 监控配置已保存');
+    }
+
+    async function startAirgateMonitor() {
+      const data = await request('/api/ops/airgate-monitor/start', {
+        method: 'POST',
+        body: JSON.stringify(airgateMonitorPayload()),
+      });
+      state.airgate = data.airgate || {};
+      state.queue = data.queue || state.queue;
+      renderAirgatePanel();
+      renderQueueSummary();
+      toast('AirGate 监控已启动');
+    }
+
+    async function stopAirgateMonitor() {
+      const data = await request('/api/ops/airgate-monitor/stop', { method: 'POST' });
+      state.airgate = data.airgate || {};
+      state.queue = data.queue || state.queue;
+      renderAirgatePanel();
+      renderQueueSummary();
+      toast('AirGate 监控已停止');
+      await loadJobBoard();
+    }
+
+    async function runAirgateMonitorOnce() {
+      const data = await request('/api/ops/airgate-monitor/run-once', { method: 'POST' });
+      state.airgate = data.airgate || {};
+      state.queue = data.queue || state.queue;
+      renderAirgatePanel();
+      renderQueueSummary();
+      toast('AirGate 监控已执行一次巡检');
       await loadJobBoard();
     }
 
@@ -5103,6 +5310,10 @@ HTML_PAGE = r"""
     $('autoSaveBtn').addEventListener('click', () => saveAutoRegisterConfig().catch((err) => toast(err.message)));
     $('autoStartBtn').addEventListener('click', () => startAutoRegister().catch((err) => toast(err.message)));
     $('autoStopBtn').addEventListener('click', () => stopAutoRegister().catch((err) => toast(err.message)));
+    $('airgateSaveBtn').addEventListener('click', () => saveAirgateMonitorConfig().catch((err) => toast(err.message)));
+    $('airgateStartBtn').addEventListener('click', () => startAirgateMonitor().catch((err) => toast(err.message)));
+    $('airgateStopBtn').addEventListener('click', () => stopAirgateMonitor().catch((err) => toast(err.message)));
+    $('airgateRunOnceBtn').addEventListener('click', () => runAirgateMonitorOnce().catch((err) => toast(err.message)));
     $('submitPromptBtn').addEventListener('click', () => submitPrompt().catch((err) => toast(err.message)));
     $('promptInput').addEventListener('keydown', (event) => {
       if (event.key === 'Enter') submitPrompt().catch((err) => toast(err.message));
