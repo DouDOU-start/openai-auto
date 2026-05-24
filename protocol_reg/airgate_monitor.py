@@ -259,19 +259,23 @@ class AirGate401Monitor:
             if not email:
                 skipped.append(_describe_account(account, "missing email"))
                 continue
+            print(f"[AirGate] 准备修复 core 账号: {email} (id={account.get('id')})")
             cooldown_key = email.lower()
             last_attempt = self._cooldowns.get(cooldown_key)
             if last_attempt is not None and now - last_attempt < config.account_cooldown_seconds:
                 skipped.append(_describe_account(account, "cooldown"))
+                print(f"[AirGate] 跳过冷却中的账号: {email} (id={account.get('id')})")
                 continue
             self._cooldowns[cooldown_key] = now
             try:
                 result = self._relogin_and_update(account, email, config)
             except Exception as exc:
                 failed.append(f"{_describe_account(account, 'failed')}: {exc}")
+                print(f"[AirGate] 修复失败: {email} (id={account.get('id')}) -> {exc}")
                 continue
             if result:
                 success.append(result)
+                print(f"[AirGate] 修复完成: {result}")
 
         with self._lock:
             self._run_count += 1
@@ -296,6 +300,7 @@ class AirGate401Monitor:
         settings = _override_proxy(settings, config)
         flow = RegisterFlow(settings, prompt=self._prompt_factory)
         try:
+            print(f"[AirGate] 重新登录获取 session: {email}")
             session_data = flow.login(email, password, create_checkout=False)
         finally:
             try:

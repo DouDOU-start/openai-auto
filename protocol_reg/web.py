@@ -22,7 +22,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
-from .config import AppConfig, load_app_config
+from .config import AppConfig, load_app_config, save_airgate_monitor_config
 from .airgate_monitor import AirGate401Monitor, AirGateMonitorConfig
 from .flow import RegisterFlow
 from .proxy_pool import pick_proxy_from_pool
@@ -1626,15 +1626,34 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
 
     @app.post("/api/ops/airgate-monitor/start")
     def api_airgate_monitor_start(payload: AirGateMonitorPayload) -> dict[str, Any]:
-        return {"airgate": airgate_monitor.start(_airgate_monitor_config_from_payload(payload)), "queue": manager.stats()}
+        airgate = airgate_monitor.start(_airgate_monitor_config_from_payload(payload, enabled=True))
+        save_airgate_monitor_config(runtime.config_path, airgate_monitor.current_config())
+        return {"airgate": airgate, "queue": manager.stats()}
 
     @app.post("/api/ops/airgate-monitor/config")
     def api_airgate_monitor_config(payload: AirGateMonitorPayload) -> dict[str, Any]:
-        return {"airgate": airgate_monitor.configure(_airgate_monitor_config_from_payload(payload)), "queue": manager.stats()}
+        current_enabled = bool(airgate_monitor.status().get("enabled"))
+        airgate = airgate_monitor.configure(_airgate_monitor_config_from_payload(payload, enabled=current_enabled))
+        save_airgate_monitor_config(runtime.config_path, airgate_monitor.current_config())
+        return {"airgate": airgate, "queue": manager.stats()}
 
     @app.post("/api/ops/airgate-monitor/stop")
     def api_airgate_monitor_stop() -> dict[str, Any]:
-        return {"airgate": airgate_monitor.stop(), "queue": manager.stats()}
+        airgate = airgate_monitor.stop()
+        current = airgate_monitor.current_config()
+        save_airgate_monitor_config(
+            runtime.config_path,
+            AirGateMonitorConfig(
+                enabled=False,
+                core_url=current.core_url,
+                admin_key=current.admin_key,
+                proxy=current.proxy,
+                poll_interval_seconds=current.poll_interval_seconds,
+                account_cooldown_seconds=current.account_cooldown_seconds,
+                page_size=current.page_size,
+            ),
+        )
+        return {"airgate": airgate, "queue": manager.stats()}
 
     @app.post("/api/ops/airgate-monitor/run-once")
     def api_airgate_monitor_run_once() -> dict[str, Any]:
@@ -2017,9 +2036,9 @@ def _airgate_monitor_proxy(monitor: AirGate401Monitor) -> str:
     return str(config.proxy or "").strip()
 
 
-def _airgate_monitor_config_from_payload(payload: AirGateMonitorPayload) -> AirGateMonitorConfig:
+def _airgate_monitor_config_from_payload(payload: AirGateMonitorPayload, *, enabled: bool) -> AirGateMonitorConfig:
     return AirGateMonitorConfig(
-        enabled=True,
+        enabled=enabled,
         core_url=str(payload.core_url or "").strip(),
         admin_key=str(payload.admin_key or "").strip(),
         proxy=str(payload.proxy or "").strip(),
@@ -2664,14 +2683,24 @@ HTML_PAGE = r"""
       margin: 0;
     }
 
-    body[data-page="tasks"] #opsModalBackdrop .modal,
-    body[data-page="settings"] #opsModalBackdrop .modal {
+    body[data-page="tasks"] #opsModalBackdrop .modal {
       width: 100%;
       max-width: none;
       max-height: none;
       height: 100%;
       min-height: 0;
       min-width: 0;
+      animation: rise .35s ease both;
+    }
+
+    body[data-page="settings"] #opsModalBackdrop .modal {
+      width: 100%;
+      max-width: 1180px;
+      max-height: none;
+      height: auto;
+      min-height: 0;
+      min-width: 0;
+      margin: 0 auto;
       animation: rise .35s ease both;
     }
 
@@ -2751,12 +2780,13 @@ HTML_PAGE = r"""
 
     body[data-page="settings"] .ops {
       grid-template-columns: minmax(0, 1fr);
-      grid-template-rows: auto minmax(0, 1fr);
-      max-width: 920px;
+      grid-template-rows: auto;
+      max-width: 980px;
       margin: 0 auto;
-      align-content: stretch;
-      align-items: stretch;
-      height: 100%;
+      align-content: start;
+      align-items: start;
+      gap: 14px;
+      height: auto;
     }
 
     body[data-page="settings"] .ops-stack {
@@ -2764,31 +2794,50 @@ HTML_PAGE = r"""
     }
 
     body[data-page="settings"] .ops-meta {
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      min-height: 0;
-      height: 100%;
+      display: none;
     }
 
-    body[data-page="settings"] .auto-panel {
-      border-radius: 24px;
-      padding: 18px;
-    }
-
+    body[data-page="settings"] .auto-panel,
     body[data-page="settings"] .airgate-panel {
-      border-radius: 24px;
-      padding: 18px;
+      border-radius: 18px;
+      padding: 16px;
+      box-shadow: 0 8px 24px rgba(48,39,25,.06);
+      min-height: 0;
+      align-self: start;
     }
 
-    body[data-page="settings"] .job-list {
-      max-height: none;
-      min-height: 0;
-      flex: 1;
+    body[data-page="settings"] .auto-controls,
+    body[data-page="settings"] .airgate-controls {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    body[data-page="settings"] .airgate-controls .auto-field:nth-child(1),
+    body[data-page="settings"] .airgate-controls .auto-field:nth-child(2),
+    body[data-page="settings"] .airgate-controls .auto-field:nth-child(3) {
+      grid-column: 1 / -1;
+    }
+
+    body[data-page="settings"] .airgate-controls button,
+    body[data-page="settings"] .auto-controls button {
+      width: 100%;
+      min-height: 42px;
     }
 
     body[data-page="settings"] #jobState {
       display: none;
+    }
+
+    body[data-page="settings"] {
+      overflow-y: auto;
+    }
+
+    body[data-page="settings"] .shell {
+      height: auto;
+      min-height: 100vh;
+    }
+
+    body[data-page="settings"] .panel {
+      height: auto;
     }
 
     .panel {
@@ -4866,7 +4915,7 @@ HTML_PAGE = r"""
       badge.textContent = enabled ? '运行中' : (configured ? '已配置' : '未配置');
       badge.dataset.status = enabled ? 'running' : (configured ? 'idle' : 'danger');
       $('airgateStartBtn').textContent = enabled ? '已启用' : '启动监控';
-      $('airgateStartBtn').disabled = enabled || !configured;
+      $('airgateStartBtn').disabled = enabled;
       $('airgateStopBtn').disabled = !enabled;
       $('airgateRunOnceBtn').disabled = !configured;
       $('airgateSaveBtn').disabled = false;

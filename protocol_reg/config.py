@@ -112,6 +112,26 @@ def load_app_config(path: Path) -> AppConfig:
     )
 
 
+def save_airgate_monitor_config(path: Path, config: AirGateMonitorConfig) -> None:
+    if path.exists():
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raw = {}
+    else:
+        raw = {}
+    raw["airgate_monitor"] = {
+        "enabled": bool(config.enabled),
+        "core_url": str(config.core_url or "").strip(),
+        "admin_key": str(config.admin_key or "").strip(),
+        "proxy": str(config.proxy or "").strip(),
+        "poll_interval_seconds": max(10, int(config.poll_interval_seconds or 300)),
+        "account_cooldown_seconds": max(60, int(config.account_cooldown_seconds or 1800)),
+        "page_size": min(100, max(1, int(config.page_size or 100))),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+
 def config_template() -> dict[str, Any]:
     return {
         "proxy": "",
