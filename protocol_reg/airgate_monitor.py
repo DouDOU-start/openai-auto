@@ -11,7 +11,13 @@ from curl_cffi import requests
 
 from .flow import RegisterFlow
 from .settings import Settings
-from .storage import NULL_VALUE, get_account_db_by_email, save_login_session_db
+from .storage import (
+    ACCOUNT_STATUS_ABANDONED,
+    NULL_VALUE,
+    get_account_db_by_email,
+    save_login_session_db,
+    update_account_status_db,
+)
 
 
 PromptFactory = Callable[[str], str]
@@ -259,6 +265,15 @@ class AirGate401Monitor:
             if not email:
                 skipped.append(_describe_account(account, "missing email"))
                 continue
+            local_account = get_account_db_by_email(email)
+            if local_account is None:
+                skipped.append(_describe_account(account, "local missing"))
+                print(f"[AirGate] 跳过本地账号池缺失的账号: {email} (id={account.get('id')})")
+                continue
+            if str(local_account.get("status") or "").strip() == ACCOUNT_STATUS_ABANDONED:
+                skipped.append(_describe_account(account, "local abandoned"))
+                print(f"[AirGate] 跳过已废弃的本地账号: {email} (id={account.get('id')})")
+                continue
             print(f"[AirGate] 准备修复 core 账号: {email} (id={account.get('id')})")
             jobs.append((account, email))
 
@@ -305,7 +320,13 @@ class AirGate401Monitor:
         flow = RegisterFlow(settings, prompt=self._prompt_factory)
         try:
             print(f"[AirGate] 重新登录获取 session: {email}")
-            session_data = flow.login(email, password, create_checkout=False)
+            try:
+                session_data = flow.login(email, password, create_checkout=False)
+            except Exception as exc:
+                if _is_forbidden_error(exc):
+                    self._abandon_local_account(local_account)
+                    raise AirGateAdminError(f"登录触发 403，已将本地账号废弃: {email}") from exc
+                raise
         finally:
             try:
                 flow.close()
@@ -322,6 +343,19 @@ class AirGate401Monitor:
         client = AirGateCoreClient(config.core_url, config.admin_key, timeout=settings.timeout)
         client.update_account(int(core_account.get("id") or 0), credentials=merged_credentials, state="active")
         return f"{email} -> core#{core_account.get('id')}"
+
+    def _abandon_local_account(self, local_account: dict[str, Any]) -> None:
+        account_id = int(local_account.get("id") or 0)
+        if account_id <= 0:
+            return
+        current_status = str(local_account.get("status") or "").strip()
+        if current_status == ACCOUNT_STATUS_ABANDONED:
+            return
+        try:
+            update_account_status_db(account_id, ACCOUNT_STATUS_ABANDONED)
+            print(f"[AirGate] 已将本地账号废弃: {local_account.get('email')} (id={account_id})")
+        except Exception as exc:
+            print(f"[AirGate] 废弃本地账号失败: {local_account.get('email')} (id={account_id}) -> {exc}")
 
     def _snapshot_config(self) -> AirGateMonitorConfig:
         with self._lock:
@@ -502,6 +536,10 @@ def _mask_url(url: str) -> str:
 
 def _fail_prompt(prompt: str) -> str:
     raise RuntimeError(f"监控任务不支持交互输入: {prompt}")
+
+
+def _is_forbidden_error(exc: Exception) -> bool:
+    return "403" in str(exc or "")
 
 
 def _merge_config(current: AirGateMonitorConfig, incoming: AirGateMonitorConfig) -> AirGateMonitorConfig:
