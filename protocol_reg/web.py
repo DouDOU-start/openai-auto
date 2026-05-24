@@ -134,7 +134,6 @@ class AirGateMonitorPayload(BaseModel):
     admin_key: str = ""
     proxy: str = ""
     poll_interval_seconds: int = 300
-    account_cooldown_seconds: int = 1800
     page_size: int = 100
     relogin_concurrency: int = 3
 
@@ -1650,7 +1649,6 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
                 admin_key=current.admin_key,
                 proxy=current.proxy,
                 poll_interval_seconds=current.poll_interval_seconds,
-                account_cooldown_seconds=current.account_cooldown_seconds,
                 page_size=current.page_size,
                 relogin_concurrency=current.relogin_concurrency,
             ),
@@ -2045,7 +2043,6 @@ def _airgate_monitor_config_from_payload(payload: AirGateMonitorPayload, *, enab
         admin_key=str(payload.admin_key or "").strip(),
         proxy=str(payload.proxy or "").strip(),
         poll_interval_seconds=max(10, int(payload.poll_interval_seconds or 10)),
-        account_cooldown_seconds=max(60, int(payload.account_cooldown_seconds or 60)),
         page_size=min(100, max(1, int(payload.page_size or 100))),
         relogin_concurrency=min(10, max(1, int(payload.relogin_concurrency or 3))),
     )
@@ -3956,7 +3953,6 @@ HTML_PAGE = r"""
               <label class="auto-field">Admin Key<input id="airgateAdminKey" type="password" placeholder="admin-..." /></label>
               <label class="auto-field">代理<input id="airgateProxy" type="text" placeholder="可选，留空使用当前任务代理" /></label>
               <label class="auto-field">轮询秒数<input id="airgateInterval" type="number" min="10" value="300" /></label>
-              <label class="auto-field">账号冷却<input id="airgateCooldown" type="number" min="60" value="1800" /></label>
               <label class="auto-field">页大小<input id="airgatePageSize" type="number" min="1" max="100" value="100" /></label>
               <label class="auto-field">重登并发<input id="airgateConcurrency" type="number" min="1" max="10" value="3" /></label>
               <button class="ghost" type="button" id="airgateSaveBtn">保存配置</button>
@@ -4917,9 +4913,6 @@ HTML_PAGE = r"""
       if (document.activeElement !== $('airgateInterval') && airgate.poll_interval_seconds) {
         $('airgateInterval').value = String(airgate.poll_interval_seconds);
       }
-      if (document.activeElement !== $('airgateCooldown') && airgate.account_cooldown_seconds) {
-        $('airgateCooldown').value = String(airgate.account_cooldown_seconds);
-      }
       if (document.activeElement !== $('airgatePageSize') && airgate.page_size) {
         $('airgatePageSize').value = String(airgate.page_size);
       }
@@ -4938,7 +4931,7 @@ HTML_PAGE = r"""
       const nextLeft = secondsLeft(airgate.next_run_at);
       const error = airgate.last_error ? ` · 最近错误：${airgate.last_error}` : '';
       $('airgateSummary').textContent = configured
-        ? `Core ${core} · 冷却 ${airgate.account_cooldown_seconds || 1800}s · 周期 ${airgate.poll_interval_seconds || 300}s · 并发 ${airgate.relogin_concurrency || 3} · 已巡检 ${airgate.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`
+        ? `Core ${core} · 周期 ${airgate.poll_interval_seconds || 300}s · 并发 ${airgate.relogin_concurrency || 3} · 已巡检 ${airgate.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`
         : '请先配置 core 地址和 admin key';
     }
 
@@ -5130,7 +5123,6 @@ HTML_PAGE = r"""
         admin_key: $('airgateAdminKey').value.trim(),
         proxy: $('airgateProxy').value.trim(),
         poll_interval_seconds: Math.max(10, Math.trunc(Number($('airgateInterval').value || 10))),
-        account_cooldown_seconds: Math.max(60, Math.trunc(Number($('airgateCooldown').value || 60))),
         page_size: Math.min(100, Math.max(1, Math.trunc(Number($('airgatePageSize').value || 100)))),
         relogin_concurrency: Math.min(10, Math.max(1, Math.trunc(Number($('airgateConcurrency').value || 3)))),
       };

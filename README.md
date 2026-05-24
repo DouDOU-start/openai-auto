@@ -181,7 +181,6 @@ airgate_monitor:
   core_url: "http://127.0.0.1:8080"
   admin_key: "admin-..."
   poll_interval_seconds: 300
-  account_cooldown_seconds: 1800
   page_size: 100
   relogin_concurrency: 3
 ```

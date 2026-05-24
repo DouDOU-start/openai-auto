@@ -16,7 +16,6 @@ class AirGateMonitorConfig:
     admin_key: str = ""
     proxy: str = ""
     poll_interval_seconds: int = 300
-    account_cooldown_seconds: int = 1800
     page_size: int = 100
     relogin_concurrency: int = 3
 
@@ -126,7 +125,6 @@ def save_airgate_monitor_config(path: Path, config: AirGateMonitorConfig) -> Non
         "admin_key": str(config.admin_key or "").strip(),
         "proxy": str(config.proxy or "").strip(),
         "poll_interval_seconds": max(10, int(config.poll_interval_seconds or 300)),
-        "account_cooldown_seconds": max(60, int(config.account_cooldown_seconds or 1800)),
         "page_size": min(100, max(1, int(config.page_size or 100))),
         "relogin_concurrency": min(10, max(1, int(config.relogin_concurrency or 3))),
     }
@@ -156,7 +154,6 @@ def config_template() -> dict[str, Any]:
             "admin_key": "",
             "proxy": "",
             "poll_interval_seconds": 300,
-            "account_cooldown_seconds": 1800,
             "page_size": 100,
             "relogin_concurrency": 3,
         },
@@ -174,9 +171,6 @@ def _load_airgate_monitor(value: object) -> AirGateMonitorConfig:
     poll = _positive_int(value.get("poll_interval_seconds"), 300)
     if poll < 10:
         poll = 10
-    cooldown = _positive_int(value.get("account_cooldown_seconds"), 1800)
-    if cooldown < 60:
-        cooldown = 60
     page_size = _positive_int(value.get("page_size"), 100)
     page_size = min(100, max(1, page_size))
     relogin_concurrency = _positive_int(value.get("relogin_concurrency"), 3)
@@ -187,7 +181,6 @@ def _load_airgate_monitor(value: object) -> AirGateMonitorConfig:
         admin_key=_s("admin_key"),
         proxy=_s("proxy"),
         poll_interval_seconds=poll,
-        account_cooldown_seconds=cooldown,
         page_size=page_size,
         relogin_concurrency=relogin_concurrency,
     )

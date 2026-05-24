@@ -25,7 +25,6 @@ class AirGateMonitorConfig:
     admin_key: str = ""
     proxy: str = ""
     poll_interval_seconds: int = 300
-    account_cooldown_seconds: int = 1800
     page_size: int = 100
     relogin_concurrency: int = 3
 
@@ -155,7 +154,6 @@ class AirGate401Monitor:
         self._last_skipped: list[str] = []
         self._last_failed: list[str] = []
         self._last_candidates = 0
-        self._cooldowns: dict[str, float] = {}
 
     def start(self, config: AirGateMonitorConfig | None = None) -> dict[str, Any]:
         with self._lock:
@@ -196,7 +194,6 @@ class AirGate401Monitor:
                 "proxy": self._config.proxy,
                 "admin_key_configured": bool(self._config.admin_key.strip()),
                 "poll_interval_seconds": self._config.poll_interval_seconds,
-                "account_cooldown_seconds": self._config.account_cooldown_seconds,
                 "page_size": self._config.page_size,
                 "relogin_concurrency": self._config.relogin_concurrency,
                 "run_count": self._run_count,
@@ -246,7 +243,6 @@ class AirGate401Monitor:
                 self._last_candidates = 0
             return self.status()
 
-        now = time.time()
         success: list[str] = []
         skipped: list[str] = []
         failed: list[str] = []
@@ -264,14 +260,6 @@ class AirGate401Monitor:
                 skipped.append(_describe_account(account, "missing email"))
                 continue
             print(f"[AirGate] 准备修复 core 账号: {email} (id={account.get('id')})")
-            cooldown_key = email.lower()
-            last_attempt = self._cooldowns.get(cooldown_key)
-            if last_attempt is not None and now - last_attempt < config.account_cooldown_seconds:
-                skipped.append(_describe_account(account, "cooldown"))
-                print(f"[AirGate] 跳过冷却中的账号: {email} (id={account.get('id')})")
-                continue
-            self._cooldowns[cooldown_key] = now
-
             jobs.append((account, email))
 
         if jobs:
@@ -523,7 +511,6 @@ def _merge_config(current: AirGateMonitorConfig, incoming: AirGateMonitorConfig)
         admin_key=_prefer_text(incoming.admin_key, current.admin_key),
         proxy=_prefer_text(incoming.proxy, current.proxy),
         poll_interval_seconds=_prefer_int(incoming.poll_interval_seconds, current.poll_interval_seconds, minimum=10),
-        account_cooldown_seconds=_prefer_int(incoming.account_cooldown_seconds, current.account_cooldown_seconds, minimum=60),
         page_size=min(100, max(1, _prefer_int(incoming.page_size, current.page_size, minimum=1))),
         relogin_concurrency=min(10, max(1, _prefer_int(incoming.relogin_concurrency, current.relogin_concurrency, minimum=1))),
     )
