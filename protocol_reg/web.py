@@ -24,10 +24,11 @@ from pydantic import BaseModel
 
 from .config import AppConfig, load_app_config, save_airgate_monitor_config
 from .airgate_monitor import AirGate401Monitor, AirGateMonitorConfig
-from .flow import RegisterFlow
+from .flow import PHONE_CHANGE_COMMAND, PhoneVerificationError, RegisterFlow
 from .proxy_pool import pick_proxy_from_pool
 from .settings import Settings, proxy_preview, resolve_proxy_pool
 from .storage import (
+    ACCOUNT_STATUS_ACTIVE,
     ACCOUNT_STATUS_ABANDONED,
     NULL_VALUE,
     AUTH_ROLE_ADMIN,
@@ -68,6 +69,7 @@ from .storage import (
     create_web_session,
     create_web_user,
     ensure_bootstrap_admin_user,
+    get_account_db_by_email,
     record_audit_log,
     resolve_web_session,
     revoke_web_session,
@@ -123,6 +125,12 @@ class BatchOperationPayload(OperationPayload):
     count: int = 1
 
 
+class BatchOperationIdsPayload(BaseModel):
+    mode: str
+    ids: list[int]
+    create_checkout: bool = False
+
+
 class AutoRegisterPayload(BaseModel):
     interval_seconds: int = 300
     batch_count: int = 1
@@ -140,6 +148,10 @@ class AirGateMonitorPayload(BaseModel):
 
 class PromptPayload(BaseModel):
     value: str
+
+
+class PromptActionPayload(BaseModel):
+    action: str
 
 
 class LoginPayload(BaseModel):
@@ -207,6 +219,7 @@ class WebJob:
     updated_at: float = field(default_factory=time.time)
     _condition: threading.Condition = field(default_factory=threading.Condition)
     _input_value: str | None = None
+    _cancel_requested: bool = False
 
     def log(self, message: object) -> None:
         text = str(message).rstrip()
@@ -242,14 +255,22 @@ class WebJob:
 
     def wait_input(self, prompt: str) -> str:
         with self._condition:
+            if self._cancel_requested:
+                raise RuntimeError("任务已取消")
             self.prompt = prompt
             self.status = "waiting"
             self.queue_position = 0
             self.updated_at = time.time()
             self.logs.append(f"[等待输入] {prompt}")
             self._condition.notify_all()
-            while self._input_value is None:
+            while self._input_value is None and not self._cancel_requested:
                 self._condition.wait(timeout=1)
+            if self._cancel_requested:
+                self.prompt = ""
+                self.status = "cancelled"
+                self.error = "任务已取消"
+                self.updated_at = time.time()
+                raise RuntimeError("任务已取消")
             value = self._input_value
             self._input_value = None
             self.prompt = ""
@@ -257,12 +278,34 @@ class WebJob:
             self.updated_at = time.time()
             return value
 
-    def submit_input(self, value: str) -> None:
+    def submit_input(self, value: str, *, log_message: str = "[输入] 已收到页面提交，继续执行") -> None:
         with self._condition:
             self._input_value = value
-            self.logs.append("[输入] 已收到页面提交，继续执行")
+            self.prompt = ""
+            self.status = "running"
+            self.logs.append(log_message)
             self.updated_at = time.time()
             self._condition.notify_all()
+
+    def cancel(self) -> bool:
+        with self._condition:
+            if self.status in {"succeeded", "failed", "cancelled"}:
+                return False
+            self._cancel_requested = True
+            self._input_value = None
+            self.prompt = ""
+            self.error = "任务已取消"
+            self.status = "cancelled"
+            self.queue_position = 0
+            self.logs.append("[取消] 管理员已取消任务")
+            self.updated_at = time.time()
+            self._condition.notify_all()
+            return True
+
+    def raise_if_cancelled(self) -> None:
+        with self._condition:
+            if self._cancel_requested or self.status == "cancelled":
+                raise RuntimeError("任务已取消")
 
 
 class JobWriter:
@@ -376,6 +419,35 @@ def _bind_job_output(writer: JobWriter):
     return _stdout_router.bind(writer), _stderr_router.bind(writer)
 
 
+def _is_authorize_risk_403_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "触发 403，当前授权/代理/风控环境不可用" in message
+
+
+def _auto_abandon_authorize_account(job: WebJob, payload: OperationPayload, exc: Exception) -> None:
+    if payload.mode.strip().lower() != "authorize":
+        return
+    if not _is_authorize_risk_403_error(exc):
+        return
+
+    account_id = payload.account_id
+    if account_id is None:
+        account = get_account_db_by_email(payload.email)
+        if account is not None:
+            account_id = int(account.get("id") or 0) or None
+
+    if account_id is None:
+        job.log("[账号] 授权触发风控 403，但任务未绑定数据库账号，无法自动标记废弃")
+        return
+
+    try:
+        update_account_status_db(account_id, ACCOUNT_STATUS_ABANDONED)
+    except Exception as mark_exc:
+        job.log(f"[账号] 授权触发风控 403，但自动标记废弃失败: {mark_exc}")
+        return
+    job.log("[账号] 授权触发风控 403，已自动标记为废弃")
+
+
 class JobManager:
     def __init__(self, runtime: WebRuntime):
         self.runtime = runtime
@@ -441,6 +513,27 @@ class JobManager:
                 "stored": len(self._jobs),
             }
 
+    def cancel(self, job_id: str) -> WebJob:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                raise KeyError("任务不存在")
+            removed_from_queue = False
+            if job.status == "pending":
+                remaining: list[tuple[WebJob, OperationPayload, str]] = []
+                for queued_job, payload, proxy in self._queue:
+                    if queued_job.id == job_id:
+                        removed_from_queue = True
+                        continue
+                    remaining.append((queued_job, payload, proxy))
+                self._queue = remaining
+            cancelled = job.cancel()
+            if removed_from_queue:
+                self._refresh_queue_positions_locked()
+            if not cancelled:
+                raise ValueError("任务已结束，不能取消")
+            return job
+
     def _reserved_register_emails_locked(self) -> set[str]:
         return {
             job.email.strip().lower()
@@ -484,14 +577,22 @@ class JobManager:
                 job.email = email
                 job.log(f"[任务] 开始执行 {payload.mode}: {email}")
                 flow = RegisterFlow(settings, prompt=job.wait_input)
+                job.raise_if_cancelled()
                 result = _execute_operation(job, payload, settings, flow, email, password, self.runtime)
+                job.raise_if_cancelled()
                 job.set_result(result)
                 job.set_status("succeeded")
                 job.log("[任务] 执行完成")
             except Exception as exc:
-                job.set_error(str(exc))
-                job.set_status("failed")
-                job.log(f"[错误] {exc}")
+                if str(exc) == "任务已取消" or job.status == "cancelled":
+                    job.set_error("任务已取消")
+                    job.set_status("cancelled")
+                    job.log("[取消] 任务已停止")
+                else:
+                    _auto_abandon_authorize_account(job, payload, exc)
+                    job.set_error(str(exc))
+                    job.set_status("failed")
+                    job.log(f"[错误] {exc}")
             finally:
                 if flow is not None:
                     flow.close()
@@ -508,7 +609,7 @@ class JobManager:
         completed = [
             job
             for job in self._jobs.values()
-            if job.status in {"succeeded", "failed"}
+            if job.status in {"succeeded", "failed", "cancelled"}
         ]
         if len(self._jobs) <= 120:
             return
@@ -1290,11 +1391,20 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         plan: str = Query("all"),
         stock_status: str = Query("all"),
         subscription_status: str = Query("all"),
+        rt_status: str = Query("all"),
+        sort_by: str = Query("created_at"),
+        sort_dir: str = Query("desc"),
         page: int = Query(1, ge=1),
         page_size: int = Query(50, ge=1, le=500),
     ) -> dict[str, Any]:
+        normalized_sort_by = sort_by.strip().lower()
+        if normalized_sort_by not in {"created_at", "updated_at"}:
+            normalized_sort_by = "created_at"
+        normalized_sort_dir = sort_dir.strip().lower()
+        if normalized_sort_dir not in {"asc", "desc"}:
+            normalized_sort_dir = "desc"
         operator_labels = _operator_label_map()
-        total = count_account_rows(search=search, status=status, plan=plan, stock_status=stock_status, subscription_status=subscription_status)
+        total = count_account_rows(search=search, status=status, plan=plan, stock_status=stock_status, subscription_status=subscription_status, rt_status=rt_status)
         total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
         effective_page = min(max(1, page), total_pages)
         rows = list_account_rows(
@@ -1303,8 +1413,11 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             plan=plan,
             stock_status=stock_status,
             subscription_status=subscription_status,
+            rt_status=rt_status,
             page=effective_page,
             page_size=page_size,
+            sort_by=normalized_sort_by,
+            sort_dir=normalized_sort_dir,
         )
         return {
             "items": [_account_summary(row, operator_labels) for row in rows],
@@ -1314,6 +1427,8 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
                 "page_size": page_size,
                 "total": total,
                 "total_pages": total_pages,
+                "sort_by": normalized_sort_by,
+                "sort_dir": normalized_sort_dir,
             },
         }
 
@@ -1487,11 +1602,20 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="账号不存在")
         try:
             saved = update_account_status_db(account_id, ACCOUNT_STATUS_ABANDONED)
-            if saved.get("stock_status") == STOCK_STATUS_OUT:
-                saved = update_account_stock_status_db(account_id, STOCK_STATUS_IN)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db(), "marked": True}
+
+    @app.patch("/api/accounts/{account_id}/status/restore")
+    def api_restore_account_status(account_id: int) -> dict[str, Any]:
+        account = get_account_db(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        try:
+            saved = update_account_status_db(account_id, ACCOUNT_STATUS_ACTIVE)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"item": _account_detail(saved, _operator_label_map()), "stats": account_stats_db(), "restored": True}
 
     @app.delete("/api/accounts/{account_id}")
     def api_delete_account(account_id: int) -> dict[str, Any]:
@@ -1578,6 +1702,38 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"jobs": jobs, "queue": manager.stats(), "auto": auto_scheduler.status()}
 
+    @app.post("/api/ops/jobs/batch/accounts")
+    def api_start_account_jobs(payload: BatchOperationIdsPayload) -> dict[str, Any]:
+        mode = payload.mode.strip().lower()
+        if mode not in {"authorize", "login"}:
+            raise HTTPException(status_code=400, detail="批量账号任务只支持 authorize 或 login 模式")
+        ids = []
+        seen: set[int] = set()
+        for raw_id in payload.ids:
+            account_id = int(raw_id or 0)
+            if account_id <= 0 or account_id in seen:
+                continue
+            seen.add(account_id)
+            ids.append(account_id)
+        if not ids:
+            raise HTTPException(status_code=400, detail="请选择账号")
+        if len(ids) > 50:
+            raise HTTPException(status_code=400, detail="一次最多批量处理 50 个账号")
+
+        jobs: list[dict[str, Any]] = []
+        failed: list[dict[str, Any]] = []
+        create_checkout = True if mode == "login" else bool(payload.create_checkout)
+        for account_id in ids:
+            try:
+                job = manager.start(OperationPayload(mode=mode, account_id=account_id, create_checkout=create_checkout))
+                jobs.append(_job_view(job))
+            except ValueError as exc:
+                failed.append({"id": account_id, "error": str(exc)})
+        if not jobs and failed:
+            action = "批量重新登录" if mode == "login" else "批量授权"
+            raise HTTPException(status_code=400, detail=f"{action}启动失败: {failed[0]['error']}")
+        return {"jobs": jobs, "failed": failed, "queue": manager.stats(), "auto": auto_scheduler.status()}
+
     @app.get("/api/ops/jobs")
     def api_jobs() -> dict[str, Any]:
         return {
@@ -1594,6 +1750,16 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="任务不存在")
         return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status(), "airgate": airgate_monitor.status()}
 
+    @app.post("/api/ops/jobs/{job_id}/cancel")
+    def api_cancel_job(job_id: str) -> dict[str, Any]:
+        try:
+            job = manager.cancel(job_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status(), "airgate": airgate_monitor.status()}
+
     @app.post("/api/ops/jobs/{job_id}/input")
     def api_job_input(job_id: str, payload: PromptPayload) -> dict[str, Any]:
         job = manager.get(job_id)
@@ -1602,6 +1768,22 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         if job.status != "waiting":
             raise HTTPException(status_code=400, detail="任务当前不在等待输入状态")
         job.submit_input(payload.value)
+        return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status(), "airgate": airgate_monitor.status()}
+
+    @app.post("/api/ops/jobs/{job_id}/input-action")
+    def api_job_input_action(job_id: str, payload: PromptActionPayload) -> dict[str, Any]:
+        job = manager.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if job.status != "waiting":
+            raise HTTPException(status_code=400, detail="任务当前不在等待输入状态")
+        action = payload.action.strip().lower()
+        if action not in {"change-phone", "change_phone"}:
+            raise HTTPException(status_code=400, detail="不支持的输入动作")
+        prompt_text = job.prompt or ""
+        if "短信验证码" not in prompt_text and "phone-otp" not in prompt_text:
+            raise HTTPException(status_code=400, detail="当前任务不在短信验证码输入阶段")
+        job.submit_input(PHONE_CHANGE_COMMAND, log_message="[输入] 已请求更换验证手机号")
         return {"job": _job_view(job), "queue": manager.stats(), "auto": auto_scheduler.status(), "airgate": airgate_monitor.status()}
 
     @app.get("/api/ops/auto-register")
@@ -2172,9 +2354,20 @@ def _execute_operation(
         job.log("[授权] 未找到可用登录会话，使用账号密码即时登录")
         session_data = flow.login(email, password, create_checkout=False)
         save_login_session_db(email, password, session_data)
+        token_data = flow.authorize_current_session(email, session_data)
     else:
         password = str(session_data.get("password") or password)
-    token_data = flow.authorize_from_session(email, session_data)
+        try:
+            token_data = flow.authorize_from_session(email, session_data)
+        except PhoneVerificationError:
+            raise
+        except RuntimeError as exc:
+            if not password:
+                raise
+            job.log(f"[授权] 已保存会话不可用，改用账号密码重新登录后授权: {exc}")
+            session_data = flow.login(email, password, create_checkout=False)
+            save_login_session_db(email, password, session_data)
+            token_data = flow.authorize_current_session(email, session_data)
     save_authorization_token_db(email, password, token_data)
     return {"email": token_data.get("email") or email, "token_saved": True}
 
@@ -2718,7 +2911,7 @@ HTML_PAGE = r"""
     }
 
     body[data-page="tasks"] .ops {
-      grid-template-columns: minmax(340px, 430px) minmax(0, 1fr);
+      grid-template-columns: minmax(420px, 520px) minmax(0, 1fr);
       align-items: stretch;
       align-content: stretch;
       height: 100%;
@@ -2731,6 +2924,9 @@ HTML_PAGE = r"""
       height: 100%;
       min-height: 0;
       align-content: start;
+      overflow: auto;
+      overscroll-behavior: contain;
+      padding-right: 4px;
     }
 
     body[data-page="tasks"] .ops-row {
@@ -2754,6 +2950,19 @@ HTML_PAGE = r"""
       background: rgba(255,255,255,.28);
     }
 
+    body[data-page="tasks"] .waiting-panel {
+      flex: 0 0 auto;
+      overflow: visible;
+    }
+
+    body[data-page="tasks"] .waiting-panel.show {
+      display: none;
+    }
+
+    body[data-page="tasks"] .waiting-list {
+      max-height: clamp(220px, 36vh, 420px);
+    }
+
     body[data-page="tasks"] .ops-meta {
       min-height: 0;
       height: 100%;
@@ -2761,6 +2970,7 @@ HTML_PAGE = r"""
       flex-direction: column;
       gap: 10px;
       padding: 14px;
+      overflow: hidden;
       border: 1px solid rgba(17,16,13,.12);
       border-radius: 20px;
       background: rgba(255,255,255,.26);
@@ -3153,6 +3363,7 @@ HTML_PAGE = r"""
     .pagination button:disabled { opacity: .45; cursor: not-allowed; }
 
     .account-card {
+      position: relative;
       display: flex;
       flex-direction: column;
       gap: 8px;
@@ -3165,10 +3376,45 @@ HTML_PAGE = r"""
       animation: cardIn .28s ease both;
     }
 
+    .account-card.is-abandoned {
+      border-color: rgba(178, 54, 42, .72);
+      background:
+        linear-gradient(90deg, rgba(178, 54, 42, .14), rgba(255, 252, 246, .72) 44%),
+        rgba(255, 240, 235, .78);
+      box-shadow: inset 5px 0 0 rgba(178, 54, 42, .82), 0 12px 28px rgba(178, 54, 42, .08);
+    }
+
+    .account-card.is-abandoned .email {
+      color: var(--bad);
+    }
+
+    .account-card.is-abandoned:hover,
+    .account-card.is-abandoned.active {
+      border-color: rgba(178, 54, 42, .92);
+      background:
+        linear-gradient(90deg, rgba(178, 54, 42, .2), rgba(255, 252, 246, .82) 46%),
+        rgba(255, 238, 232, .9);
+    }
+
+    .abandoned-ribbon {
+      position: absolute;
+      top: 10px;
+      right: 10px;
+      border: 1px solid rgba(178, 54, 42, .28);
+      border-radius: 999px;
+      padding: 4px 8px;
+      background: rgba(178, 54, 42, .12);
+      color: var(--bad);
+      font: 800 11px var(--mono);
+      letter-spacing: .04em;
+      pointer-events: none;
+    }
+
     .account-head {
       display: flex;
       align-items: flex-start;
       gap: 10px;
+      padding-right: 64px;
     }
 
     .select-box {
@@ -3220,12 +3466,15 @@ HTML_PAGE = r"""
 
     .card-actions {
       display: flex;
-      align-items: center;
+      align-items: flex-end;
       justify-content: space-between;
-      gap: 12px;
+      gap: 8px 12px;
+      flex-wrap: wrap;
+      min-width: 0;
     }
 
     .stock-action {
+      flex: 0 0 auto;
       padding: 8px 11px;
       border-radius: 999px;
       font: 700 12px var(--body);
@@ -3240,11 +3489,15 @@ HTML_PAGE = r"""
     }
 
     .card-actions .updated {
+      flex: 1 1 210px;
+      min-width: 0;
       margin: 0;
       font-family: var(--mono);
       font-size: 11px;
       color: rgba(17,16,13,.58);
-      white-space: nowrap;
+      text-align: left;
+      white-space: normal;
+      overflow-wrap: anywhere;
     }
 
     .card-actions .updated strong {
@@ -3348,6 +3601,7 @@ HTML_PAGE = r"""
     .tab-badge[data-status="waiting"]::before { animation: pulse 1s ease-in-out infinite; }
     .tab-badge[data-status="succeeded"] { color: var(--good); background: rgba(45, 122, 70, .16); }
     .tab-badge[data-status="failed"] { color: var(--bad); background: rgba(163, 59, 47, .16); }
+    .tab-badge[data-status="cancelled"] { color: var(--muted); background: rgba(17, 16, 13, .10); }
 
     .tab-panel {
       padding: 20px;
@@ -3455,6 +3709,12 @@ HTML_PAGE = r"""
       background: rgba(163, 59, 47, .08);
     }
 
+    .job-card[data-status="cancelled"] {
+      border-color: rgba(17, 16, 13, .18);
+      background: rgba(17, 16, 13, .05);
+      opacity: .78;
+    }
+
     .job-card[data-status="succeeded"] {
       border-color: rgba(45, 122, 70, .3);
       background: rgba(45, 122, 70, .07);
@@ -3484,6 +3744,59 @@ HTML_PAGE = r"""
     .job-card-meta {
       color: var(--muted);
       font: 11px var(--mono);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+
+    .job-card-prompt {
+      display: none;
+      gap: 5px;
+      min-width: 0;
+      margin-top: 2px;
+    }
+
+    .job-card-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      margin-top: 3px;
+    }
+
+    .job-card-actions button {
+      min-height: 28px;
+      padding: 0 9px;
+      border-radius: 999px;
+      font-size: 11px;
+    }
+
+    .job-card-actions .danger {
+      background: rgba(163, 59, 47, .12);
+      color: var(--bad);
+    }
+
+    .job-card[data-status="waiting"] .job-card-prompt {
+      display: grid;
+    }
+
+    .job-card-phone {
+      width: fit-content;
+      max-width: 100%;
+      border: 1px solid rgba(16,115,99,.22);
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: rgba(16,115,99,.08);
+      color: var(--teal);
+      font: 10px var(--mono);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .job-card-hint {
+      color: var(--warn);
+      font: 11px/1.35 var(--mono);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
@@ -3606,12 +3919,187 @@ HTML_PAGE = r"""
 
     .prompt-box {
       display: none;
-      grid-template-columns: minmax(0, 1fr) auto;
-      gap: 10px;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px 10px;
       align-items: center;
+      min-width: 0;
+      overflow: hidden;
     }
 
     .prompt-box.show { display: grid; }
+
+    .prompt-box input {
+      min-width: 0;
+      width: 100%;
+    }
+
+    .prompt-box button {
+      white-space: nowrap;
+    }
+
+    #changePhoneBtn {
+      display: none;
+    }
+
+    #changePhoneBtn.show {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .prompt-current {
+      grid-column: 1 / -1;
+      min-width: 0;
+      color: var(--warn);
+      font: 12px/1.45 var(--mono);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .prompt-tip {
+      grid-column: 1 / -1;
+      min-width: 0;
+      color: var(--muted);
+      font: 11px/1.45 var(--mono);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .waiting-panel {
+      display: none;
+      gap: 8px;
+      padding: 10px;
+      border: 1px solid rgba(169,95,0,.22);
+      border-radius: 16px;
+      background: rgba(169,95,0,.08);
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    .waiting-panel.show { display: grid; }
+
+    .waiting-title {
+      color: var(--warn);
+      font: 12px var(--mono);
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .waiting-list {
+      display: grid;
+      gap: 10px;
+      max-height: 360px;
+      min-width: 0;
+      overflow: auto;
+      overscroll-behavior: contain;
+      padding-right: 2px;
+    }
+
+    .waiting-item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 7px 8px;
+      align-items: start;
+      width: 100%;
+      border: 1px solid rgba(169,95,0,.25);
+      border-radius: 12px;
+      padding: 11px 10px;
+      background: rgba(255,255,255,.72);
+      color: var(--ink);
+      text-align: left;
+      cursor: pointer;
+      min-width: 0;
+      overflow: hidden;
+      min-height: 128px;
+      align-content: start;
+    }
+
+    .waiting-item button,
+    .waiting-item input {
+      min-width: 0;
+    }
+
+    .waiting-item.active {
+      border-color: rgba(169,95,0,.58);
+      background: rgba(255,255,255,.94);
+      box-shadow: 0 0 0 2px rgba(169,95,0,.12);
+    }
+
+    .waiting-email {
+      font: 12px var(--mono);
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .waiting-inline {
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 8px;
+      align-items: center;
+      min-width: 0;
+      margin-top: 2px;
+    }
+
+    .waiting-inline input {
+      width: 100%;
+      height: 38px;
+      padding: 0 12px;
+      font: 12px var(--mono);
+      background: rgba(255,250,241,.76);
+    }
+
+    .waiting-inline button {
+      height: 38px;
+      padding: 0 12px;
+      border-radius: 12px;
+      white-space: nowrap;
+    }
+
+    .waiting-phone {
+      grid-column: 1 / -1;
+      display: none;
+      width: fit-content;
+      max-width: 100%;
+      border: 1px solid rgba(16,115,99,.22);
+      border-radius: 999px;
+      padding: 3px 8px;
+      background: rgba(16,115,99,.08);
+      color: var(--teal);
+      font: 11px var(--mono);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .waiting-phone.show { display: block; }
+
+    .waiting-action {
+      justify-self: end;
+      border: 1px solid rgba(169,95,0,.22);
+      border-radius: 999px;
+      padding: 3px 7px;
+      background: rgba(169,95,0,.1);
+      color: var(--warn);
+      font: 10px var(--mono);
+      white-space: nowrap;
+    }
+
+    .waiting-prompt {
+      grid-column: 1 / -1;
+      min-width: 0;
+      color: var(--muted);
+      font: 11px/1.45 var(--mono);
+      overflow: visible;
+      white-space: normal;
+      word-break: break-word;
+    }
 
     .field label {
       display: flex;
@@ -3750,6 +4238,19 @@ HTML_PAGE = r"""
           <select id="statusFilter"><option value="all">全部状态</option></select>
           <select id="subscriptionFilter"><option value="all">全部订阅</option></select>
           <select id="stockFilter"><option value="all">全部库存</option></select>
+          <select id="rtFilter" title="Refresh Token 筛选">
+            <option value="all">全部 RT</option>
+            <option value="has">有 RT</option>
+            <option value="none">无 RT</option>
+          </select>
+          <select id="sortBySelect" title="排序字段">
+            <option value="created_at" selected>按创建时间</option>
+            <option value="updated_at">按更新时间</option>
+          </select>
+          <select id="sortDirSelect" title="排序方向">
+            <option value="desc" selected>新到旧</option>
+            <option value="asc">旧到新</option>
+          </select>
           <select id="pageSizeSelect" title="每页条数">
             <option value="20">20 / 页</option>
             <option value="50" selected>50 / 页</option>
@@ -3768,6 +4269,8 @@ HTML_PAGE = r"""
           <span class="batch-count" id="batchCount">已选择 0 个</span>
           <button class="accent" type="button" id="batchStockOutBtn">批量出库</button>
           <button class="ghost" type="button" id="batchStockInBtn">恢复未出库</button>
+          <button class="secondary" type="button" id="batchReloginBtn">批量重新登录</button>
+          <button class="secondary" type="button" id="batchAuthorizeBtn">批量 OAuth 授权</button>
           <button class="secondary" type="button" id="batchRefreshPlanBtn">自动获取类型</button>
           <button class="secondary" type="button" id="batchExportJsonlBtn">导出 Session JSONL</button>
           <button class="secondary" type="button" id="batchExportAirgateBtn">导出 AirGate JSON</button>
@@ -3880,6 +4383,7 @@ HTML_PAGE = r"""
             <textarea id="sessionJson" readonly spellcheck="false" placeholder="/api/auth/session 返回 data 对象"></textarea>
           </div>
           <div class="button-row">
+            <button class="secondary" type="button" id="authorizeBtn">OAuth 授权</button>
             <button class="accent" type="button" id="stockToggleBtn">标记出库</button>
             <button class="secondary" type="button" id="markSubscribedBtn">系统核实订阅</button>
             <button class="ghost" type="button" id="abandonBtn">标记废弃</button>
@@ -3919,8 +4423,16 @@ HTML_PAGE = r"""
               <input id="opPassword" placeholder="执行密码，留空可使用当前表单" />
             </div>
             <div class="prompt-box" id="promptBox">
-              <input id="promptInput" placeholder="输入邮箱验证码后继续" />
-              <button type="button" id="submitPromptBtn">提交验证码</button>
+              <div class="prompt-current" id="promptCurrent">当前没有等待输入的任务</div>
+              <input id="promptInput" placeholder="按提示输入手机号或验证码后继续" />
+              <button type="button" id="submitPromptBtn">提交</button>
+              <button class="ghost" type="button" id="changePhoneBtn">更换手机号</button>
+              <div class="prompt-tip" id="promptTip">点击右侧等待输入的账号卡片后，在这里填写手机号或验证码。</div>
+            </div>
+            <button class="danger" type="button" id="cancelCurrentJobBtn">取消当前任务</button>
+            <div class="waiting-panel" id="waitingPanel">
+              <div class="waiting-title" id="waitingTitle">等待人工处理</div>
+              <div class="waiting-list" id="waitingList"></div>
             </div>
             <div class="job-console" id="jobLog">任务日志会显示在这里。</div>
           </div>
@@ -3996,6 +4508,8 @@ HTML_PAGE = r"""
       auto: {},
       airgate: {},
       currentJobId: null,
+      jobSelectionLocked: false,
+      promptDrafts: {},
       initialJobId: new URLSearchParams(window.location.search).get('job') || '',
       initialAccountId: new URLSearchParams(window.location.search).get('account') || '',
       initialJobApplied: false,
@@ -4005,6 +4519,8 @@ HTML_PAGE = r"""
       refreshAccountIdAfterJob: null,
       page: 1,
       pageSize: 50,
+      sortBy: 'created_at',
+      sortDir: 'desc',
       totalPages: 1,
       total: 0,
     };
@@ -4015,6 +4531,7 @@ HTML_PAGE = r"""
     const $ = (id) => document.getElementById(id);
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[ch]));
     const hasValue = (value) => Boolean(String(value ?? '').trim() && String(value ?? '').trim().toLowerCase() !== 'null');
+    const ACCOUNT_FILTER_STORAGE_KEY = 'protocol-reg.account-filters.v1';
 
     function setupPageChrome() {
       const brand = $('brandMark');
@@ -4129,11 +4646,73 @@ HTML_PAGE = r"""
       `).join('');
     }
 
+    function accountFilterState() {
+      return {
+        search: $('search').value.trim(),
+        plan: $('planFilter').value || 'all',
+        status: $('statusFilter').value || 'all',
+        subscription_status: $('subscriptionFilter').value || 'all',
+        stock_status: $('stockFilter').value || 'all',
+        rt_status: $('rtFilter').value || 'all',
+        sort_by: $('sortBySelect').value || state.sortBy || 'created_at',
+        sort_dir: $('sortDirSelect').value || state.sortDir || 'desc',
+        page: state.page || 1,
+        page_size: state.pageSize || 50,
+      };
+    }
+
+    function saveAccountFilterState() {
+      if (pageMode !== 'accounts') return;
+      try {
+        localStorage.setItem(ACCOUNT_FILTER_STORAGE_KEY, JSON.stringify(accountFilterState()));
+      } catch {
+        // 浏览器禁用本地存储时不影响账号列表使用。
+      }
+    }
+
+    function loadAccountFilterState() {
+      try {
+        const raw = localStorage.getItem(ACCOUNT_FILTER_STORAGE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+      } catch {
+        return {};
+      }
+    }
+
+    function setSelectValuePreservingMissing(id, value) {
+      const select = $(id);
+      const normalized = String(value || 'all');
+      if (![...select.options].some((option) => option.value === normalized)) {
+        select.appendChild(new Option(normalized, normalized));
+      }
+      select.value = normalized;
+    }
+
+    function applySavedAccountFilters() {
+      const saved = loadAccountFilterState();
+      $('search').value = String(saved.search || '');
+      setSelectValuePreservingMissing('planFilter', saved.plan || 'all');
+      setSelectValuePreservingMissing('statusFilter', saved.status || 'all');
+      setSelectValuePreservingMissing('subscriptionFilter', saved.subscription_status || 'all');
+      setSelectValuePreservingMissing('stockFilter', saved.stock_status || 'all');
+      $('rtFilter').value = ['all', 'has', 'none'].includes(saved.rt_status) ? saved.rt_status : 'all';
+      state.sortBy = ['created_at', 'updated_at'].includes(saved.sort_by) ? saved.sort_by : 'created_at';
+      state.sortDir = saved.sort_dir === 'asc' ? 'asc' : 'desc';
+      state.pageSize = [20, 50, 100, 200].includes(Number(saved.page_size)) ? Number(saved.page_size) : 50;
+      state.page = Math.max(1, Number(saved.page) || 1);
+      $('sortBySelect').value = state.sortBy;
+      $('sortDirSelect').value = state.sortDir;
+      $('pageSizeSelect').value = String(state.pageSize);
+    }
+
     function renderFilters(stats) {
       const currentPlan = $('planFilter').value || 'all';
       const currentStatus = $('statusFilter').value || 'all';
       const currentSubscription = $('subscriptionFilter').value || 'all';
       const currentStock = $('stockFilter').value || 'all';
+      const currentRt = $('rtFilter').value || 'all';
       const planOptions = ['all', ...Object.keys(stats.plans || {}).filter(hasValue)];
       const statusOptions = ['all', ...Object.keys(stats.statuses || {}).filter(hasValue)];
       const subscriptionOptions = ['all', ...Object.keys(stats.subscription_statuses || {}).filter(hasValue)];
@@ -4146,6 +4725,8 @@ HTML_PAGE = r"""
       $('statusFilter').value = statusOptions.includes(currentStatus) ? currentStatus : 'all';
       $('subscriptionFilter').value = subscriptionOptions.includes(currentSubscription) ? currentSubscription : 'all';
       $('stockFilter').value = stockOptions.includes(currentStock) ? currentStock : 'all';
+      $('rtFilter').value = ['all', 'has', 'none'].includes(currentRt) ? currentRt : 'all';
+      saveAccountFilterState();
     }
 
     function renderList(items) {
@@ -4162,16 +4743,19 @@ HTML_PAGE = r"""
         const checkoutClass = item.has_checkout_url ? 'good' : 'warn';
         const stockStatus = item.stock_status || STOCK_IN;
         const accountStatus = item.status || 'active';
+        const abandoned = String(accountStatus || '').trim() === STATUS_ABANDONED;
+        const abandonedClass = abandoned ? ' is-abandoned' : '';
+        const statusClass = abandoned ? 'bad' : '';
         const subscriptionStatus = item.subscription_status || '待订阅';
         const subscriptionClass = subscriptionStatus === '已确认订阅' ? 'good' : (subscriptionStatus === '订阅失败' ? 'bad' : 'warn');
         const operatorLabel = item.subscription_operator_name || (hasValue(item.subscription_operator_id) ? `#${item.subscription_operator_id}` : '未领取');
         const stockClass = stockStatus === STOCK_OUT ? 'bad' : 'good';
-        const stockButtonText = accountStatus === STATUS_ABANDONED
-          ? (stockStatus === STOCK_OUT ? '恢复未出库' : '废弃')
-          : (stockStatus === STOCK_OUT ? '恢复未出库' : '出库');
-        const stockButtonDisabled = accountStatus === STATUS_ABANDONED && stockStatus !== STOCK_OUT;
+        const stockButtonText = stockStatus === STOCK_OUT ? '恢复未出库' : '出库';
+        const stockButtonDisabled = abandoned && stockStatus !== STOCK_OUT;
+        const stockButtonTitle = stockButtonDisabled ? '废弃账号不允许出库' : '';
         return `
-          <article class="account-card${active}" data-id="${item.id}" style="animation-delay:${Math.min(index * 18, 180)}ms">
+          <article class="account-card${active}${abandonedClass}" data-id="${item.id}" style="animation-delay:${Math.min(index * 18, 180)}ms">
+            ${abandoned ? '<div class="abandoned-ribbon">已废弃</div>' : ''}
             <div class="account-head">
               <label class="select-box" title="选择账号">
                 <input type="checkbox" data-select-id="${item.id}"${checked} />
@@ -4184,15 +4768,15 @@ HTML_PAGE = r"""
               <span class="pill ${subscriptionClass}">订阅 · ${escapeHtml(subscriptionStatus)}</span>
               <span class="pill">领取人 · ${escapeHtml(operatorLabel)}</span>
               <span class="pill">${escapeHtml(item.subscription_type || 'null')}</span>
-              <span class="pill">${escapeHtml(item.status || 'null')}</span>
+              <span class="pill ${statusClass}">${escapeHtml(item.status || 'null')}</span>
               <span class="pill ${stockClass}">库存 · ${escapeHtml(stockStatus)}</span>
               <span class="pill ${checkoutClass}">Checkout · ${item.has_checkout_url ? '有' : '无'}</span>
               <span class="pill ${rtClass}">RT · ${item.has_refresh_token ? '有' : '无'}</span>
               <span class="pill ${sessionClass}">Session · ${item.has_session ? '有' : '无'}</span>
             </div>
             <div class="card-actions">
-              <div class="updated"><strong>创建</strong> ${escapeHtml(fmtDate(item.created_at))}</div>
-              <button class="stock-action ${stockStatus === STOCK_OUT ? 'out' : ''}" type="button" data-stock-id="${item.id}" ${stockButtonDisabled ? 'disabled' : ''}>${escapeHtml(stockButtonText)}</button>
+              <div class="updated"><strong>创建</strong> ${escapeHtml(fmtDate(item.created_at))} · <strong>更新</strong> ${escapeHtml(fmtDate(item.updated_at))}</div>
+              <button class="stock-action ${stockStatus === STOCK_OUT ? 'out' : ''}" type="button" data-stock-id="${item.id}" title="${escapeHtml(stockButtonTitle)}" ${stockButtonDisabled ? 'disabled' : ''}>${escapeHtml(stockButtonText)}</button>
             </div>
           </article>
         `;
@@ -4234,7 +4818,7 @@ HTML_PAGE = r"""
       $('batchCount').textContent = `已选择 ${ids.length} 个`;
       $('selectAllVisible').checked = allVisibleSelected;
       $('selectAllVisible').indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < state.items.length;
-      for (const id of ['batchStockOutBtn', 'batchStockInBtn', 'batchRefreshPlanBtn', 'batchExportJsonlBtn', 'batchExportAirgateBtn', 'batchDeleteBtn', 'batchClearBtn']) {
+      for (const id of ['batchStockOutBtn', 'batchStockInBtn', 'batchReloginBtn', 'batchAuthorizeBtn', 'batchRefreshPlanBtn', 'batchExportJsonlBtn', 'batchExportAirgateBtn', 'batchDeleteBtn', 'batchClearBtn']) {
         $(id).disabled = ids.length === 0;
       }
     }
@@ -4254,14 +4838,18 @@ HTML_PAGE = r"""
     }
 
     async function loadAccounts() {
+      const filters = accountFilterState();
       const params = new URLSearchParams({
-        search: $('search').value.trim(),
-        plan: $('planFilter').value || 'all',
-        status: $('statusFilter').value || 'all',
-        subscription_status: $('subscriptionFilter').value || 'all',
-        stock_status: $('stockFilter').value || 'all',
-        page: String(state.page),
-        page_size: String(state.pageSize),
+        search: filters.search,
+        plan: filters.plan,
+        status: filters.status,
+        subscription_status: filters.subscription_status,
+        stock_status: filters.stock_status,
+        rt_status: filters.rt_status,
+        sort_by: filters.sort_by,
+        sort_dir: filters.sort_dir,
+        page: String(filters.page),
+        page_size: String(filters.page_size),
       });
       const data = await request(`/api/accounts?${params.toString()}`);
       state.items = data.items || [];
@@ -4269,12 +4857,17 @@ HTML_PAGE = r"""
       const pagination = data.pagination || {};
       state.page = pagination.page || 1;
       state.pageSize = pagination.page_size || state.pageSize;
+      state.sortBy = pagination.sort_by || $('sortBySelect').value || state.sortBy;
+      state.sortDir = pagination.sort_dir || $('sortDirSelect').value || state.sortDir;
+      $('sortBySelect').value = ['created_at', 'updated_at'].includes(state.sortBy) ? state.sortBy : 'created_at';
+      $('sortDirSelect').value = state.sortDir === 'asc' ? 'asc' : 'desc';
       state.total = pagination.total || 0;
       state.totalPages = pagination.total_pages || 1;
       renderStats(state.stats);
       renderFilters(state.stats);
       renderList(state.items);
       renderPagination();
+      saveAccountFilterState();
       if (!state.initialAccountApplied && state.initialAccountId) {
         state.initialAccountApplied = true;
         const accountId = Number(state.initialAccountId);
@@ -4362,6 +4955,7 @@ HTML_PAGE = r"""
       updateStockButton(item.stock_status || STOCK_IN, item.id, item.status);
       updateCheckoutButton(item.id);
       updateSessionButton(item.id);
+      updateAuthorizeButton(item.id);
       updatePlanButton(item.id);
       updateMarkSubscribedButton(item.id, '系统核实订阅', item.subscription_status);
       updateAbandonButton(item.id, item.subscription_type, item.status);
@@ -4433,16 +5027,11 @@ HTML_PAGE = r"""
 
     function updateStockButton(status, id = $('accountId').value, accountStatus = $('status').value) {
       const button = $('stockToggleBtn');
-      const abandoned = String(accountStatus || '').trim() === STATUS_ABANDONED;
       const out = status === STOCK_OUT;
+      const abandoned = String(accountStatus || '').trim() === STATUS_ABANDONED;
       button.disabled = !id || (abandoned && !out);
-      if (abandoned && !out) {
-        button.textContent = '废弃账号';
-        button.title = '废弃账号不允许出库';
-      } else {
-        button.textContent = out ? '恢复未出库' : '标记出库';
-        button.title = '';
-      }
+      button.textContent = out ? '恢复未出库' : '标记出库';
+      button.title = abandoned && !out ? '废弃账号不允许出库' : '';
     }
 
     function updateCheckoutButton(id = $('accountId').value) {
@@ -4451,6 +5040,10 @@ HTML_PAGE = r"""
 
     function updateSessionButton(id = $('accountId').value) {
       $('refreshSessionBtn').disabled = !id;
+    }
+
+    function updateAuthorizeButton(id = $('accountId').value) {
+      $('authorizeBtn').disabled = !id;
     }
 
     function updatePlanButton(id = $('accountId').value) {
@@ -4469,10 +5062,10 @@ HTML_PAGE = r"""
     function updateAbandonButton(id = $('accountId').value, subscriptionType = $('subscriptionType').value, status = $('status').value) {
       const button = $('abandonBtn');
       const abandoned = String(status || '').trim() === STATUS_ABANDONED;
-      button.disabled = !id || abandoned;
-      button.textContent = abandoned ? '已废弃' : '标记废弃';
+      button.disabled = !id;
+      button.textContent = abandoned ? '恢复账号' : '标记废弃';
       if (!id) button.title = '请先选择账号';
-      else if (abandoned) button.title = '账号已标记废弃';
+      else if (abandoned) button.title = '恢复为 active 状态';
       else button.title = '标记为废弃账号';
     }
 
@@ -4498,6 +5091,7 @@ HTML_PAGE = r"""
       updateStockButton(STOCK_IN, '', 'active');
       updateCheckoutButton('');
       updateSessionButton('');
+      updateAuthorizeButton('');
       updatePlanButton('');
       updateMarkSubscribedButton('', '系统核实订阅', '待订阅');
       updateAbandonButton('', '', 'active');
@@ -4588,18 +5182,24 @@ HTML_PAGE = r"""
       }
     }
 
-    async function markAbandoned() {
+    async function toggleAccountAbandoned() {
       const accountId = Number($('accountId').value || 0);
       if (!accountId) return toast('请先选择账号');
       const email = ($('email').value || '').trim();
       const target = email ? `「${email}」` : '该账号';
-      const ok = await showConfirm(`将${target}标记为废弃。`, { title: '标记废弃', okText: '确认标记' });
+      const isAbandoned = String($('status').value || '').trim() === STATUS_ABANDONED;
+      const action = isAbandoned ? '恢复账号' : '标记废弃';
+      const message = isAbandoned
+        ? `将${target}恢复为 active 状态。`
+        : `将${target}标记为废弃。`;
+      const ok = await showConfirm(message, { title: action, okText: isAbandoned ? '确认恢复' : '确认标记' });
       if (!ok) return;
       const button = $('abandonBtn');
       button.disabled = true;
-      button.textContent = '标记中...';
+      button.textContent = isAbandoned ? '恢复中...' : '标记中...';
       try {
-        const data = await request(`/api/accounts/${accountId}/status/abandon`, { method: 'PATCH' });
+        const endpoint = isAbandoned ? 'restore' : 'abandon';
+        const data = await request(`/api/accounts/${accountId}/status/${endpoint}`, { method: 'PATCH' });
         const item = data.item;
         $('status').value = item.status === 'null' ? 'active' : item.status || 'active';
         $('stockStatus').value = item.stock_status || STOCK_IN;
@@ -4608,7 +5208,7 @@ HTML_PAGE = r"""
         $('editorHint').textContent = accountEditorHint(item);
         updateStockButton(item.stock_status || STOCK_IN, item.id, item.status);
         updateAbandonButton(item.id, item.subscription_type, item.status);
-        toast('已标记废弃');
+        toast(isAbandoned ? '已恢复账号' : '已标记废弃');
         await loadAccounts();
         state.selectedId = item.id;
         renderList(state.items);
@@ -4646,6 +5246,54 @@ HTML_PAGE = r"""
       });
       toast(batchMessage('批量自动获取类型', data));
       await loadAccounts();
+    }
+
+    async function batchAuthorizeAccounts() {
+      const ids = selectedIds();
+      if (!ids.length) return toast('请先选择账号');
+      const ok = await showConfirm(
+        `将对选中的 ${ids.length} 个账号启动 OAuth 授权任务。遇到手机验证时，请在任务列表中点击对应邮箱的等待任务并输入手机号/验证码。`,
+        { title: '批量 OAuth 授权', okText: '开始授权' },
+      );
+      if (!ok) return;
+      const data = await request('/api/ops/jobs/batch/accounts', {
+        method: 'POST',
+        body: JSON.stringify({ mode: 'authorize', ids }),
+      });
+      const jobs = data.jobs || [];
+      if (!jobs.length) throw new Error('批量授权任务启动失败');
+      state.currentJobId = jobs[0].id;
+      state.jobSelectionLocked = false;
+      state.jobs = jobs.concat(state.jobs.filter((job) => !jobs.some((item) => String(item.id) === String(job.id))));
+      state.queue = data.queue || state.queue;
+      state.auto = data.auto || state.auto;
+      const failed = data.failed || [];
+      toast(failed.length ? `已启动 ${jobs.length} 个授权任务，失败 ${failed.length} 个` : `已启动 ${jobs.length} 个授权任务`);
+      window.location.href = `/tasks?job=${encodeURIComponent(jobs[0].id)}`;
+    }
+
+    async function batchReloginAccounts() {
+      const ids = selectedIds();
+      if (!ids.length) return toast('请先选择账号');
+      const ok = await showConfirm(
+        `将对选中的 ${ids.length} 个账号启动重新登录任务，并重新获取 checkout 支付链接。遇到手机/邮箱验证时，请在任务页点击对应邮箱的等待任务后输入手机号或验证码。`,
+        { title: '批量重新登录', okText: '开始重新登录' },
+      );
+      if (!ok) return;
+      const data = await request('/api/ops/jobs/batch/accounts', {
+        method: 'POST',
+        body: JSON.stringify({ mode: 'login', ids, create_checkout: true }),
+      });
+      const jobs = data.jobs || [];
+      if (!jobs.length) throw new Error('批量重新登录任务启动失败');
+      state.currentJobId = jobs[0].id;
+      state.jobSelectionLocked = false;
+      state.jobs = jobs.concat(state.jobs.filter((job) => !jobs.some((item) => String(item.id) === String(job.id))));
+      state.queue = data.queue || state.queue;
+      state.auto = data.auto || state.auto;
+      const failed = data.failed || [];
+      toast(failed.length ? `已启动 ${jobs.length} 个重新登录任务，失败 ${failed.length} 个` : `已启动 ${jobs.length} 个重新登录任务`);
+      window.location.href = `/tasks?job=${encodeURIComponent(jobs[0].id)}`;
     }
 
     function downloadBlob(blob, filename) {
@@ -4857,7 +5505,119 @@ HTML_PAGE = r"""
     }
 
     function jobStatusLabel(status) {
-      return { pending: '排队中', running: '运行中', waiting: '等待验证码', succeeded: '已完成', failed: '失败' }[status] || (status || '空闲');
+      return { pending: '排队中', running: '运行中', waiting: '等待输入', succeeded: '已完成', failed: '失败', cancelled: '已取消' }[status] || (status || '空闲');
+    }
+
+    function canCancelJob(job) {
+      return Boolean(job && ['pending', 'running', 'waiting'].includes(job.status));
+    }
+
+    function promptKind(prompt) {
+      const text = String(prompt || '');
+      if ((text.includes('手机号') && text.includes('短信验证码')) || text.includes('phone-otp')) return 'phone-code';
+      if (text.includes('请输入手机号') || text.includes('重新输入手机号') || text.includes('更换手机号') || text.includes('add-phone')) return 'phone-number';
+      if (text.includes('邮箱') && text.includes('验证码')) return 'email-code';
+      if (text.includes('验证码')) return 'code';
+      return 'input';
+    }
+
+    function phoneFromPrompt(prompt) {
+      const text = String(prompt || '').replace(/\s+/g, ' ').trim();
+      const patterns = [
+        /手机号\s*([+＋]?\d[\d\s().-]{5,}\d)\s*收到/,
+        /phone\s*(?:number)?\s*[:：]?\s*([+＋]?\d[\d\s().-]{5,}\d)/i,
+        /([+＋]\d[\d\s().-]{5,}\d)/,
+      ];
+      for (const pattern of patterns) {
+        const match = pattern.exec(text);
+        if (!match) continue;
+        return match[1].replace(/＋/g, '+').replace(/\s+/g, '');
+      }
+      return '';
+    }
+
+    function waitingActionLabel(prompt) {
+      const labels = {
+        'phone-number': '输入手机号',
+        'phone-code': '输入短信验证码',
+        'email-code': '输入邮箱验证码',
+        code: '输入验证码',
+        input: '等待输入',
+      };
+      return labels[promptKind(prompt)] || labels.input;
+    }
+
+    function promptPlaceholder(prompt) {
+      const phone = phoneFromPrompt(prompt);
+      const placeholders = {
+        'phone-number': '输入手机号，例如 +8613800000000',
+        'phone-code': phone ? `输入 ${phone} 收到的短信验证码；留空提交可重发` : '输入短信验证码；留空提交可重发短信',
+        'email-code': '输入邮箱验证码；留空提交可重发邮件',
+        code: '输入验证码；留空提交可重发',
+        input: '按任务提示输入后继续',
+      };
+      return placeholders[promptKind(prompt)] || placeholders.input;
+    }
+
+    function promptSubmitLabel(prompt) {
+      const kind = promptKind(prompt);
+      if (kind === 'phone-number') return '发送短信';
+      if (kind === 'phone-code' || kind === 'email-code' || kind === 'code') return '提交验证码';
+      return '提交';
+    }
+
+    function waitingPromptSummary(prompt) {
+      const text = String(prompt || '').replace(/\s+/g, ' ').trim();
+      const kind = promptKind(text);
+      if (kind === 'phone-number') {
+        if (text.includes('不可用') || text.includes('更换手机号')) {
+          return '上个手机号被拒，请换一个带国家码的手机号';
+        }
+        return '填写带国家码的手机号，例如 +8613800000000';
+      }
+      if (kind === 'phone-code') {
+        const phone = phoneFromPrompt(text);
+        return phone ? `验证码发送到 ${phone}；可更换手机号` : '输入短信验证码；留空重发；可更换手机号';
+      }
+      if (kind === 'email-code') return '输入邮箱验证码；留空重发邮件';
+      if (kind === 'code') return '输入验证码；留空重发';
+      return text || '按任务日志提示输入';
+    }
+
+    function submitToastText(job, kind, phone) {
+      if (phone && kind === 'phone-code') {
+        return `已为 ${job.email || '当前账号'} 提交 ${phone} 的验证码`;
+      }
+      if (kind === 'phone-number') {
+        return `已为 ${job.email || '当前账号'} 提交手机号`;
+      }
+      return '已提交';
+    }
+
+    function waitingJobs() {
+      return (state.jobs || []).filter((job) => job.status === 'waiting');
+    }
+
+    function prunePromptDrafts() {
+      const waitingIds = new Set(waitingJobs().map((job) => String(job.id)));
+      for (const id of Object.keys(state.promptDrafts)) {
+        if (!waitingIds.has(String(id))) delete state.promptDrafts[id];
+      }
+    }
+
+    function nextWaitingJob(excludeId = '') {
+      return waitingJobs().find((job) => String(job.id) !== String(excludeId)) || null;
+    }
+
+    function selectJob(jobId, options = {}) {
+      state.currentJobId = jobId || null;
+      if (options.lock) state.jobSelectionLocked = true;
+      renderJobList();
+      renderWaitingPanel();
+      renderJob(currentJob());
+      if (options.focus && currentJob()?.status === 'waiting') {
+        $('promptInput').focus();
+      }
     }
 
     function fmtUnixSeconds(value) {
@@ -4929,9 +5689,13 @@ HTML_PAGE = r"""
       const core = airgate.core_url || '未配置';
       const last = fmtUnixSeconds(airgate.last_run_at);
       const nextLeft = secondsLeft(airgate.next_run_at);
+      const deletedCount = Array.isArray(airgate.last_deleted) ? airgate.last_deleted.length : 0;
+      const successCount = Array.isArray(airgate.last_success) ? airgate.last_success.length : 0;
+      const failedCount = Array.isArray(airgate.last_failed) ? airgate.last_failed.length : 0;
+      const cleanup = ` · 修复 ${successCount} · 删除废弃 ${deletedCount} · 失败 ${failedCount}`;
       const error = airgate.last_error ? ` · 最近错误：${airgate.last_error}` : '';
       $('airgateSummary').textContent = configured
-        ? `Core ${core} · 周期 ${airgate.poll_interval_seconds || 300}s · 并发 ${airgate.relogin_concurrency || 3} · 已巡检 ${airgate.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`
+        ? `Core ${core} · 周期 ${airgate.poll_interval_seconds || 300}s · 并发 ${airgate.relogin_concurrency || 3} · 已巡检 ${airgate.run_count || 0} 轮${cleanup} · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`
         : '请先配置 core 地址和 admin key';
     }
 
@@ -4944,7 +5708,7 @@ HTML_PAGE = r"""
       const waiting = Number(queue.waiting || 0);
       const stored = Number(queue.stored || state.jobs.length || 0);
       $('queueSummary').textContent = active
-        ? `并发 ${running}/${max} · 排队 ${pending} · 等待验证码 ${waiting} · 活动 ${active} · 历史 ${stored}`
+        ? `并发 ${running}/${max} · 排队 ${pending} · 等待输入 ${waiting} · 活动 ${active} · 历史 ${stored}`
         : '当前没有运行中的任务';
     }
 
@@ -4952,34 +5716,132 @@ HTML_PAGE = r"""
       const list = $('jobList');
       const jobs = state.jobs || [];
       if (!jobs.length) {
-        list.innerHTML = '<div class="empty">暂无任务。点击开始执行后会在这里显示排队、运行和等待验证码的任务。</div>';
+        list.innerHTML = '<div class="empty">暂无任务。点击开始执行后会在这里显示排队、运行和等待输入的任务。</div>';
         return;
       }
       list.innerHTML = jobs.map((job) => {
         const active = String(job.id) === String(state.currentJobId) ? ' active' : '';
         const status = jobStatusLabel(job.status);
         const statusClass = job.status || 'idle';
+        const cancellable = canCancelJob(job);
         const queueText = job.status === 'pending'
           ? `排队 #${job.queue_position || 0}`
           : status;
         const email = job.email ? escapeHtml(job.email) : '未命名任务';
+        const prompt = job.prompt || '';
+        const promptKindLabel = job.status === 'waiting' ? waitingActionLabel(prompt) : '';
+        const promptSummary = job.status === 'waiting' ? waitingPromptSummary(prompt) : '';
+        const phone = job.status === 'waiting' ? phoneFromPrompt(prompt) : '';
         return `
-          <button type="button" class="job-card${active}" data-job-id="${escapeHtml(job.id)}" data-status="${escapeHtml(statusClass)}">
+          <div class="job-card${active}" data-job-id="${escapeHtml(job.id)}" data-status="${escapeHtml(statusClass)}">
             <div class="job-card-head">
               <div class="job-card-title">${email}</div>
               <span class="tab-badge" data-status="${escapeHtml(statusClass)}">${escapeHtml(status)}</span>
             </div>
             <div class="job-card-meta">${escapeHtml(job.mode || 'unknown')} · ${escapeHtml(queueText)}</div>
-          </button>
+            ${job.status === 'waiting' ? `
+              <div class="job-card-prompt">
+                <div class="job-card-hint">${escapeHtml(promptKindLabel)} · ${escapeHtml(promptSummary)}</div>
+                ${phone ? `<div class="job-card-phone">手机号 · ${escapeHtml(phone)}</div>` : ''}
+              </div>
+            ` : ''}
+            <div class="job-card-actions">
+              <button type="button" class="secondary" data-job-select="${escapeHtml(job.id)}">查看</button>
+              ${cancellable ? `<button type="button" class="danger" data-job-cancel="${escapeHtml(job.id)}">取消</button>` : ''}
+            </div>
+          </div>
         `;
       }).join('');
       list.querySelectorAll('[data-job-id]').forEach((button) => {
         button.addEventListener('click', () => {
-          state.currentJobId = button.dataset.jobId || null;
-          renderJobList();
-          renderJob(currentJob());
+          selectJob(button.dataset.jobId || null, { focus: true, lock: true });
         });
       });
+      list.querySelectorAll('[data-job-select]').forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          selectJob(button.dataset.jobSelect || null, { focus: true, lock: true });
+        });
+      });
+      list.querySelectorAll('[data-job-cancel]').forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          cancelJob(button.dataset.jobCancel || '').catch((err) => toast(err.message));
+        });
+      });
+    }
+
+    function renderWaitingPanel() {
+      const waiting = waitingJobs();
+      const activeInput = document.activeElement;
+      const focusedWaitingId = activeInput?.dataset?.waitingInput || '';
+      const selectionStart = focusedWaitingId ? activeInput.selectionStart : null;
+      const selectionEnd = focusedWaitingId ? activeInput.selectionEnd : null;
+      $('waitingPanel').classList.toggle('show', waiting.length > 0);
+      $('waitingTitle').textContent = waiting.length
+        ? `等待人工处理 ${waiting.length} 个账号`
+        : '等待人工处理';
+      $('waitingList').innerHTML = waiting.map((job) => {
+        const active = String(job.id) === String(state.currentJobId) ? ' active' : '';
+        const prompt = job.prompt || '按任务日志提示输入';
+        const action = waitingActionLabel(prompt);
+        const summary = waitingPromptSummary(prompt);
+        const phone = phoneFromPrompt(prompt);
+        const placeholder = promptPlaceholder(prompt);
+        const submitLabel = promptSubmitLabel(prompt);
+        const canChangePhone = promptKind(prompt) === 'phone-code';
+        const draft = state.promptDrafts[String(job.id)] || '';
+        return `
+          <div class="waiting-item${active}" data-waiting-job-id="${escapeHtml(job.id)}">
+            <div class="waiting-email">${escapeHtml(job.email || '未命名任务')}</div>
+            <div class="waiting-action">${escapeHtml(action)}</div>
+            <div class="waiting-phone${phone ? ' show' : ''}">${phone ? `手机号 · ${escapeHtml(phone)}` : ''}</div>
+            <div class="waiting-prompt" title="${escapeHtml(prompt)}">${escapeHtml(summary)}</div>
+            <div class="waiting-inline">
+              <input data-waiting-input="${escapeHtml(job.id)}" value="${escapeHtml(draft)}" placeholder="${escapeHtml(placeholder)}" />
+              <button type="button" class="secondary" data-waiting-submit="${escapeHtml(job.id)}">${escapeHtml(submitLabel)}</button>
+              ${canChangePhone ? `<button type="button" class="ghost" data-waiting-change-phone="${escapeHtml(job.id)}">更换手机号</button>` : ''}
+            </div>
+          </div>
+        `;
+      }).join('');
+      $('waitingList').querySelectorAll('[data-waiting-job-id]').forEach((node) => {
+        node.addEventListener('click', () => {
+          selectJob(node.dataset.waitingJobId || null, { lock: true });
+        });
+      });
+      $('waitingList').querySelectorAll('[data-waiting-input]').forEach((input) => {
+        input.addEventListener('click', (event) => event.stopPropagation());
+        input.addEventListener('input', () => {
+          state.promptDrafts[String(input.dataset.waitingInput || '')] = input.value;
+        });
+        input.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter') return;
+          event.stopPropagation();
+          submitWaitingPrompt(input.dataset.waitingInput || '').catch((err) => toast(err.message));
+        });
+      });
+      $('waitingList').querySelectorAll('[data-waiting-submit]').forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          submitWaitingPrompt(button.dataset.waitingSubmit || '').catch((err) => toast(err.message));
+        });
+      });
+      $('waitingList').querySelectorAll('[data-waiting-change-phone]').forEach((button) => {
+        button.addEventListener('click', (event) => {
+          event.stopPropagation();
+          changePhoneForJob(button.dataset.waitingChangePhone || '').catch((err) => toast(err.message));
+        });
+      });
+      if (focusedWaitingId) {
+        const restored = $('waitingList').querySelector(`[data-waiting-input="${CSS.escape(focusedWaitingId)}"]`);
+        if (restored) {
+          restored.focus();
+          if (selectionStart !== null && selectionEnd !== null) {
+            restored.setSelectionRange(selectionStart, selectionEnd);
+          }
+        }
+      }
     }
 
     async function loadJobBoard() {
@@ -4988,6 +5850,7 @@ HTML_PAGE = r"""
       state.queue = data.queue || {};
       state.auto = data.auto || {};
       state.airgate = data.airgate || state.airgate;
+      prunePromptDrafts();
       if (!state.initialJobApplied && state.initialJobId && state.jobs.some((job) => String(job.id) === String(state.initialJobId))) {
         state.currentJobId = state.initialJobId;
         state.initialJobApplied = true;
@@ -4998,20 +5861,37 @@ HTML_PAGE = r"""
       if (state.currentJobId && !state.jobs.some((job) => String(job.id) === String(state.currentJobId))) {
         const fallback = state.jobs.find((job) => ['pending', 'running', 'waiting'].includes(job.status)) || state.jobs[0] || null;
         state.currentJobId = fallback ? fallback.id : null;
+        state.jobSelectionLocked = false;
       }
-      const selectedBeforeSwitch = currentJob();
-      const activeJob = state.jobs.find((job) => ['pending', 'running', 'waiting'].includes(job.status)) || null;
-      if (
-        activeJob
-        && (!selectedBeforeSwitch || (state.auto && state.auto.enabled && ['succeeded', 'failed'].includes(selectedBeforeSwitch.status)))
-      ) {
-        state.currentJobId = activeJob.id;
+      if (!state.jobSelectionLocked) {
+        const selectedBeforeSwitch = currentJob();
+        const activeJob = state.jobs.find((job) => ['pending', 'running', 'waiting'].includes(job.status)) || null;
+        const waitingJob = waitingJobs()[0] || null;
+        if (
+          waitingJob
+          && selectedBeforeSwitch
+          && selectedBeforeSwitch.status !== 'waiting'
+        ) {
+          state.currentJobId = waitingJob.id;
+        } else if (
+          activeJob
+          && (
+            !selectedBeforeSwitch
+            || (
+              selectedBeforeSwitch.status !== 'waiting'
+              && state.auto
+              && state.auto.enabled
+              && ['succeeded', 'failed'].includes(selectedBeforeSwitch.status)
+            )
+          )
+        ) {
+          state.currentJobId = activeJob.id;
+        }
       }
       renderQueueSummary();
       renderAutoPanel();
       renderAirgatePanel();
-      renderJobList();
-      renderJob(currentJob());
+      selectJob(state.currentJobId);
       const selected = currentJob();
       const activeCount = Number(state.queue.active || 0);
       const autoEnabled = Boolean(state.auto && state.auto.enabled);
@@ -5185,6 +6065,7 @@ HTML_PAGE = r"""
       const jobs = data.jobs || (data.job ? [data.job] : []);
       if (!jobs.length) throw new Error('任务启动失败');
       state.currentJobId = jobs[0].id;
+      state.jobSelectionLocked = false;
       state.refreshAccountIdAfterJob = refreshAccountId;
       state.jobs = jobs.concat(state.jobs.filter((job) => !jobs.some((item) => String(item.id) === String(job.id))));
       state.queue = data.queue || state.queue;
@@ -5194,8 +6075,7 @@ HTML_PAGE = r"""
         return;
       }
       renderQueueSummary();
-      renderJobList();
-      renderJob(currentJob());
+      selectJob(state.currentJobId);
       toast(isBatch ? `已启动 ${jobs.length} 个注册任务` : '任务已启动');
       startJobPolling();
     }
@@ -5210,6 +6090,7 @@ HTML_PAGE = r"""
       const badge = $('jobState');
       badge.textContent = jobStatusLabel(current.status);
       badge.dataset.status = current.status || 'idle';
+      $('cancelCurrentJobBtn').disabled = !canCancelJob(job);
       updateCheckoutButton();
       if (current.status === 'waiting' && pageMode === 'tasks') openOpsModal();
       const lines = (current.logs || []).join('\n');
@@ -5220,11 +6101,45 @@ HTML_PAGE = r"""
       $('jobLog').scrollTop = $('jobLog').scrollHeight;
       $('promptBox').classList.toggle('show', current.status === 'waiting');
       if (current.status === 'waiting') {
-        $('promptInput').placeholder = current.prompt || '输入验证码后继续';
+        const action = waitingActionLabel(current.prompt);
+        const email = current.email || '未命名任务';
+        const phone = phoneFromPrompt(current.prompt);
+        const canChangePhone = promptKind(current.prompt) === 'phone-code';
+        $('promptCurrent').textContent = phone
+          ? `当前处理：${email} · 手机号 ${phone} · ${action}`
+          : `当前处理：${email} · ${action}`;
+        $('promptInput').placeholder = promptPlaceholder(current.prompt);
+        $('promptTip').textContent = waitingPromptSummary(current.prompt);
+        $('submitPromptBtn').textContent = promptSubmitLabel(current.prompt);
+        $('changePhoneBtn').classList.toggle('show', canChangePhone);
+        $('changePhoneBtn').disabled = !canChangePhone;
         $('promptInput').focus();
       } else {
-        $('promptInput').placeholder = '输入邮箱验证码后继续';
+        $('promptCurrent').textContent = '当前没有等待输入的任务';
+        $('promptInput').placeholder = '按提示输入手机号或验证码后继续';
+        $('promptTip').textContent = '点击右侧等待输入的账号卡片后，在这里填写手机号或验证码。';
+        $('submitPromptBtn').textContent = '提交';
+        $('changePhoneBtn').classList.remove('show');
+        $('changePhoneBtn').disabled = true;
       }
+    }
+
+    async function cancelJob(jobId = state.currentJobId) {
+      if (!jobId) return toast('当前没有可取消的任务');
+      const job = (state.jobs || []).find((item) => String(item.id) === String(jobId));
+      if (!canCancelJob(job)) return toast('任务已结束，不能取消');
+      const ok = await showConfirm(`取消任务「${job.email || job.id}」。`, { title: '取消任务', okText: '确认取消', danger: true });
+      if (!ok) return;
+      const data = await request(`/api/ops/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+      state.queue = data.queue || state.queue;
+      state.jobs = state.jobs.map((item) => String(item.id) === String(data.job.id) ? data.job : item);
+      if (!state.jobs.some((item) => String(item.id) === String(data.job.id))) {
+        state.jobs.unshift(data.job);
+      }
+      renderQueueSummary();
+      selectJob(data.job.id, { lock: true });
+      toast('任务已取消');
+      startJobPolling();
     }
 
     async function regenerateCheckout() {
@@ -5271,25 +6186,99 @@ HTML_PAGE = r"""
       toast('已开始重新获取 Session');
     }
 
-    async function submitPrompt() {
-      if (!state.currentJobId) return toast('当前没有运行中的任务');
-      const value = $('promptInput').value.trim();
-      if (!value) return toast('验证码不能为空');
-      const data = await request(`/api/ops/jobs/${state.currentJobId}/input`, {
+    async function authorizeAccount() {
+      const accountId = Number($('accountId').value || 0);
+      if (!accountId) return toast('请先选择账号');
+      const email = $('email').value.trim();
+      const password = $('password').value;
+      if (!email) return toast('当前账号缺少邮箱，无法授权');
+      $('opMode').value = 'authorize';
+      $('opEmail').value = email;
+      $('opPassword').value = password;
+      closeAccountModal();
+      await startJob({
+        mode: 'authorize',
+        email,
+        password,
+        account_id: accountId,
+        generate_email: false,
+        generate_password: false,
+        create_checkout: false,
+      }, accountId);
+      toast('已开始 OAuth 授权');
+    }
+
+    async function submitWaitingPrompt(jobId, rawValue, options = {}) {
+      const selectedBeforeSubmit = (state.jobs || []).find((job) => String(job.id) === String(jobId)) || null;
+      if (!selectedBeforeSubmit || selectedBeforeSubmit.status !== 'waiting') {
+        return toast('该任务不在等待输入状态');
+      }
+      const submitKind = promptKind(selectedBeforeSubmit.prompt);
+      const submitPhone = phoneFromPrompt(selectedBeforeSubmit.prompt);
+      const value = String(rawValue ?? state.promptDrafts[String(jobId)] ?? '').trim();
+      if (!value && submitKind === 'phone-number') {
+        return toast('请输入带国家码的手机号，例如 +8613800000000');
+      }
+      const data = await request(`/api/ops/jobs/${jobId}/input`, {
         method: 'POST',
         body: JSON.stringify({ value }),
       });
-      $('promptInput').value = '';
+      delete state.promptDrafts[String(jobId)];
+      if (String(jobId) === String(state.currentJobId)) $('promptInput').value = '';
       state.queue = data.queue || state.queue;
       state.jobs = state.jobs.map((job) => String(job.id) === String(data.job.id) ? data.job : job);
       renderQueueSummary();
-      renderJobList();
-      renderJob(data.job);
+      const nextWaiting = data.job.status === 'waiting' ? data.job : nextWaitingJob(data.job.id);
+      const shouldFollow = Boolean(options.follow);
+      if (shouldFollow) {
+        selectJob(nextWaiting ? nextWaiting.id : data.job.id, { focus: Boolean(nextWaiting) });
+      } else {
+        renderJobList();
+        renderWaitingPanel();
+        renderJob(currentJob());
+      }
+      const submitted = submitToastText(selectedBeforeSubmit, submitKind, submitPhone);
+      if (nextWaiting) {
+        toast(`${submitted}，继续处理 ${nextWaiting.email || '下一个账号'}`);
+      } else {
+        toast(`${submitted}，等待任务继续执行`);
+      }
       startJobPolling();
+    }
+
+    async function changePhoneForJob(jobId = state.currentJobId) {
+      const selected = (state.jobs || []).find((job) => String(job.id) === String(jobId)) || null;
+      if (!selected || selected.status !== 'waiting') return toast('该任务不在等待输入状态');
+      if (promptKind(selected.prompt) !== 'phone-code') return toast('当前任务不在短信验证码阶段');
+      const phone = phoneFromPrompt(selected.prompt);
+      const label = phone ? `当前手机号 ${phone}` : '当前手机号';
+      const ok = await showConfirm(`账号「${selected.email || selected.id}」将放弃${label}，重新输入新的验证手机号。`, {
+        title: '更换验证手机号',
+        okText: '更换手机号',
+      });
+      if (!ok) return;
+      const data = await request(`/api/ops/jobs/${encodeURIComponent(jobId)}/input-action`, {
+        method: 'POST',
+        body: JSON.stringify({ action: 'change-phone' }),
+      });
+      delete state.promptDrafts[String(jobId)];
+      if (String(jobId) === String(state.currentJobId)) $('promptInput').value = '';
+      state.queue = data.queue || state.queue;
+      state.jobs = state.jobs.map((job) => String(job.id) === String(data.job.id) ? data.job : job);
+      renderQueueSummary();
+      selectJob(data.job.id, { lock: true, focus: true });
+      toast('已请求更换手机号，请输入新手机号');
+      startJobPolling();
+    }
+
+    async function submitPrompt() {
+      if (!state.currentJobId) return toast('当前没有运行中的任务');
+      return submitWaitingPrompt(state.currentJobId, $('promptInput').value, { follow: true });
     }
 
     function reloadFromFirstPage() {
       state.page = 1;
+      saveAccountFilterState();
       return loadAccounts().catch((err) => toast(err.message));
     }
 
@@ -5302,6 +6291,15 @@ HTML_PAGE = r"""
     $('statusFilter').addEventListener('change', reloadFromFirstPage);
     $('subscriptionFilter').addEventListener('change', reloadFromFirstPage);
     $('stockFilter').addEventListener('change', reloadFromFirstPage);
+    $('rtFilter').addEventListener('change', reloadFromFirstPage);
+    $('sortBySelect').addEventListener('change', () => {
+      state.sortBy = $('sortBySelect').value || 'created_at';
+      reloadFromFirstPage();
+    });
+    $('sortDirSelect').addEventListener('change', () => {
+      state.sortDir = $('sortDirSelect').value || 'desc';
+      reloadFromFirstPage();
+    });
     $('pageSizeSelect').addEventListener('change', () => {
       state.pageSize = Number($('pageSizeSelect').value) || 50;
       reloadFromFirstPage();
@@ -5309,11 +6307,13 @@ HTML_PAGE = r"""
     $('prevPageBtn').addEventListener('click', () => {
       if (state.page <= 1) return;
       state.page -= 1;
+      saveAccountFilterState();
       loadAccounts().catch((err) => toast(err.message));
     });
     $('nextPageBtn').addEventListener('click', () => {
       if (state.page >= state.totalPages) return;
       state.page += 1;
+      saveAccountFilterState();
       loadAccounts().catch((err) => toast(err.message));
     });
     $('opMode').addEventListener('change', syncOperationControls);
@@ -5349,10 +6349,13 @@ HTML_PAGE = r"""
     $('deleteBtn').addEventListener('click', () => deleteSelected().catch((err) => toast(err.message)));
     $('stockToggleBtn').addEventListener('click', () => toggleStockStatus().catch((err) => toast(err.message)));
     $('markSubscribedBtn').addEventListener('click', () => markSubscribed().catch((err) => toast(err.message)));
-    $('abandonBtn').addEventListener('click', () => markAbandoned().catch((err) => toast(err.message)));
+    $('abandonBtn').addEventListener('click', () => toggleAccountAbandoned().catch((err) => toast(err.message)));
+    $('cancelCurrentJobBtn').addEventListener('click', () => cancelJob().catch((err) => toast(err.message)));
     $('selectAllVisible').addEventListener('change', () => toggleSelectAllVisible($('selectAllVisible').checked));
     $('batchStockOutBtn').addEventListener('click', () => batchUpdateStockStatus(STOCK_OUT).catch((err) => toast(err.message)));
     $('batchStockInBtn').addEventListener('click', () => batchUpdateStockStatus(STOCK_IN).catch((err) => toast(err.message)));
+    $('batchReloginBtn').addEventListener('click', () => batchReloginAccounts().catch((err) => toast(err.message)));
+    $('batchAuthorizeBtn').addEventListener('click', () => batchAuthorizeAccounts().catch((err) => toast(err.message)));
     $('batchRefreshPlanBtn').addEventListener('click', () => batchRefreshSubscriptionTypes().catch((err) => toast(err.message)));
     $('batchExportJsonlBtn').addEventListener('click', () => batchExportSessionJsonl().catch((err) => toast(err.message)));
     $('batchExportAirgateBtn').addEventListener('click', () => batchExportAirgateJson().catch((err) => toast(err.message)));
@@ -5362,6 +6365,7 @@ HTML_PAGE = r"""
     $('refreshPlanBtn').addEventListener('click', () => refreshSubscriptionType().catch((err) => toast(err.message)));
     $('regenCheckoutBtn').addEventListener('click', () => regenerateCheckout().catch((err) => toast(err.message)));
     $('refreshSessionBtn').addEventListener('click', () => refreshSession().catch((err) => toast(err.message)));
+    $('authorizeBtn').addEventListener('click', () => authorizeAccount().catch((err) => toast(err.message)));
     $('startJobBtn').addEventListener('click', () => startJob().catch((err) => toast(err.message)));
     $('autoSaveBtn').addEventListener('click', () => saveAutoRegisterConfig().catch((err) => toast(err.message)));
     $('autoStartBtn').addEventListener('click', () => startAutoRegister().catch((err) => toast(err.message)));
@@ -5371,6 +6375,7 @@ HTML_PAGE = r"""
     $('airgateStopBtn').addEventListener('click', () => stopAirgateMonitor().catch((err) => toast(err.message)));
     $('airgateRunOnceBtn').addEventListener('click', () => runAirgateMonitorOnce().catch((err) => toast(err.message)));
     $('submitPromptBtn').addEventListener('click', () => submitPrompt().catch((err) => toast(err.message)));
+    $('changePhoneBtn').addEventListener('click', () => changePhoneForJob().catch((err) => toast(err.message)));
     $('promptInput').addEventListener('keydown', (event) => {
       if (event.key === 'Enter') submitPrompt().catch((err) => toast(err.message));
     });
@@ -5464,6 +6469,7 @@ HTML_PAGE = r"""
         await loadJobBoard();
       } else {
         resetForm();
+        applySavedAccountFilters();
         await loadAccounts();
         startAccountsPolling();
       }

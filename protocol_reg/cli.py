@@ -12,7 +12,7 @@ import webbrowser
 import yaml
 
 from .config import config_template, load_app_config
-from .flow import RegisterFlow
+from .flow import PhoneVerificationError, RegisterFlow
 from .proxy_pool import pick_proxy_from_pool
 from .settings import Settings, proxy_preview, resolve_proxy_pool
 from .storage import (
@@ -411,9 +411,20 @@ def main() -> None:
                     raise SystemExit("[错误] 单独授权必须有登录会话或输入已有账号密码")
                 session_data = flow.login(email, password, create_checkout=False)
                 save_login_session_db(email, password, session_data)
+                token_data = flow.authorize_current_session(email, session_data)
             else:
-                password = str(session_data.get("password") or "")
-            token_data = flow.authorize_from_session(email, session_data)
+                password = str(session_data.get("password") or password)
+                try:
+                    token_data = flow.authorize_from_session(email, session_data)
+                except PhoneVerificationError:
+                    raise
+                except RuntimeError as exc:
+                    if not password:
+                        raise
+                    print(f"[授权] 已保存会话不可用，改用账号密码重新登录后授权: {exc}")
+                    session_data = flow.login(email, password, create_checkout=False)
+                    save_login_session_db(email, password, session_data)
+                    token_data = flow.authorize_current_session(email, session_data)
             save_authorization_token_db(email, password, token_data)
     except KeyboardInterrupt:
         raise SystemExit("\n[中断] 用户取消")

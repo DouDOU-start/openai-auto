@@ -5,6 +5,7 @@ import hmac
 import json
 import secrets
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,13 @@ SUBSCRIPTION_STATUSES = {
     SUBSCRIPTION_STATUS_VERIFIED,
     SUBSCRIPTION_STATUS_FAILED,
 }
+NON_PAID_SUBSCRIPTION_TYPES = {"", NULL_VALUE, "none", "free"}
 _file_write_lock = threading.RLock()
+_accounts_db_init_lock = threading.RLock()
+_accounts_db_initialized_path: Path | None = None
+_account_stats_cache_lock = threading.RLock()
+_account_stats_cache: tuple[float, dict[str, Any]] | None = None
+_ACCOUNT_STATS_CACHE_SECONDS = 5.0
 _AIRGATE_EXPORT_TZ = timezone(timedelta(hours=8))
 _AIRGATE_EXPORT_VERSION = 1
 _AIRGATE_EXPORT_PLATFORM = "openai"
@@ -57,110 +64,147 @@ def init_accounts_db() -> None:
     """初始化账号数据库表，不影响 auth_core 已使用的 system_kv 表。"""
 
     db_manager = _db_manager()
-    with db_manager.get_db_conn(is_write=True) as conn:
-        cursor = db_manager.get_cursor(conn)
-        db_manager.execute_sql(
-            cursor,
-            """
-            CREATE TABLE IF NOT EXISTS accounts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                password TEXT NOT NULL,
-                subscription_type TEXT DEFAULT 'null',
-                refresh_token TEXT DEFAULT 'null',
-                session_json TEXT DEFAULT 'null',
-                checkout_url TEXT DEFAULT 'null',
-                login_session_json TEXT DEFAULT 'null',
-                auth_token_json TEXT DEFAULT 'null',
-                checkout_json TEXT DEFAULT 'null',
-                subscription_status TEXT DEFAULT '待订阅',
-                subscription_operator_id INTEGER,
-                subscription_claimed_at TEXT,
-                subscription_claim_expires_at TEXT,
-                subscription_marked_at TEXT,
-                subscription_verified_at TEXT,
-                subscription_verify_attempts INTEGER DEFAULT 0,
-                subscription_verify_last_at TEXT,
-                subscription_verify_next_at TEXT,
-                subscription_verify_last_message TEXT DEFAULT 'null',
-                subscription_note TEXT DEFAULT 'null',
-                stock_status TEXT DEFAULT '未出库',
-                status TEXT DEFAULT 'active',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                last_login_at TEXT,
-                last_authorized_at TEXT
+    db_path = Path(getattr(db_manager, "DB_PATH", "data/data.db")).resolve()
+    global _accounts_db_initialized_path
+    with _accounts_db_init_lock:
+        if _accounts_db_initialized_path == db_path and db_path.exists():
+            return
+
+        with db_manager.get_db_conn(is_write=True) as conn:
+            cursor = db_manager.get_cursor(conn)
+            db_manager.execute_sql(
+                cursor,
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    password TEXT NOT NULL,
+                    subscription_type TEXT DEFAULT 'null',
+                    refresh_token TEXT DEFAULT 'null',
+                    session_json TEXT DEFAULT 'null',
+                    checkout_url TEXT DEFAULT 'null',
+                    login_session_json TEXT DEFAULT 'null',
+                    auth_token_json TEXT DEFAULT 'null',
+                    checkout_json TEXT DEFAULT 'null',
+                    subscription_status TEXT DEFAULT '待订阅',
+                    subscription_operator_id INTEGER,
+                    subscription_claimed_at TEXT,
+                    subscription_claim_expires_at TEXT,
+                    subscription_marked_at TEXT,
+                    subscription_verified_at TEXT,
+                    subscription_verify_attempts INTEGER DEFAULT 0,
+                    subscription_verify_last_at TEXT,
+                    subscription_verify_next_at TEXT,
+                    subscription_verify_last_message TEXT DEFAULT 'null',
+                    subscription_note TEXT DEFAULT 'null',
+                    stock_status TEXT DEFAULT '未出库',
+                    status TEXT DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login_at TEXT,
+                    last_authorized_at TEXT
+                )
+                """,
             )
-            """,
-        )
-        _ensure_accounts_column(cursor, "checkout_url", "TEXT DEFAULT 'null'")
-        _ensure_accounts_column(cursor, "login_session_json", "TEXT DEFAULT 'null'")
-        _ensure_accounts_column(cursor, "auth_token_json", "TEXT DEFAULT 'null'")
-        _ensure_accounts_column(cursor, "checkout_json", "TEXT DEFAULT 'null'")
-        _ensure_accounts_column(cursor, "subscription_status", "TEXT DEFAULT '待订阅'")
-        _ensure_accounts_column(cursor, "subscription_operator_id", "INTEGER")
-        _ensure_accounts_column(cursor, "subscription_claimed_at", "TEXT")
-        _ensure_accounts_column(cursor, "subscription_claim_expires_at", "TEXT")
-        _ensure_accounts_column(cursor, "subscription_marked_at", "TEXT")
-        _ensure_accounts_column(cursor, "subscription_verified_at", "TEXT")
-        _ensure_accounts_column(cursor, "subscription_verify_attempts", "INTEGER DEFAULT 0")
-        _ensure_accounts_column(cursor, "subscription_verify_last_at", "TEXT")
-        _ensure_accounts_column(cursor, "subscription_verify_next_at", "TEXT")
-        _ensure_accounts_column(cursor, "subscription_verify_last_message", "TEXT DEFAULT 'null'")
-        _ensure_accounts_column(cursor, "subscription_note", "TEXT DEFAULT 'null'")
-        _ensure_accounts_column(cursor, "stock_status", "TEXT DEFAULT '未出库'")
-        _drop_accounts_column(cursor, "source")
-        db_manager.execute_sql(
-            cursor,
-            "UPDATE accounts SET stock_status = ? WHERE lower(stock_status) IN ('out', 'sold', 'used', '1', 'true', 'yes')",
-            (STOCK_STATUS_OUT,),
-        )
-        db_manager.execute_sql(
-            cursor,
-            "UPDATE accounts SET stock_status = ? WHERE stock_status IS NULL OR stock_status = '' OR stock_status NOT IN (?, ?)",
-            (STOCK_STATUS_IN, STOCK_STATUS_IN, STOCK_STATUS_OUT),
-        )
-        db_manager.execute_sql(
-            cursor,
-            "UPDATE accounts SET subscription_status = ? WHERE subscription_status IS NULL OR subscription_status = '' OR subscription_status NOT IN (?, ?, ?, ?, ?)",
-            (
-                SUBSCRIPTION_STATUS_PENDING,
-                SUBSCRIPTION_STATUS_PENDING,
-                SUBSCRIPTION_STATUS_CLAIMED,
-                SUBSCRIPTION_STATUS_MARKED,
-                SUBSCRIPTION_STATUS_VERIFIED,
-                SUBSCRIPTION_STATUS_FAILED,
-            ),
-        )
-        db_manager.execute_sql(
-            cursor,
-            "CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)",
-        )
-        db_manager.execute_sql(
-            cursor,
-            "CREATE INDEX IF NOT EXISTS idx_accounts_stock_status ON accounts(stock_status)",
-        )
-        db_manager.execute_sql(
-            cursor,
-            "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_status ON accounts(subscription_status)",
-        )
-        db_manager.execute_sql(
-            cursor,
-            "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_operator ON accounts(subscription_operator_id)",
-        )
-        db_manager.execute_sql(
-            cursor,
-            "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_verify_next_at ON accounts(subscription_status, subscription_verify_next_at)",
-        )
-        db_manager.execute_sql(
-            cursor,
-            "CREATE INDEX IF NOT EXISTS idx_accounts_updated_at ON accounts(updated_at)",
-        )
-        db_manager.execute_sql(
-            cursor,
-            "CREATE INDEX IF NOT EXISTS idx_accounts_created_at ON accounts(created_at)",
-        )
-        _init_web_auth_tables(cursor)
+            _ensure_accounts_column(cursor, "checkout_url", "TEXT DEFAULT 'null'")
+            _ensure_accounts_column(cursor, "login_session_json", "TEXT DEFAULT 'null'")
+            _ensure_accounts_column(cursor, "auth_token_json", "TEXT DEFAULT 'null'")
+            _ensure_accounts_column(cursor, "checkout_json", "TEXT DEFAULT 'null'")
+            _ensure_accounts_column(cursor, "subscription_status", "TEXT DEFAULT '待订阅'")
+            _ensure_accounts_column(cursor, "subscription_operator_id", "INTEGER")
+            _ensure_accounts_column(cursor, "subscription_claimed_at", "TEXT")
+            _ensure_accounts_column(cursor, "subscription_claim_expires_at", "TEXT")
+            _ensure_accounts_column(cursor, "subscription_marked_at", "TEXT")
+            _ensure_accounts_column(cursor, "subscription_verified_at", "TEXT")
+            _ensure_accounts_column(cursor, "subscription_verify_attempts", "INTEGER DEFAULT 0")
+            _ensure_accounts_column(cursor, "subscription_verify_last_at", "TEXT")
+            _ensure_accounts_column(cursor, "subscription_verify_next_at", "TEXT")
+            _ensure_accounts_column(cursor, "subscription_verify_last_message", "TEXT DEFAULT 'null'")
+            _ensure_accounts_column(cursor, "subscription_note", "TEXT DEFAULT 'null'")
+            _ensure_accounts_column(cursor, "stock_status", "TEXT DEFAULT '未出库'")
+            _drop_accounts_column(cursor, "source")
+            db_manager.execute_sql(
+                cursor,
+                "UPDATE accounts SET stock_status = ? WHERE lower(stock_status) IN ('out', 'sold', 'used', '1', 'true', 'yes')",
+                (STOCK_STATUS_OUT,),
+            )
+            db_manager.execute_sql(
+                cursor,
+                "UPDATE accounts SET stock_status = ? WHERE stock_status IS NULL OR stock_status = '' OR stock_status NOT IN (?, ?)",
+                (STOCK_STATUS_IN, STOCK_STATUS_IN, STOCK_STATUS_OUT),
+            )
+            db_manager.execute_sql(
+                cursor,
+                "UPDATE accounts SET subscription_status = ? WHERE subscription_status IS NULL OR subscription_status = '' OR subscription_status NOT IN (?, ?, ?, ?, ?)",
+                (
+                    SUBSCRIPTION_STATUS_PENDING,
+                    SUBSCRIPTION_STATUS_PENDING,
+                    SUBSCRIPTION_STATUS_CLAIMED,
+                    SUBSCRIPTION_STATUS_MARKED,
+                    SUBSCRIPTION_STATUS_VERIFIED,
+                    SUBSCRIPTION_STATUS_FAILED,
+                ),
+            )
+            db_manager.execute_sql(
+                cursor,
+                f"""
+                UPDATE accounts
+                SET subscription_status = ?,
+                    subscription_verified_at = COALESCE(NULLIF(subscription_verified_at, 'null'), ?),
+                    subscription_verify_next_at = ?,
+                    subscription_verify_last_message = CASE
+                        WHEN subscription_verify_last_message IS NULL OR subscription_verify_last_message = '' OR subscription_verify_last_message = 'null'
+                        THEN '已确认订阅 · ' || subscription_type
+                        ELSE subscription_verify_last_message
+                    END,
+                    updated_at = ?
+                WHERE NOT {_sql_non_paid_subscription_predicate()}
+                  AND subscription_status != ?
+                """,
+                (
+                    SUBSCRIPTION_STATUS_VERIFIED,
+                    utc_now(),
+                    NULL_VALUE,
+                    utc_now(),
+                    SUBSCRIPTION_STATUS_VERIFIED,
+                ),
+            )
+            db_manager.execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)",
+            )
+            db_manager.execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_accounts_stock_status ON accounts(stock_status)",
+            )
+            db_manager.execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_status ON accounts(subscription_status)",
+            )
+            db_manager.execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_operator ON accounts(subscription_operator_id)",
+            )
+            db_manager.execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_accounts_subscription_verify_next_at ON accounts(subscription_status, subscription_verify_next_at)",
+            )
+            db_manager.execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_accounts_updated_at ON accounts(updated_at)",
+            )
+            db_manager.execute_sql(
+                cursor,
+                "CREATE INDEX IF NOT EXISTS idx_accounts_created_at ON accounts(created_at)",
+            )
+            _init_web_auth_tables(cursor)
+        _accounts_db_initialized_path = db_path
+
+
+def _invalidate_account_stats_cache() -> None:
+    global _account_stats_cache
+    with _account_stats_cache_lock:
+        _account_stats_cache = None
 
 
 def _init_web_auth_tables(cursor: Any) -> None:
@@ -272,6 +316,7 @@ def _build_account_filter(
     plan: str,
     stock_status: str,
     subscription_status: str,
+    rt_status: str = "",
 ) -> tuple[str, tuple[str, ...]]:
     where: list[str] = []
     params: list[str] = []
@@ -294,8 +339,31 @@ def _build_account_filter(
     if subscription_status and subscription_status != "all":
         where.append("subscription_status = ?")
         params.append(_normalize_subscription_status(subscription_status))
+    if rt_status == "has":
+        where.append("refresh_token IS NOT NULL AND refresh_token != 'null' AND refresh_token != ''")
+    elif rt_status == "none":
+        where.append("(refresh_token IS NULL OR refresh_token = 'null' OR refresh_token = '')")
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     return where_sql, tuple(params)
+
+
+def _account_order_sql(sort_by: str = "", sort_dir: str = "") -> str:
+    columns = {
+        "created_at": "created_at",
+        "updated_at": "updated_at",
+    }
+    column = columns.get(str(sort_by or "").strip().lower(), "created_at")
+    direction = "ASC" if str(sort_dir or "").strip().lower() == "asc" else "DESC"
+    return f"ORDER BY {column} {direction}, id {direction}"
+
+
+def _is_paid_subscription_type(value: object) -> bool:
+    normalized = _field(value).strip().lower()
+    return normalized not in NON_PAID_SUBSCRIPTION_TYPES
+
+
+def _sql_non_paid_subscription_predicate(column: str = "subscription_type") -> str:
+    return f"(COALESCE(LOWER(TRIM({column})), '') IN ('', 'null', 'none', 'free'))"
 
 
 def list_account_rows(
@@ -304,13 +372,17 @@ def list_account_rows(
     plan: str = "",
     stock_status: str = "",
     subscription_status: str = "",
+    rt_status: str = "",
     page: int = 1,
     page_size: int = 0,
+    sort_by: str = "created_at",
+    sort_dir: str = "desc",
 ) -> list[dict[str, str]]:
     """按条件读取账号管理页列表。page_size=0 表示不分页，返回所有匹配项。"""
 
     init_accounts_db()
-    where_sql, params = _build_account_filter(search, status, plan, stock_status, subscription_status)
+    where_sql, params = _build_account_filter(search, status, plan, stock_status, subscription_status, rt_status)
+    order_sql = _account_order_sql(sort_by, sort_dir)
 
     limit_sql = ""
     extra_params: tuple[Any, ...] = ()
@@ -336,7 +408,7 @@ def list_account_rows(
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             {where_sql}
-            ORDER BY created_at DESC, id DESC
+            {order_sql}
             {limit_sql}
             """,
             params + extra_params,
@@ -400,11 +472,12 @@ def count_account_rows(
     plan: str = "",
     stock_status: str = "",
     subscription_status: str = "",
+    rt_status: str = "",
 ) -> int:
     """返回按条件过滤后的账号总数。"""
 
     init_accounts_db()
-    where_sql, params = _build_account_filter(search, status, plan, stock_status, subscription_status)
+    where_sql, params = _build_account_filter(search, status, plan, stock_status, subscription_status, rt_status)
     db_manager = _db_manager()
     with db_manager.get_db_conn() as conn:
         cursor = db_manager.get_cursor(conn)
@@ -423,7 +496,7 @@ def get_account_db(account_id: int) -> dict[str, str] | None:
         cursor = db_manager.get_cursor(conn)
         row = db_manager.execute_sql(
             cursor,
-            """
+            f"""
             SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
@@ -573,6 +646,7 @@ def save_account_db_record(data: dict[str, Any], account_id: int | None = None) 
     saved = get_account_db(saved_id)
     if saved is None:
         raise RuntimeError("账号保存后读取失败")
+    _invalidate_account_stats_cache()
     return saved
 
 
@@ -653,6 +727,7 @@ def update_account_checkout_url_db(
     account = _get_account_db_by_email(normalized_email)
     if account is None:
         raise RuntimeError("账号 checkout 长链接更新后读取失败")
+    _invalidate_account_stats_cache()
     return account
 
 
@@ -668,16 +743,44 @@ def update_account_subscription_type_db(account_id: int, subscription_type: str)
     now = utc_now()
     with db_manager.get_db_conn(is_write=True) as conn:
         cursor = db_manager.get_cursor(conn)
-        db_manager.execute_sql(
-            cursor,
-            "UPDATE accounts SET subscription_type = ?, updated_at = ? WHERE id = ?",
-            (normalized, now, account_id),
-        )
-        if cursor.rowcount <= 0:
-            raise KeyError(f"账号不存在: {account_id}")
+        if _is_paid_subscription_type(normalized):
+            db_manager.execute_sql(
+                cursor,
+                """
+                UPDATE accounts
+                SET subscription_type = ?,
+                    subscription_status = ?,
+                    subscription_verified_at = COALESCE(NULLIF(subscription_verified_at, 'null'), ?),
+                    subscription_verify_next_at = ?,
+                    subscription_verify_last_message = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    normalized,
+                    SUBSCRIPTION_STATUS_VERIFIED,
+                    now,
+                    NULL_VALUE,
+                    f"已确认订阅 · {normalized}",
+                    now,
+                    account_id,
+                ),
+            )
+            if cursor.rowcount <= 0:
+                raise KeyError(f"账号不存在: {account_id}")
+            _invalidate_account_stats_cache()
+        else:
+            db_manager.execute_sql(
+                cursor,
+                "UPDATE accounts SET subscription_type = ?, updated_at = ? WHERE id = ?",
+                (normalized, now, account_id),
+            )
+            if cursor.rowcount <= 0:
+                raise KeyError(f"账号不存在: {account_id}")
     account = get_account_db(account_id)
     if account is None:
         raise RuntimeError("账号订阅类型更新后读取失败")
+    _invalidate_account_stats_cache()
     return account
 
 
@@ -710,6 +813,7 @@ def update_account_stock_status_db(account_id: int, stock_status: str) -> dict[s
     account = get_account_db(account_id)
     if account is None:
         raise RuntimeError("账号出库状态更新后读取失败")
+    _invalidate_account_stats_cache()
     return account
 
 
@@ -735,6 +839,7 @@ def update_account_status_db(account_id: int, status: str) -> dict[str, str]:
     account = get_account_db(account_id)
     if account is None:
         raise RuntimeError("账号状态更新后读取失败")
+    _invalidate_account_stats_cache()
     return account
 
 
@@ -744,30 +849,37 @@ def delete_account_db(account_id: int) -> bool:
     with db_manager.get_db_conn(is_write=True) as conn:
         cursor = db_manager.get_cursor(conn)
         db_manager.execute_sql(cursor, "DELETE FROM accounts WHERE id = ?", (account_id,))
-        return cursor.rowcount > 0
+        deleted = cursor.rowcount > 0
+    if deleted:
+        _invalidate_account_stats_cache()
+    return deleted
 
 
 def account_stats_db() -> dict[str, Any]:
+    global _account_stats_cache
+    now = time.monotonic()
+    with _account_stats_cache_lock:
+        if _account_stats_cache is not None:
+            cached_at, cached_stats = _account_stats_cache
+            if now - cached_at <= _ACCOUNT_STATS_CACHE_SECONDS:
+                return dict(cached_stats)
+
     init_accounts_db()
     db_manager = _db_manager()
     with db_manager.get_db_conn(as_dict=True) as conn:
         cursor = db_manager.get_cursor(conn)
-        total = cursor.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-        with_rt = cursor.execute(
-            "SELECT COUNT(*) FROM accounts WHERE refresh_token IS NOT NULL AND refresh_token != 'null' AND refresh_token != ''"
-        ).fetchone()[0]
-        with_session = cursor.execute(
-            "SELECT COUNT(*) FROM accounts WHERE session_json IS NOT NULL AND session_json != 'null' AND session_json != ''"
-        ).fetchone()[0]
-        with_checkout = cursor.execute(
-            "SELECT COUNT(*) FROM accounts WHERE checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''"
-        ).fetchone()[0]
-        with_login_session = cursor.execute(
-            "SELECT COUNT(*) FROM accounts WHERE login_session_json IS NOT NULL AND login_session_json != 'null' AND login_session_json != ''"
-        ).fetchone()[0]
-        with_auth_token = cursor.execute(
-            "SELECT COUNT(*) FROM accounts WHERE auth_token_json IS NOT NULL AND auth_token_json != 'null' AND auth_token_json != ''"
-        ).fetchone()[0]
+        counts = cursor.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN refresh_token IS NOT NULL AND refresh_token != 'null' AND refresh_token != '' THEN 1 ELSE 0 END) AS with_rt,
+                SUM(CASE WHEN session_json IS NOT NULL AND session_json != 'null' AND session_json != '' THEN 1 ELSE 0 END) AS with_session,
+                SUM(CASE WHEN checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != '' THEN 1 ELSE 0 END) AS with_checkout,
+                SUM(CASE WHEN login_session_json IS NOT NULL AND login_session_json != 'null' AND login_session_json != '' THEN 1 ELSE 0 END) AS with_login_session,
+                SUM(CASE WHEN auth_token_json IS NOT NULL AND auth_token_json != 'null' AND auth_token_json != '' THEN 1 ELSE 0 END) AS with_auth_token
+            FROM accounts
+            """
+        ).fetchone()
         plans = cursor.execute(
             "SELECT subscription_type, COUNT(*) FROM accounts GROUP BY subscription_type ORDER BY COUNT(*) DESC"
         ).fetchall()
@@ -808,13 +920,13 @@ def account_stats_db() -> dict[str, Any]:
                 SUBSCRIPTION_STATUS_FAILED,
             ),
         ).fetchall()
-    return {
-        "total": total,
-        "with_rt": with_rt,
-        "with_session": with_session,
-        "with_checkout": with_checkout,
-        "with_login_session": with_login_session,
-        "with_auth_token": with_auth_token,
+    stats = {
+        "total": int(counts["total"] or 0),
+        "with_rt": int(counts["with_rt"] or 0),
+        "with_session": int(counts["with_session"] or 0),
+        "with_checkout": int(counts["with_checkout"] or 0),
+        "with_login_session": int(counts["with_login_session"] or 0),
+        "with_auth_token": int(counts["with_auth_token"] or 0),
         "plans": {str(plan or NULL_VALUE): count for plan, count in plans},
         "statuses": {str(item_status or NULL_VALUE): count for item_status, count in statuses},
         "stock_statuses": _stock_status_counts(stock_statuses),
@@ -839,6 +951,9 @@ def account_stats_db() -> dict[str, Any]:
             for row in operator_stats
         ],
     }
+    with _account_stats_cache_lock:
+        _account_stats_cache = (time.monotonic(), dict(stats))
+    return stats
 
 
 def count_subscription_queue_db() -> int:
@@ -848,11 +963,12 @@ def count_subscription_queue_db() -> int:
         cursor = db_manager.get_cursor(conn)
         row = db_manager.execute_sql(
             cursor,
-            """
+            f"""
             SELECT COUNT(*)
             FROM accounts
             WHERE stock_status = ?
               AND COALESCE(status, '') != ?
+              AND {_sql_non_paid_subscription_predicate()}
               AND checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''
             """,
             (STOCK_STATUS_IN, ACCOUNT_STATUS_ABANDONED),
@@ -909,6 +1025,7 @@ def list_subscription_queue_db(
             FROM accounts
             WHERE stock_status = ?
               AND COALESCE(status, '') != ?
+              AND {_sql_non_paid_subscription_predicate()}
               AND checkout_url IS NOT NULL AND checkout_url != 'null' AND checkout_url != ''
               AND (
                     subscription_status IN ({status_placeholders})
@@ -979,6 +1096,7 @@ def update_subscription_verification_tracking_db(
             )
             if cursor.rowcount <= 0:
                 raise KeyError(f"账号不存在: {account_id}")
+        _invalidate_account_stats_cache()
     account = get_account_db(int(account_id))
     if account is None:
         raise RuntimeError("账号核实追踪更新后读取失败")
@@ -1011,6 +1129,7 @@ def list_due_subscription_verification_accounts_db(
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             WHERE subscription_status = ?
+              AND {_sql_non_paid_subscription_predicate()}
               AND COALESCE(subscription_verify_attempts, 0) < ?
               AND (
                     subscription_verify_next_at IS NULL
@@ -1049,7 +1168,7 @@ def claim_subscription_account_db(account_id: int, operator_user_id: int, *, cla
         row = db_manager.execute_sql(
             cursor,
             """
-            SELECT status, subscription_status, subscription_operator_id, subscription_claim_expires_at
+            SELECT status, subscription_type, subscription_status, subscription_operator_id, subscription_claim_expires_at
             FROM accounts
             WHERE id = ?
             """,
@@ -1060,6 +1179,9 @@ def claim_subscription_account_db(account_id: int, operator_user_id: int, *, cla
         account_status = _field(row["status"]) if "status" in row.keys() else ACCOUNT_STATUS_ACTIVE
         if account_status == ACCOUNT_STATUS_ABANDONED:
             raise ValueError("废弃账号不允许操作")
+        current_plan = _field(row["subscription_type"]) if "subscription_type" in row.keys() else NULL_VALUE
+        if _is_paid_subscription_type(current_plan):
+            raise ValueError("账号已是付费订阅，不需要领取")
         current_status = _field(row["subscription_status"]) if "subscription_status" in row.keys() else SUBSCRIPTION_STATUS_PENDING
         current_operator = _field(row["subscription_operator_id"]) if "subscription_operator_id" in row.keys() else NULL_VALUE
         current_expires = _field(row["subscription_claim_expires_at"]) if "subscription_claim_expires_at" in row.keys() else NULL_VALUE
@@ -1101,6 +1223,7 @@ def claim_subscription_account_db(account_id: int, operator_user_id: int, *, cla
     )
     if account is None:
         raise RuntimeError("账号领取后读取失败")
+    _invalidate_account_stats_cache()
     return account
 
 
@@ -1161,7 +1284,7 @@ def verify_subscription_account_db(account_id: int, *, note: str = "") -> dict[s
         note=note,
         clear_claim=False,
         verified_field="subscription_verified_at",
-        allowed_current_statuses=(SUBSCRIPTION_STATUS_MARKED, SUBSCRIPTION_STATUS_VERIFIED),
+        allowed_current_statuses=(SUBSCRIPTION_STATUS_PENDING, SUBSCRIPTION_STATUS_CLAIMED, SUBSCRIPTION_STATUS_MARKED, SUBSCRIPTION_STATUS_VERIFIED),
     )
     return update_subscription_verification_tracking_db(
         account_id,
@@ -1261,6 +1384,7 @@ def _update_subscription_account_status(
             f"UPDATE accounts SET {', '.join(updates)} WHERE id = ?",
             (*params, int(account_id)),
         )
+    _invalidate_account_stats_cache()
     account = get_account_db(int(account_id))
     if account is None:
         raise RuntimeError("账号订阅状态更新后读取失败")
@@ -1573,6 +1697,8 @@ def delete_web_user(user_id: int) -> dict[str, Any]:
         deleted = db_manager.execute_sql(cursor, "DELETE FROM web_users WHERE id = ?", (int(user_id),))
         if deleted.rowcount <= 0:
             raise KeyError(f"用户不存在: {user_id}")
+    if str(current.get("role") or "").strip().lower() == AUTH_ROLE_OPERATOR:
+        _invalidate_account_stats_cache()
     return current
 
 
@@ -2010,7 +2136,10 @@ def save_login_session_db(email: str, password: str, session_data: dict[str, Any
         )
         if cursor.rowcount <= 0:
             return None
-    return _get_account_db_by_email(normalized_email)
+    account = _get_account_db_by_email(normalized_email)
+    if account is not None:
+        _invalidate_account_stats_cache()
+    return account
 
 
 def save_authorization_token_db(email: str, password: str, token_data: dict[str, Any]) -> dict[str, str] | None:
@@ -2042,7 +2171,10 @@ def save_authorization_token_db(email: str, password: str, token_data: dict[str,
         )
         if cursor.rowcount <= 0:
             return None
-    return _get_account_db_by_email(normalized_email)
+    account = _get_account_db_by_email(normalized_email)
+    if account is not None:
+        _invalidate_account_stats_cache()
+    return account
 
 
 def try_load_login_session_db(email: str) -> dict[str, Any] | None:
@@ -2192,6 +2324,7 @@ def _upsert_account_db(fields: list[str], source: str) -> None:
                     last_authorized_at,
                 ),
             )
+            _invalidate_account_stats_cache()
             return
 
         old_fields = [
@@ -2233,6 +2366,7 @@ def _upsert_account_db(fields: list[str], source: str) -> None:
                 old_fields[0],
             ),
         )
+    _invalidate_account_stats_cache()
 
 
 def _normalize_account_fields(fields: list[str]) -> list[str] | None:

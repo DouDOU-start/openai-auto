@@ -49,20 +49,22 @@ class AirGateCoreClient:
         self.admin_key = str(admin_key or "").strip()
         self.timeout = max(1, int(timeout or 30))
 
-    def list_accounts(self, *, platform: str = "openai", state: str = "disabled", page_size: int = 100) -> list[dict[str, Any]]:
+    def list_accounts(self, *, platform: str = "openai", state: str = "", page_size: int = 100) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         page = 1
         total = None
         while True:
+            params: dict[str, Any] = {
+                "platform": platform,
+                "page": page,
+                "page_size": min(100, max(1, int(page_size or 100))),
+            }
+            if state:
+                params["state"] = state
             payload = self._request(
                 "GET",
                 "/admin/accounts",
-                params={
-                    "platform": platform,
-                    "state": state,
-                    "page": page,
-                    "page_size": min(100, max(1, int(page_size or 100))),
-                },
+                params=params,
             )
             batch = payload.get("list") if isinstance(payload, dict) else None
             if not isinstance(batch, list):
@@ -91,6 +93,9 @@ class AirGateCoreClient:
         }
         data = self._request("PUT", f"/admin/accounts/{int(account_id)}", json_body=payload)
         return data if isinstance(data, dict) else {}
+
+    def delete_account(self, account_id: int) -> None:
+        self._request("DELETE", f"/admin/accounts/{int(account_id)}")
 
     def _request(
         self,
@@ -159,6 +164,7 @@ class AirGate401Monitor:
         self._last_success: list[str] = []
         self._last_skipped: list[str] = []
         self._last_failed: list[str] = []
+        self._last_deleted: list[str] = []
         self._last_candidates = 0
 
     def start(self, config: AirGateMonitorConfig | None = None) -> dict[str, Any]:
@@ -209,6 +215,7 @@ class AirGate401Monitor:
                 "last_success": list(self._last_success[-20:]),
                 "last_skipped": list(self._last_skipped[-20:]),
                 "last_failed": list(self._last_failed[-20:]),
+                "last_deleted": list(self._last_deleted[-20:]),
                 "last_candidates": self._last_candidates,
             }
 
@@ -241,7 +248,7 @@ class AirGate401Monitor:
 
         client = AirGateCoreClient(config.core_url, config.admin_key, timeout=self._settings_factory().timeout)
         try:
-            candidates = client.list_accounts(platform="openai", state="disabled", page_size=config.page_size)
+            candidates = client.list_accounts(platform="openai", page_size=config.page_size)
         except Exception as exc:
             with self._lock:
                 self._last_error = str(exc)
@@ -252,27 +259,35 @@ class AirGate401Monitor:
         success: list[str] = []
         skipped: list[str] = []
         failed: list[str] = []
+        deleted: list[str] = []
         processed = 0
         jobs: list[tuple[dict[str, Any], str]] = []
         for account in candidates:
             if not isinstance(account, dict):
                 continue
-            if not _looks_like_401_account(account):
-                skipped.append(_describe_account(account, "skip"))
-                continue
-            processed += 1
             email = _account_email(account)
             if not email:
-                skipped.append(_describe_account(account, "missing email"))
+                if _looks_like_401_account(account):
+                    processed += 1
+                    skipped.append(_describe_account(account, "missing email"))
                 continue
             local_account = get_account_db_by_email(email)
+            if _is_local_account_abandoned(local_account):
+                try:
+                    client.delete_account(int(account.get("id") or 0))
+                except Exception as exc:
+                    failed.append(f"{_describe_account(account, 'delete failed')}: {exc}")
+                    print(f"[AirGate] 删除已废弃账号失败: {email} (id={account.get('id')}) -> {exc}")
+                else:
+                    deleted.append(_describe_account(account, "deleted local abandoned"))
+                    print(f"[AirGate] 已删除 core 中的本地废弃账号: {email} (id={account.get('id')})")
+                continue
+            if not _looks_like_401_account(account):
+                continue
+            processed += 1
             if local_account is None:
                 skipped.append(_describe_account(account, "local missing"))
                 print(f"[AirGate] 跳过本地账号池缺失的账号: {email} (id={account.get('id')})")
-                continue
-            if str(local_account.get("status") or "").strip() == ACCOUNT_STATUS_ABANDONED:
-                skipped.append(_describe_account(account, "local abandoned"))
-                print(f"[AirGate] 跳过已废弃的本地账号: {email} (id={account.get('id')})")
                 continue
             print(f"[AirGate] 准备修复 core 账号: {email} (id={account.get('id')})")
             jobs.append((account, email))
@@ -304,6 +319,7 @@ class AirGate401Monitor:
             self._last_success = success
             self._last_skipped = skipped
             self._last_failed = failed
+            self._last_deleted = deleted
             self._last_candidates = processed
         return self.status()
 
@@ -507,6 +523,12 @@ def _account_email(account: dict[str, Any]) -> str:
 def _describe_account(account: dict[str, Any], suffix: str) -> str:
     email = _account_email(account) or _clean_text(account.get("name")) or f"#{account.get('id')}"
     return f"{email} ({suffix})"
+
+
+def _is_local_account_abandoned(account: dict[str, Any] | None) -> bool:
+    if account is None:
+        return False
+    return str(account.get("status") or "").strip() == ACCOUNT_STATUS_ABANDONED
 
 
 def _response_message(data: object, fallback_text: str) -> str:
