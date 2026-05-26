@@ -762,19 +762,21 @@ class RegisterFlow:
         max_retries = max(1, int(self.settings.otp_max_retries or 1))
         last_error = ""
         phone_attempt = 1
-        while phone_attempt <= max_retries:
+        while True:
             phone = self._read_phone_number(label, phone_attempt, max_retries, last_error)
             send_resp = self._send_phone_number(http, did, user_agent, ctx, current, phone)
             if send_resp.status_code == 200:
                 current = self._next_url_from_response(send_resp) or "https://auth.openai.com/phone-verification"
-                change_phone = False
-                for attempt in range(1, max_retries + 1):
-                    code = self.prompt(f"请输入手机号 {phone} 收到的短信验证码（第 {attempt}/{max_retries} 次，留空重发）: ").strip()
+                code_attempt = 1
+                while True:
+                    code = self.prompt(
+                        f"请输入手机号 {phone} 收到的短信验证码（第 {code_attempt}/{max_retries} 次，留空重发，输入“更换手机号”可换号）: "
+                    ).strip()
                     if self._is_change_phone_command(code):
                         print(f"[{label}] 已请求更换手机号")
                         last_error = "已请求更换手机号"
                         current = "https://auth.openai.com/add-phone"
-                        change_phone = True
+                        phone_attempt += 1
                         break
                     if not code:
                         last_error = "验证码为空"
@@ -787,23 +789,25 @@ class RegisterFlow:
                         print(f"[{label}] 手机号验证完成")
                         return final_url
                     last_error = self._response_text(verify_resp) or verify_resp.text[:300] or f"HTTP {verify_resp.status_code}"
-                    if verify_resp.status_code == 401:
-                        print(f"[警告] {label} 手机验证码错误，准备重试")
+                    if self._should_retry_phone_otp(verify_resp, last_error):
+                        print(f"[警告] {label} 手机验证码错误，继续等待重新输入: {last_error}")
+                        code_attempt += 1
+                        if code_attempt > max_retries:
+                            print(f"[警告] {label} 手机验证码已连续失败 {max_retries} 次，继续等待验证码；也可以点击更换手机号")
+                            code_attempt = 1
                         continue
-                    if verify_resp.status_code in {429, 500, 502, 503, 504} and attempt < max_retries:
-                        print(f"[警告] {label} 手机验证码校验失败，准备重试: {last_error}")
-                        continue
-                    break
-                if change_phone:
+                    print(f"[警告] {label} 手机验证码校验未通过，继续等待重新输入或更换手机号: {last_error}")
+                    code_attempt += 1
+                    if code_attempt > max_retries:
+                        code_attempt = 1
                     continue
-                break
+                continue
             last_error = self._phone_submit_error(send_resp)
-            if self._should_retry_phone_number(send_resp, last_error) and phone_attempt < max_retries:
+            if self._should_retry_phone_number(send_resp, last_error):
                 print(f"[警告] {label} 手机号不可用，请更换手机号后重试: {last_error}")
                 phone_attempt += 1
                 continue
             raise PhoneVerificationError(f"{label}手机号提交失败 HTTP {send_resp.status_code}: {last_error}")
-        raise PhoneVerificationError(f"{label}手机号验证失败，已重试 {max_retries} 轮: {last_error}")
 
     @staticmethod
     def _is_change_phone_command(value: str) -> bool:
@@ -812,11 +816,11 @@ class RegisterFlow:
 
     def _read_phone_number(self, label: str, attempt: int = 1, max_retries: int = 1, last_error: str = "") -> str:
         while True:
-            prompt = f"[{label}] 请输入手机号（必须带国家码，例如 +8613800000000，第 {attempt}/{max_retries} 次）: "
+            prompt = f"[{label}] 请输入手机号（必须带国家码，例如 +8613800000000，第 {attempt} 次）: "
             if last_error == "已请求更换手机号":
-                prompt = f"[{label}] 请重新输入手机号（必须带国家码，例如 +8613800000000，第 {attempt}/{max_retries} 次）: "
+                prompt = f"[{label}] 请重新输入手机号（必须带国家码，例如 +8613800000000，第 {attempt} 次）: "
             elif last_error:
-                prompt = f"[{label}] 上一个手机号不可用：{last_error}。请更换手机号（第 {attempt}/{max_retries} 次）: "
+                prompt = f"[{label}] 上一个手机号不可用：{last_error}。请更换手机号（第 {attempt} 次）: "
             phone = self.prompt(prompt).strip()
             if phone:
                 return phone
@@ -856,6 +860,27 @@ class RegisterFlow:
         if str(getattr(resp, "status_code", "") or "") == "400":
             return True
         return any(marker in text for marker in ("fraud_guard", "invalid_request_error", "phone", "number"))
+
+    @staticmethod
+    def _should_retry_phone_otp(resp: Any, error_text: str) -> bool:
+        status = int(getattr(resp, "status_code", 0) or 0)
+        text = str(error_text or "").lower()
+        if status in {401, 429, 500, 502, 503, 504}:
+            return True
+        if status == 400 and any(
+            marker in text
+            for marker in (
+                "invalid otp",
+                "invalid_otp",
+                "invalid code",
+                "invalid_code",
+                "invalid_input",
+                "please try again",
+                "otp",
+            )
+        ):
+            return True
+        return False
 
     def _resend_phone_otp(
         self,

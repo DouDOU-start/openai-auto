@@ -20,9 +20,16 @@ from curl_cffi import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from .config import AppConfig, load_app_config, save_airgate_monitor_config
+from .browser_session import BrowserAutomationError, BrowserLaunchError, open_url_in_fresh_browser
+from .config import (
+    AppConfig,
+    CheckoutSmsNumberConfig,
+    load_app_config,
+    save_airgate_monitor_config,
+    save_checkout_sms_config,
+)
 from .airgate_monitor import AirGate401Monitor, AirGateMonitorConfig
 from .flow import PHONE_CHANGE_COMMAND, PhoneVerificationError, RegisterFlow
 from .proxy_pool import pick_proxy_from_pool
@@ -186,6 +193,22 @@ class SubscriptionActionPayload(BaseModel):
 
 class ClaimPayload(BaseModel):
     claim_minutes: int = 30
+
+
+class OpenCheckoutPayload(BaseModel):
+    automation_js: str = ""
+
+
+class CheckoutSmsNumberPayload(BaseModel):
+    phone: str = ""
+    sms_url: str = ""
+    label: str = ""
+
+
+class CheckoutSmsPayload(BaseModel):
+    timeout: int = 180
+    poll: float = 2.0
+    numbers: list[CheckoutSmsNumberPayload] = Field(default_factory=list)
 
 
 WEB_SESSION_COOKIE = "protocol_reg_session"
@@ -1356,6 +1379,36 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         record_audit_log(int(user["id"]), "mark_failed", target_type="account", target_id=str(account_id), detail={"note": payload.note}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
         return {"item": _subscription_queue_item(saved, expose_checkout_url=True, operator_labels=_operator_label_map()), "stats": account_stats_db()}
 
+    @app.post("/api/operator/subscriptions/{account_id}/open-checkout")
+    def api_operator_open_checkout(account_id: int, payload: OpenCheckoutPayload, request: Request) -> dict[str, Any]:
+        user = _require_operator_permission(request, "view_subscription_accounts")
+        account = get_account_db(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        role = str(user.get("role") or "").strip().lower()
+        operator_id = str(account.get("subscription_operator_id") or "").strip()
+        if role == AUTH_ROLE_OPERATOR and operator_id != str(user.get("id") or ""):
+            raise HTTPException(status_code=403, detail="请先领取该账号，再打开 checkout")
+        checkout_url = str(account.get("checkout_url") or "").strip()
+        if not _has_value(checkout_url):
+            raise HTTPException(status_code=400, detail="该账号没有 checkout 长链接")
+        try:
+            result = _open_checkout_in_fresh_browser(checkout_url, runtime, automation_js=payload.automation_js)
+        except BrowserAutomationError as exc:
+            raise HTTPException(status_code=502, detail=f"JS 自动化失败: {exc}") from exc
+        except BrowserLaunchError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        record_audit_log(
+            int(user["id"]),
+            "open_checkout",
+            target_type="account",
+            target_id=str(account_id),
+            detail=result.to_public_dict(),
+            ip=_request_ip(request),
+            user_agent=str(request.headers.get("user-agent") or ""),
+        )
+        return {"opened": True, "browser": result.to_public_dict()}
+
     @app.post("/api/operator/subscriptions/{account_id}/release")
     def api_operator_release(account_id: int, request: Request) -> dict[str, Any]:
         user = _require_operator_permission(request, "claim_subscription_account")
@@ -1528,6 +1581,32 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         if account is None:
             raise HTTPException(status_code=404, detail="账号不存在")
         return {"item": _account_detail(account, _operator_label_map())}
+
+    @app.post("/api/accounts/{account_id}/open-checkout")
+    def api_open_account_checkout(account_id: int, payload: OpenCheckoutPayload, request: Request) -> dict[str, Any]:
+        user = _require_admin_user(request)
+        account = get_account_db(account_id)
+        if account is None:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        checkout_url = str(account.get("checkout_url") or "").strip()
+        if not _has_value(checkout_url):
+            raise HTTPException(status_code=400, detail="该账号没有 checkout 长链接")
+        try:
+            result = _open_checkout_in_fresh_browser(checkout_url, runtime, automation_js=payload.automation_js)
+        except BrowserAutomationError as exc:
+            raise HTTPException(status_code=502, detail=f"JS 自动化失败: {exc}") from exc
+        except BrowserLaunchError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        record_audit_log(
+            int(user["id"]),
+            "open_checkout",
+            target_type="account",
+            target_id=str(account_id),
+            detail=result.to_public_dict(),
+            ip=_request_ip(request),
+            user_agent=str(request.headers.get("user-agent") or ""),
+        )
+        return {"opened": True, "browser": result.to_public_dict()}
 
     @app.post("/api/accounts")
     def api_create_account(payload: AccountPayload) -> dict[str, Any]:
@@ -1741,6 +1820,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             "queue": manager.stats(),
             "auto": auto_scheduler.status(),
             "airgate": airgate_monitor.status(),
+            "checkout_sms": _checkout_sms_config_view(load_app_config(runtime.config_path)),
         }
 
     @app.get("/api/ops/jobs/{job_id}")
@@ -1801,6 +1881,32 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     @app.post("/api/ops/auto-register/stop")
     def api_auto_register_stop() -> dict[str, Any]:
         return {"auto": auto_scheduler.stop(), "queue": manager.stats(), "airgate": airgate_monitor.status()}
+
+    @app.get("/api/ops/checkout-sms")
+    def api_checkout_sms_config(request: Request) -> dict[str, Any]:
+        _require_admin_user(request)
+        return {"checkout_sms": _checkout_sms_config_view(load_app_config(runtime.config_path))}
+
+    @app.post("/api/ops/checkout-sms")
+    def api_checkout_sms_save(payload: CheckoutSmsPayload, request: Request) -> dict[str, Any]:
+        user = _require_admin_user(request)
+        numbers = _checkout_sms_numbers_from_payload(payload)
+        save_checkout_sms_config(
+            runtime.config_path,
+            tuple(numbers),
+            timeout=max(5, int(payload.timeout or 180)),
+            poll=max(1.0, float(payload.poll or 2.0)),
+        )
+        record_audit_log(
+            int(user["id"]),
+            "save_checkout_sms",
+            target_type="settings",
+            target_id="checkout_sms",
+            detail={"count": len(numbers)},
+            ip=_request_ip(request),
+            user_agent=str(request.headers.get("user-agent") or ""),
+        )
+        return {"checkout_sms": _checkout_sms_config_view(load_app_config(runtime.config_path)), "queue": manager.stats()}
 
     @app.get("/api/ops/airgate-monitor")
     def api_airgate_monitor_status() -> dict[str, Any]:
@@ -2210,6 +2316,59 @@ def _settings_from_runtime(runtime: WebRuntime, *, proxy: str | None = None) -> 
     )
 
 
+def _checkout_sms_config_view(cfg: AppConfig) -> dict[str, Any]:
+    return {
+        "timeout": max(5, int(cfg.checkout_sms_timeout or 180)),
+        "poll": max(1.0, float(cfg.checkout_sms_poll or 2.0)),
+        "numbers": [
+            {
+                "phone": item.phone,
+                "sms_url": item.sms_url,
+                "label": item.label,
+            }
+            for item in cfg.checkout_sms_numbers
+        ],
+    }
+
+
+def _checkout_sms_numbers_from_payload(payload: CheckoutSmsPayload) -> list[CheckoutSmsNumberConfig]:
+    numbers: list[CheckoutSmsNumberConfig] = []
+    seen: set[tuple[str, str]] = set()
+    for item in payload.numbers or []:
+        phone = str(item.phone or "").strip()
+        sms_url = str(item.sms_url or "").strip()
+        label = str(item.label or "").strip()
+        if not phone and not sms_url and not label:
+            continue
+        if not phone or not sms_url:
+            raise HTTPException(status_code=400, detail="每组短信配置都必须同时填写手机号和收码 URL")
+        if not (sms_url.startswith("http://") or sms_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="收码 URL 必须是 http/https 链接")
+        key = (phone, sms_url)
+        if key in seen:
+            continue
+        seen.add(key)
+        numbers.append(CheckoutSmsNumberConfig(phone=phone, sms_url=sms_url, label=label))
+    return numbers
+
+
+def _checkout_sms_runtime_config(runtime: WebRuntime) -> dict[str, Any]:
+    cfg = load_app_config(runtime.config_path)
+    view = _checkout_sms_config_view(cfg)
+    return {
+        "timeoutSeconds": view["timeout"],
+        "pollSeconds": view["poll"],
+        "numbers": [
+            {
+                "phone": item["phone"],
+                "smsUrl": item["sms_url"],
+                "label": item["label"],
+            }
+            for item in view["numbers"]
+        ],
+    }
+
+
 def _airgate_monitor_proxy(monitor: AirGate401Monitor) -> str:
     try:
         config = monitor.current_config()
@@ -2399,6 +2558,16 @@ def _store_checkout_for_account(email: str, checkout: object, runtime: WebRuntim
         return ""
     update_account_checkout_url_db(email, checkout_url, checkout if isinstance(checkout, dict) else None)
     return checkout_url
+
+
+def _open_checkout_in_fresh_browser(checkout_url: str, runtime: WebRuntime, *, automation_js: str = ""):
+    return open_url_in_fresh_browser(
+        checkout_url,
+        profile_root=(runtime.repo_root / "data" / "browser_profiles").resolve(),
+        automation_js=str(automation_js or ""),
+        inject_auto_filler=True,
+        checkout_sms=_checkout_sms_runtime_config(runtime),
+    )
 
 
 def _session_access_token(session_json: object) -> str:
@@ -2906,6 +3075,10 @@ HTML_PAGE = r"""
       display: none;
     }
 
+    body[data-page="tasks"] .checkout-sms-panel {
+      display: none;
+    }
+
     body[data-page="tasks"] .airgate-panel {
       display: none;
     }
@@ -3008,6 +3181,7 @@ HTML_PAGE = r"""
     }
 
     body[data-page="settings"] .auto-panel,
+    body[data-page="settings"] .checkout-sms-panel,
     body[data-page="settings"] .airgate-panel {
       border-radius: 18px;
       padding: 16px;
@@ -3017,8 +3191,19 @@ HTML_PAGE = r"""
     }
 
     body[data-page="settings"] .auto-controls,
+    body[data-page="settings"] .checkout-sms-controls,
     body[data-page="settings"] .airgate-controls {
       grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    body[data-page="settings"] .checkout-sms-controls .auto-field:nth-child(1),
+    body[data-page="settings"] .checkout-sms-controls .auto-field:nth-child(2) {
+      grid-column: span 1;
+    }
+
+    body[data-page="settings"] .checkout-sms-list,
+    body[data-page="settings"] .checkout-sms-actions {
+      grid-column: 1 / -1;
     }
 
     body[data-page="settings"] .airgate-controls .auto-field:nth-child(1),
@@ -3035,6 +3220,7 @@ HTML_PAGE = r"""
     }
 
     body[data-page="settings"] .airgate-controls button,
+    body[data-page="settings"] .checkout-sms-controls button,
     body[data-page="settings"] .auto-controls button {
       width: 100%;
       min-height: 42px;
@@ -3858,6 +4044,18 @@ HTML_PAGE = r"""
       min-width: 0;
     }
 
+    .checkout-sms-panel {
+      display: grid;
+      gap: 12px;
+      border: 1px solid rgba(17,16,13,.12);
+      border-radius: 20px;
+      padding: 14px;
+      background:
+        linear-gradient(135deg, rgba(44,121,216,.10), rgba(216,97,44,.08)),
+        rgba(255,255,255,.34);
+      min-width: 0;
+    }
+
     .auto-head {
       display: flex;
       justify-content: space-between;
@@ -3886,6 +4084,31 @@ HTML_PAGE = r"""
       align-items: end;
     }
 
+    .checkout-sms-controls {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(110px, 1fr)) minmax(170px, auto);
+      gap: 10px;
+      align-items: end;
+    }
+
+    .checkout-sms-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .checkout-sms-row {
+      display: grid;
+      grid-template-columns: minmax(110px, .7fr) minmax(220px, 1.4fr) minmax(100px, .7fr) auto;
+      gap: 8px;
+      align-items: end;
+    }
+
+    .checkout-sms-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
     .auto-field {
       display: grid;
       gap: 6px;
@@ -3895,6 +4118,7 @@ HTML_PAGE = r"""
 
     .auto-field input { width: 100%; }
     .airgate-controls .auto-field input { width: 100%; }
+    .checkout-sms-controls .auto-field input { width: 100%; }
 
     .auto-summary {
       color: var(--muted);
@@ -4371,6 +4595,7 @@ HTML_PAGE = r"""
             <label>Checkout 长链接</label>
             <div class="input-wrap">
               <input id="checkoutUrl" class="copy-on-click" readonly placeholder="生成 checkout 后自动保存" />
+              <button class="input-icon" type="button" id="openCheckoutBtn" title="用全新浏览器环境打开 checkout" aria-label="打开">↗</button>
               <button class="input-icon" type="button" id="regenCheckoutBtn" title="生成 / 重新生成 checkout" aria-label="生成">+</button>
             </div>
           </div>
@@ -4452,6 +4677,24 @@ HTML_PAGE = r"""
               <button class="ghost" type="button" id="autoStopBtn">停止</button>
             </div>
           </div>
+          <div class="checkout-sms-panel">
+            <div class="auto-head">
+              <div>
+                <div class="auto-title">Checkout 短信收码</div>
+                <div class="auto-summary" id="checkoutSmsSummary">未配置</div>
+              </div>
+              <span class="tab-badge" id="checkoutSmsState" data-status="idle">未配置</span>
+            </div>
+            <div class="checkout-sms-controls">
+              <label class="auto-field">等待秒数<input id="checkoutSmsTimeout" type="number" min="5" value="180" /></label>
+              <label class="auto-field">轮询秒数<input id="checkoutSmsPoll" type="number" min="1" step="0.5" value="2" /></label>
+              <div class="checkout-sms-list" id="checkoutSmsList"></div>
+              <div class="checkout-sms-actions">
+                <button class="ghost" type="button" id="checkoutSmsAddBtn">新增号码</button>
+                <button class="secondary" type="button" id="checkoutSmsSaveBtn">保存收码配置</button>
+              </div>
+            </div>
+          </div>
           <div class="airgate-panel">
             <div class="auto-head">
               <div>
@@ -4507,6 +4750,8 @@ HTML_PAGE = r"""
       queue: {},
       auto: {},
       airgate: {},
+      checkoutSms: { timeout: 180, poll: 2.0, numbers: [] },
+      checkoutSmsDirty: false,
       currentJobId: null,
       jobSelectionLocked: false,
       promptDrafts: {},
@@ -5036,6 +5281,7 @@ HTML_PAGE = r"""
 
     function updateCheckoutButton(id = $('accountId').value) {
       $('regenCheckoutBtn').disabled = !id;
+      $('openCheckoutBtn').disabled = !id || !hasValue($('checkoutUrl').value);
     }
 
     function updateSessionButton(id = $('accountId').value) {
@@ -5659,6 +5905,65 @@ HTML_PAGE = r"""
       $('autoSummary').textContent = `每 ${auto.interval_seconds}s 投放 ${auto.batch_count} 个注册任务 · ${checkoutText} · 已投放 ${auto.run_count || 0} 轮 · 上次 ${last} · 下次约 ${nextLeft}s 后${error}`;
     }
 
+    function checkoutSmsRows() {
+      return Array.from(document.querySelectorAll('.checkout-sms-row')).map((row) => ({
+        phone: row.querySelector('[data-checkout-sms-phone]')?.value.trim() || '',
+        sms_url: row.querySelector('[data-checkout-sms-url]')?.value.trim() || '',
+        label: row.querySelector('[data-checkout-sms-label]')?.value.trim() || '',
+      }));
+    }
+
+    function addCheckoutSmsRow(item = {}) {
+      const list = $('checkoutSmsList');
+      const row = document.createElement('div');
+      row.className = 'checkout-sms-row';
+      row.innerHTML = `
+        <label class="auto-field">手机号<input data-checkout-sms-phone type="text" placeholder="5822599791" value="${escapeHtml(item.phone || '')}" /></label>
+        <label class="auto-field">收码 URL<input data-checkout-sms-url type="text" placeholder="http://a.62-us.com/api/get_sms?key=..." value="${escapeHtml(item.sms_url || item.smsUrl || '')}" /></label>
+        <label class="auto-field">备注<input data-checkout-sms-label type="text" placeholder="可选" value="${escapeHtml(item.label || '')}" /></label>
+        <button class="ghost" type="button" data-checkout-sms-remove>删除</button>
+      `;
+      row.querySelector('[data-checkout-sms-remove]').addEventListener('click', () => {
+        row.remove();
+        state.checkoutSmsDirty = true;
+        renderCheckoutSmsSummaryFromForm();
+      });
+      row.querySelectorAll('input').forEach((input) => {
+        input.addEventListener('input', () => {
+          state.checkoutSmsDirty = true;
+          renderCheckoutSmsSummaryFromForm();
+        });
+      });
+      list.appendChild(row);
+      renderCheckoutSmsSummaryFromForm();
+    }
+
+    function renderCheckoutSmsPanel() {
+      const config = state.checkoutSms || {};
+      const numbers = Array.isArray(config.numbers) ? config.numbers : [];
+      if (document.activeElement !== $('checkoutSmsTimeout')) {
+        $('checkoutSmsTimeout').value = String(config.timeout || 180);
+      }
+      if (document.activeElement !== $('checkoutSmsPoll')) {
+        $('checkoutSmsPoll').value = String(config.poll || 2);
+      }
+      $('checkoutSmsList').innerHTML = '';
+      (numbers.length ? numbers : [{}]).forEach(addCheckoutSmsRow);
+      renderCheckoutSmsSummaryFromForm();
+    }
+
+    function renderCheckoutSmsSummaryFromForm() {
+      const rows = checkoutSmsRows().filter((item) => hasValue(item.phone) || hasValue(item.sms_url));
+      const complete = rows.filter((item) => hasValue(item.phone) && hasValue(item.sms_url));
+      const badge = $('checkoutSmsState');
+      badge.textContent = complete.length ? `已配置 ${complete.length} 组` : '未配置';
+      badge.dataset.status = complete.length ? 'idle' : 'danger';
+      const first = complete[0];
+      $('checkoutSmsSummary').textContent = complete.length
+        ? `打开 checkout 时默认使用第一组：${first.phone}${first.label ? ` · ${first.label}` : ''}；可配置多组备用。`
+        : '请至少配置一组手机号和收码 URL。';
+    }
+
     function renderAirgatePanel() {
       const airgate = state.airgate || {};
       const enabled = Boolean(airgate.enabled);
@@ -5850,6 +6155,7 @@ HTML_PAGE = r"""
       state.queue = data.queue || {};
       state.auto = data.auto || {};
       state.airgate = data.airgate || state.airgate;
+      if (data.checkout_sms && !state.checkoutSmsDirty) state.checkoutSms = data.checkout_sms;
       prunePromptDrafts();
       if (!state.initialJobApplied && state.initialJobId && state.jobs.some((job) => String(job.id) === String(state.initialJobId))) {
         state.currentJobId = state.initialJobId;
@@ -5890,6 +6196,7 @@ HTML_PAGE = r"""
       }
       renderQueueSummary();
       renderAutoPanel();
+      if (pageMode === 'settings' && !state.checkoutSmsDirty) renderCheckoutSmsPanel();
       renderAirgatePanel();
       selectJob(state.currentJobId);
       const selected = currentJob();
@@ -5960,6 +6267,27 @@ HTML_PAGE = r"""
         batch_count: Math.min(20, Math.max(1, Math.trunc(Number($('autoBatchCount').value || 1)))),
         create_checkout: true,
       };
+    }
+
+    function checkoutSmsPayload() {
+      return {
+        timeout: Math.max(5, Math.trunc(Number($('checkoutSmsTimeout').value || 180))),
+        poll: Math.max(1, Number($('checkoutSmsPoll').value || 2)),
+        numbers: checkoutSmsRows().filter((item) => hasValue(item.phone) || hasValue(item.sms_url) || hasValue(item.label)),
+      };
+    }
+
+    async function saveCheckoutSmsConfig() {
+      const data = await request('/api/ops/checkout-sms', {
+        method: 'POST',
+        body: JSON.stringify(checkoutSmsPayload()),
+      });
+      state.checkoutSms = data.checkout_sms || { timeout: 180, poll: 2, numbers: [] };
+      state.checkoutSmsDirty = false;
+      state.queue = data.queue || state.queue;
+      renderCheckoutSmsPanel();
+      renderQueueSummary();
+      toast('Checkout 收码配置已保存');
     }
 
     async function saveAutoRegisterConfig() {
@@ -6164,6 +6492,26 @@ HTML_PAGE = r"""
       toast('已开始重新生成 checkout');
     }
 
+    async function openCheckoutFresh() {
+      const accountId = Number($('accountId').value || 0);
+      if (!accountId) return toast('请先选择账号');
+      if (!hasValue($('checkoutUrl').value)) return toast('当前账号没有 checkout 长链接');
+      const button = $('openCheckoutBtn');
+      button.disabled = true;
+      button.classList.add('is-loading');
+      try {
+        const data = await request(`/api/accounts/${accountId}/open-checkout`, {
+          method: 'POST',
+          body: JSON.stringify({ automation_js: '' }),
+        });
+        const browser = data.browser || {};
+        toast(browser.browser ? `已打开全新浏览器：${browser.browser}` : '已打开全新浏览器环境');
+      } finally {
+        button.classList.remove('is-loading');
+        updateCheckoutButton();
+      }
+    }
+
     async function refreshSession() {
       const accountId = Number($('accountId').value || 0);
       if (!accountId) return toast('请先选择账号');
@@ -6363,6 +6711,7 @@ HTML_PAGE = r"""
     $('batchClearBtn').addEventListener('click', clearSelection);
     $('copyLineBtn').addEventListener('click', () => copyText(compactLine(), '账号行已复制'));
     $('refreshPlanBtn').addEventListener('click', () => refreshSubscriptionType().catch((err) => toast(err.message)));
+    $('openCheckoutBtn').addEventListener('click', () => openCheckoutFresh().catch((err) => toast(err.message)));
     $('regenCheckoutBtn').addEventListener('click', () => regenerateCheckout().catch((err) => toast(err.message)));
     $('refreshSessionBtn').addEventListener('click', () => refreshSession().catch((err) => toast(err.message)));
     $('authorizeBtn').addEventListener('click', () => authorizeAccount().catch((err) => toast(err.message)));
@@ -6370,6 +6719,11 @@ HTML_PAGE = r"""
     $('autoSaveBtn').addEventListener('click', () => saveAutoRegisterConfig().catch((err) => toast(err.message)));
     $('autoStartBtn').addEventListener('click', () => startAutoRegister().catch((err) => toast(err.message)));
     $('autoStopBtn').addEventListener('click', () => stopAutoRegister().catch((err) => toast(err.message)));
+    $('checkoutSmsAddBtn').addEventListener('click', () => {
+      state.checkoutSmsDirty = true;
+      addCheckoutSmsRow();
+    });
+    $('checkoutSmsSaveBtn').addEventListener('click', () => saveCheckoutSmsConfig().catch((err) => toast(err.message)));
     $('airgateSaveBtn').addEventListener('click', () => saveAirgateMonitorConfig().catch((err) => toast(err.message)));
     $('airgateStartBtn').addEventListener('click', () => startAirgateMonitor().catch((err) => toast(err.message)));
     $('airgateStopBtn').addEventListener('click', () => stopAirgateMonitor().catch((err) => toast(err.message)));
@@ -7829,7 +8183,7 @@ OPERATOR_PAGE = r"""
       color: var(--muted);
       font-size: 12px;
     }
-    .mini-pill, .status-pill, .checkout-link, .checkout-copy {
+    .mini-pill, .status-pill, .checkout-link, .checkout-copy, .checkout-open {
       display: inline-flex;
       align-items: center;
       width: fit-content;
@@ -7869,6 +8223,12 @@ OPERATOR_PAGE = r"""
       color: #fff;
       background: var(--accent-2);
       border-color: var(--accent-2);
+      font-weight: 800;
+    }
+    .checkout-open {
+      color: #fff;
+      background: var(--accent);
+      border-color: var(--accent);
       font-weight: 800;
     }
     .checkout-copy.copied {
@@ -8146,6 +8506,20 @@ OPERATOR_PAGE = r"""
         setTimeout(() => node.classList.remove('copied'), 700);
       }
     }
+    async function openCheckoutFresh(id, node) {
+      if (!id) return toast('缺少账号 ID');
+      if (node) node.disabled = true;
+      try {
+        const data = await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/open-checkout`, {
+          method: 'POST',
+          body: JSON.stringify({ automation_js: '' }),
+        });
+        const browser = data.browser || {};
+        toast(browser.browser ? `已打开全新浏览器：${browser.browser}` : '已打开全新浏览器环境');
+      } finally {
+        if (node) node.disabled = false;
+      }
+    }
     async function loadCurrentUser() {
       const data = await request('/api/auth/me');
       const user = data.user || {};
@@ -8211,7 +8585,7 @@ OPERATOR_PAGE = r"""
           ? `
             <div class="checkout-stack">
               <div class="checkout-actions">
-                <a class="checkout-link" href="${escapeHtml(item.checkout_url)}" target="_blank" rel="noopener noreferrer">打开链接</a>
+                <button type="button" class="checkout-open" data-open-checkout="${escapeHtml(item.id)}">全新打开</button>
                 <button type="button" class="checkout-copy" data-copy-checkout="${escapeHtml(item.checkout_url)}">复制链接</button>
               </div>
             </div>
@@ -8275,6 +8649,9 @@ OPERATOR_PAGE = r"""
       });
       document.querySelectorAll('[data-release]').forEach((button) => {
         button.addEventListener('click', () => releaseAccount(button.dataset.release).catch((err) => toast(err.message)));
+      });
+      document.querySelectorAll('[data-open-checkout]').forEach((button) => {
+        button.addEventListener('click', () => openCheckoutFresh(button.dataset.openCheckout, button).catch((err) => toast(err.message)));
       });
       document.querySelectorAll('[data-copy-checkout]').forEach((button) => {
         button.addEventListener('click', () => copyCheckoutLink(button.dataset.copyCheckout, button).catch((err) => toast(err.message)));

@@ -4,13 +4,11 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shutil
-import subprocess
 import sys
-import webbrowser
 
 import yaml
 
+from .browser_session import open_url_in_fresh_browser
 from .config import config_template, load_app_config
 from .flow import PhoneVerificationError, RegisterFlow
 from .proxy_pool import pick_proxy_from_pool
@@ -85,9 +83,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过 Plus/Stripe checkout 链路（仅登录/授权，不生成支付链接）",
     )
-    parser.add_argument("--open-checkout", dest="open_checkout", action="store_true", default=False, help="拿到支付链接后自动用系统浏览器打开，默认关闭")
+    parser.add_argument("--open-checkout", dest="open_checkout", action="store_true", default=False, help="拿到支付链接后自动用全新浏览器环境打开，默认关闭")
     parser.add_argument("--no-open-checkout", dest="open_checkout", action="store_false", help="只保存并显示支付长链接，不自动打开浏览器")
-    parser.add_argument("--incognito-checkout", action="store_true", help="自动打开支付链接时优先使用浏览器无痕模式")
+    parser.add_argument("--incognito-checkout", action="store_true", help="兼容旧参数；现在 --open-checkout 默认就是全新独立浏览器环境")
+    parser.add_argument("--checkout-js", default="", help="打开 checkout 后在新浏览器页面执行的 JavaScript 代码")
+    parser.add_argument("--checkout-js-file", default="", help="打开 checkout 后在新浏览器页面执行的 JavaScript 文件")
+    parser.add_argument("--checkout-auto-filler", dest="checkout_auto_filler", action="store_true", default=True, help="打开 checkout 时自动注入内置 PayPal/OpenAI/Stripe 填表脚本，默认开启")
+    parser.add_argument("--no-checkout-auto-filler", dest="checkout_auto_filler", action="store_false", help="打开 checkout 时不注入内置自动填表脚本")
+    parser.add_argument(
+        "--checkout-browser-profile-root",
+        default="",
+        help="checkout 独立浏览器 profile 根目录，默认 data/browser_profiles",
+    )
     return parser
 
 
@@ -351,6 +358,10 @@ def main() -> None:
         otp_poll_max_attempts=max(1, int(otp_poll_max_attempts)),
         use_proxy_for_email=bool(use_proxy_for_email),
     )
+    checkout_profile_root = _resolve_checkout_profile_root(repo_root, args.checkout_browser_profile_root)
+    checkout_automation_js = _resolve_checkout_automation_js(args.checkout_js, args.checkout_js_file)
+    if args.open_checkout and args.incognito_checkout:
+        print("[Plus] --incognito-checkout 已兼容为全新独立浏览器 profile")
 
     existing_emails = {account["email"] for account in load_account_records() if _usable_saved_account(account)}
     selected_account = _choose_authorize_account() if mode == "authorize" else None
@@ -388,7 +399,16 @@ def main() -> None:
                 flow.http.session,
                 token_data.get("chatgpt_session") if isinstance(token_data.get("chatgpt_session"), dict) else {},
             )
-            _handle_checkout(checkout, args.open_checkout, args.incognito_checkout, email=email)
+            _handle_checkout(
+                checkout,
+                args.open_checkout,
+                args.incognito_checkout,
+                email=email,
+                profile_root=checkout_profile_root,
+                automation_js=checkout_automation_js,
+                inject_auto_filler=args.checkout_auto_filler,
+                checkout_sms=_checkout_sms_runtime_config(cfg),
+            )
         elif mode == "login":
             session_data = flow.login(email, password, create_checkout=not args.no_checkout)
             save_login_session_db(email, password, session_data)
@@ -399,6 +419,10 @@ def main() -> None:
                     args.open_checkout,
                     args.incognito_checkout,
                     email=email,
+                    profile_root=checkout_profile_root,
+                    automation_js=checkout_automation_js,
+                    inject_auto_filler=args.checkout_auto_filler,
+                    checkout_sms=_checkout_sms_runtime_config(cfg),
                 )
             token_data = {}
         else:
@@ -498,6 +522,10 @@ def _handle_checkout(
     incognito: bool = False,
     *,
     email: str = "",
+    profile_root: Path | None = None,
+    automation_js: str = "",
+    inject_auto_filler: bool = True,
+    checkout_sms: dict[str, object] | None = None,
 ) -> str:
     _print_plus_trial_checkout(checkout)
     long_url = _checkout_long_url(checkout)
@@ -506,7 +534,15 @@ def _handle_checkout(
     if email:
         update_account_checkout_url_db(email, long_url, checkout if isinstance(checkout, dict) else None)
     if open_checkout:
-        _open_checkout_url(long_url, incognito=incognito)
+        if incognito:
+            print("[Plus] 使用全新独立浏览器 profile，已不复用系统浏览器环境")
+        _open_checkout_url(
+            long_url,
+            profile_root=profile_root or (_repo_root() / "data" / "browser_profiles"),
+            automation_js=automation_js,
+            inject_auto_filler=inject_auto_filler,
+            checkout_sms=checkout_sms,
+        )
     return long_url
 
 
@@ -520,101 +556,71 @@ def _checkout_long_url(checkout: object) -> str:
     return ""
 
 
-def _open_checkout_url(long_url: str, *, incognito: bool = False) -> None:
-    mode = "无痕模式" if incognito else "默认浏览器"
-    print(f"[Plus] 正在使用{mode}打开支付长链接: {long_url}")
-    if incognito and _open_with_incognito_browser(long_url):
-        return
-    if incognito:
-        print("[Plus] 无痕模式打开失败，回退到系统默认浏览器")
-    if _open_with_system_browser(long_url):
-        return
+def _open_checkout_url(
+    long_url: str,
+    *,
+    profile_root: Path,
+    automation_js: str = "",
+    inject_auto_filler: bool = True,
+    checkout_sms: dict[str, object] | None = None,
+) -> None:
+    print(f"[Plus] 正在使用全新浏览器环境打开支付长链接: {long_url}")
+    print("[Plus] 浏览器支付环境已设置 en-US；浏览器不会复用当前协议代理")
     try:
-        if webbrowser.open(long_url):
-            return
-    except Exception:
-        pass
-    print("[Plus] 自动打开浏览器失败，请手动复制上方支付链接")
-
-
-def _open_with_incognito_browser(url: str) -> bool:
-    for command in _incognito_browser_commands(url):
-        if not _command_available(command):
-            continue
-        if _run_open_command(command):
-            return True
-    return False
-
-
-def _incognito_browser_commands(url: str) -> list[list[str]]:
-    if _is_wsl():
-        return [
-            ["cmd.exe", "/c", "start", "", "msedge", "--inprivate", url],
-            ["cmd.exe", "/c", "start", "", "chrome", "--incognito", url],
-            ["cmd.exe", "/c", "start", "", "brave", "--incognito", url],
-        ]
-    commands = [
-        ["google-chrome", "--incognito", url],
-        ["google-chrome-stable", "--incognito", url],
-        ["chromium", "--incognito", url],
-        ["chromium-browser", "--incognito", url],
-        ["brave-browser", "--incognito", url],
-        ["microsoft-edge", "--inprivate", url],
-        ["msedge", "--inprivate", url],
-    ]
-    if sys.platform == "darwin":
-        commands = [
-            ["open", "-na", "Google Chrome", "--args", "--incognito", url],
-            ["open", "-na", "Microsoft Edge", "--args", "--inprivate", url],
-            ["open", "-na", "Brave Browser", "--args", "--incognito", url],
-        ]
-    return commands
-
-
-def _open_with_system_browser(url: str) -> bool:
-    commands: list[list[str]] = []
-    if _is_wsl():
-        commands.extend([
-            ["cmd.exe", "/c", "start", "", url],
-            ["wslview", url],
-        ])
-    commands.extend([
-        ["xdg-open", url],
-        ["open", url],
-    ])
-    for command in commands:
-        if not _command_available(command):
-            continue
-        if _run_open_command(command):
-            return True
-    return False
-
-
-def _command_available(command: list[str]) -> bool:
-    executable = command[0]
-    return executable in {"cmd.exe"} or shutil.which(executable) is not None
-
-
-def _run_open_command(command: list[str]) -> bool:
-    try:
-        completed = subprocess.run(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
+        result = open_url_in_fresh_browser(
+            long_url,
+            profile_root=profile_root,
+            automation_js=automation_js,
+            inject_auto_filler=inject_auto_filler,
+            checkout_sms=checkout_sms,
         )
-    except Exception:
-        return False
-    return completed.returncode == 0
+    except Exception as exc:
+        print(f"[Plus] 自动打开全新浏览器失败，请手动复制上方支付链接: {exc}")
+        return
+    print(f"[Plus] 已启动浏览器: {result.browser}")
+    print(f"[Plus] 本次独立环境目录: {result.profile_dir}")
+    if result.extension_dir:
+        print(f"[Plus] 已注入自动填表脚本: {result.extension_dir}")
+    if result.remote_debugging_port:
+        print(f"[Plus] DevTools 端口: {result.remote_debugging_port}")
+    if result.automation_result is not None:
+        print("[Plus] JS 自动化返回:")
+        print(json.dumps(result.automation_result, ensure_ascii=False, indent=2))
 
 
-def _is_wsl() -> bool:
-    if os.environ.get("WSL_DISTRO_NAME"):
-        return True
-    try:
-        return "microsoft" in Path("/proc/version").read_text(encoding="utf-8").lower()
-    except Exception:
-        return False
+def _resolve_checkout_profile_root(repo_root: Path, value: object) -> Path:
+    text = str(value or "").strip()
+    return Path(text).expanduser().resolve() if text else (repo_root / "data" / "browser_profiles").resolve()
+
+
+def _resolve_checkout_automation_js(js: object, js_file: object) -> str:
+    inline = str(js or "").strip()
+    file_value = str(js_file or "").strip()
+    if inline and file_value:
+        raise SystemExit("[错误] --checkout-js 和 --checkout-js-file 只能二选一")
+    if inline:
+        return inline
+    if not file_value:
+        return ""
+    path = Path(file_value).expanduser().resolve()
+    if not path.exists():
+        raise SystemExit(f"[错误] JS 自动化文件不存在: {path}")
+    return path.read_text(encoding="utf-8")
+
+
+def _checkout_sms_runtime_config(cfg: object) -> dict[str, object]:
+    return {
+        "timeoutSeconds": max(5, int(getattr(cfg, "checkout_sms_timeout", 180) or 180)),
+        "pollSeconds": max(1.0, float(getattr(cfg, "checkout_sms_poll", 2.0) or 2.0)),
+        "numbers": [
+            {
+                "phone": item.phone,
+                "smsUrl": item.sms_url,
+                "label": item.label,
+            }
+            for item in getattr(cfg, "checkout_sms_numbers", ()) or ()
+        ],
+    }
 
 
 def _positive_int(value: object, default: int) -> int:

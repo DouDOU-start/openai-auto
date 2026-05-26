@@ -86,9 +86,27 @@ class Settings:
     otp_poll_max_attempts: int = 20
     use_proxy_for_email: bool = False
 
+    # SMSBower 接码 API
+    smsbower_api_base: str = ""
+    smsbower_api_key: str = ""
+    smsbower_service: str = "dr"
+    smsbower_country: str = ""
+    smsbower_max_price: str = ""
+    smsbower_min_price: str = ""
+    smsbower_provider_ids: str = ""
+    smsbower_except_provider_ids: str = ""
+    smsbower_phone_exception: str = ""
+    smsbower_timeout: int = 180
+    smsbower_poll_interval: float = 5.0
+    use_proxy_for_smsbower: bool = True
+
     @property
     def email_code_proxies(self) -> dict[str, str] | None:
         return self.proxies if self.use_proxy_for_email else None
+
+    @property
+    def smsbower_proxies(self) -> dict[str, str] | None:
+        return self.proxies if self.use_proxy_for_smsbower else None
 
     @property
     def proxies(self) -> dict[str, str] | None:

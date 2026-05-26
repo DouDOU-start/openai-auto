@@ -74,10 +74,35 @@ uv run protocol-reg --mode register --proxy http://127.0.0.1:7897
 uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --open-checkout
 ```
 
-自动打开支付链接时使用无痕模式：
+`--open-checkout` 会优先启动 Chrome/Edge/Brave/Chromium，并且每次都创建全新的独立浏览器 profile，默认保存在 `data/browser_profiles/checkout-*`。该环境不会复用系统浏览器的 cookie、localStorage、扩展或登录状态。浏览器会设置为 `en-US` / `America/New_York` 倾向，但不会复用当前协议代理；网站最终识别国家仍可能取决于本机出口 IP。打开时会默认注入内置 PayPal/OpenAI/Stripe 自动填表脚本。
+
+旧参数 `--incognito-checkout` 仍可兼容，但现在不再只是无痕窗口，而是同样使用全新独立 profile：
 
 ```bash
 uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --open-checkout --incognito-checkout
+```
+
+需要指定浏览器可执行文件时：
+
+```bash
+PROTOCOL_REG_BROWSER="/path/to/chrome" uv run protocol-reg --mode register --open-checkout
+```
+
+需要在打开支付页后执行 JS 自动化时：
+
+```bash
+uv run protocol-reg --mode register --open-checkout --checkout-js "return document.title"
+uv run protocol-reg --mode register --open-checkout --checkout-js-file scripts/checkout_auto.js
+```
+
+内置自动填表脚本会作为临时 Chrome 扩展加载，能随 checkout 跳转持续在 `pay.openai.com`、`checkout.stripe.com` 和 `paypal.com` 页面生效。`--checkout-js` / `--checkout-js-file` 是额外的一次性 JS 执行入口，支持 `await`，返回值会打印到终端。
+
+PayPal 短信收码可以在 Web 设置页 `/settings` 的“Checkout 短信收码”里配置多组手机号和收码 URL。打开 checkout 时脚本默认使用第一组可用配置填写手机号，并轮询对应 URL 自动读取 6 位验证码后填写提交。配置也会保存到 `config/protocol-reg.yaml` 的 `checkout_sms.numbers`。
+
+需要关闭内置自动填表脚本时：
+
+```bash
+uv run protocol-reg --mode register --open-checkout --no-checkout-auto-filler
 ```
 
 仅登录并保存会话：
@@ -174,6 +199,43 @@ email_code:
 
 这个开关也兼容 `use_proxy_for_email` 写法。
 
+SMSBower 先作为独立工具接入，不会自动参与注册/登录手机号验证。SMSBower 文档页说明所有请求使用 `https://smsbower.page/stubs/handler_api.php`，并通过 `api_key`、`action` 参数调用；服务表中 OpenAI (ChatGPT) 的服务代码是 `dr`。后续租号、号码复用和实际提交手机号会再按业务策略适配。
+
+```yaml
+smsbower:
+  api: "https://smsbower.page/stubs/handler_api.php"
+  key: "你的 SMSBower API key"
+  service: "dr"
+  # 留空表示不指定国家；常用：美国实体号 187，美国虚拟号 12，中国 3，香港 14，加拿大 36，英国 16。
+  country: ""
+  max_price: ""
+  min_price: ""
+  timeout: 180
+  poll: 5.0
+  use_proxy: true
+```
+
+CLI 也支持临时覆盖：
+
+```bash
+SMSBOWER_API_KEY="你的 key" uv run protocol-reg-smsbower balance
+```
+
+查 OpenAI (ChatGPT) 便宜国家/供应商：
+
+```bash
+uv run protocol-reg-smsbower cheap --service dr --limit 20 --min-count 1
+```
+
+取号和手动管理状态：
+
+```bash
+uv run protocol-reg-smsbower get-number --service dr --country 187 --max-price 0.5
+uv run protocol-reg-smsbower status 123456
+uv run protocol-reg-smsbower wait-code 123456
+uv run protocol-reg-smsbower set-status 123456 6
+```
+
 AirGate 401 自动修复也支持放进同一个配置文件里：
 
 ```yaml
@@ -201,7 +263,7 @@ data/data.db
 uv run protocol-reg-web
 ```
 
-默认监听 `0.0.0.0:8765`，会读取 `config/protocol-reg.yaml`，同一局域网设备可以访问 `http://本机局域网IP:8765`。管理员页支持搜索、筛选、新建、编辑、删除账号记录，可以按订阅状态查看领取人、领取/点击/确认时间、自动核实进度和备注，也可以把账号标记为“出库”或恢复为“未出库”，并支持多选后批量出库、批量恢复未出库、批量重新登录并重新获取 checkout 支付链接、批量自动获取订阅类型、批量导出选中账号的 Session JSONL 和批量删除。页面还可以按需导出账号 TXT、Token JSONL 和 Checkout JSONL，并查看、复制账号的 checkout 长链接。`/operator` 是操作员订阅工作台，会持续自动核实已点击订阅的账号，并显示当前核实进度、下次核实时间和回填结果；`/admin/users` 保留用户管理、全局统计与按操作员展开的订阅统计，操作员权限仍是固定的，不再单独拆分细项。`/tasks` 页面里的“执行任务”面板可以直接执行 `register`、`login` 和 `authorize`；注册模式默认勾选随机邮箱、随机密码和生成 checkout，可填写任务数一次启动多个注册任务，多余任务会按 `max_concurrency` 排队。`/settings` 页面里可以调整自动注册的间隔和每轮注册数，并单独启停自动注册；自动注册固定生成 checkout。遇到邮箱验证码时任务会暂停并等待页面提交验证码，配置了 cloudflare-email 时仍会自动读取验证码。
+默认监听 `0.0.0.0:8765`，会读取 `config/protocol-reg.yaml`，同一局域网设备可以访问 `http://本机局域网IP:8765`。管理员页支持搜索、筛选、新建、编辑、删除账号记录，可以按订阅状态查看领取人、领取/点击/确认时间、自动核实进度和备注，也可以把账号标记为“出库”或恢复为“未出库”，并支持多选后批量出库、批量恢复未出库、批量重新登录并重新获取 checkout 支付链接、批量自动获取订阅类型、批量导出选中账号的 Session JSONL 和批量删除。页面还可以按需导出账号 TXT、Token JSONL 和 Checkout JSONL，并查看、复制账号的 checkout 长链接；账号详情和 `/operator` 工作台都支持用全新独立浏览器 profile 打开 checkout。`/operator` 是操作员订阅工作台，会持续自动核实已点击订阅的账号，并显示当前核实进度、下次核实时间和回填结果；`/admin/users` 保留用户管理、全局统计与按操作员展开的订阅统计，操作员权限仍是固定的，不再单独拆分细项。`/tasks` 页面里的“执行任务”面板可以直接执行 `register`、`login` 和 `authorize`；注册模式默认勾选随机邮箱、随机密码和生成 checkout，可填写任务数一次启动多个注册任务，多余任务会按 `max_concurrency` 排队。`/settings` 页面里可以调整自动注册的间隔和每轮注册数，并单独启停自动注册；自动注册固定生成 checkout。遇到邮箱验证码时任务会暂停并等待页面提交验证码，配置了 cloudflare-email 时仍会自动读取验证码。
 
 需要指定数据库、配置文件、代理或端口时：
 
@@ -262,7 +324,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 - 成功后把账号数据写入 `data/data.db` 的 `accounts` 表，缺失字段写 `null`。
 - 程序调用 `https://chatgpt.com/backend-api/payments/checkout` 获取美区 Plus 0 刀试用 checkout 长链接（US/USD）。
 - 没有获取到支付长链接时，支付自动化直接失败，但已注册账号不会丢失。
-- 程序默认只显示并保存支付长链接，不自动打开浏览器；指定 `--open-checkout` 时才自动打开，配合 `--incognito-checkout` 会优先使用 Chrome/Edge/Brave/Chromium 无痕模式打开。
+- 程序默认只显示并保存支付长链接，不自动打开浏览器；指定 `--open-checkout` 时才自动打开，并且每次都使用全新的独立浏览器 profile，同时默认注入内置自动填表脚本。`--incognito-checkout` 作为旧参数保留兼容，但不会复用系统浏览器环境。
 
 登录流程：
 
@@ -287,7 +349,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 
 ## 边界
 
-- 当前版本支持人工手机号验证：触发手机号验证时会提示输入自有手机号和短信验证码，不接入接码平台。
+- 当前注册/登录流程仍使用人工手机号验证；SMSBower 只作为独立工具接出，租号、号码复用和自动提交会后续单独适配。
 - `login` 和 `authorize` 已拆开；`authorize` 优先使用已保存 cookies，没有 cookies 时会要求输入密码并即时登录。
 - `register` 和 `login` 不做 OAuth 授权，只获取 ChatGPT session 身份信息。
 - 当前版本不自动读邮箱；验证码由手动输入。

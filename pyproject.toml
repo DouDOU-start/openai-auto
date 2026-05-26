@@ -32,6 +32,7 @@ dependencies = [
 [project.scripts]
 protocol-reg = "protocol_reg.cli:main"
 protocol-reg-web = "protocol_reg.web:main"
+protocol-reg-smsbower = "protocol_reg.smsbower_cli:main"
 
 [tool.uv]
 package = true
@@ -42,3 +43,4 @@ include = ["protocol_reg*", "utils*"]
 
 [tool.setuptools.package-data]
 utils = ["auth_core*.so", "auth_core*.pyd"]
+protocol_reg = ["checkout_auto_filler.user.js"]

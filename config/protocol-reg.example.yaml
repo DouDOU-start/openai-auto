@@ -28,6 +28,38 @@ email_code:
   otp_poll_max_attempts: 20
   # cloudflare-email API 是否也走当前任务代理；自建邮箱 API 通常保持 false。兼容 use_proxy_for_email 写法。
   use_proxy: false
+smsbower:
+  # SMSBower API 地址；文档要求请求 https://smsbower.page/stubs/handler_api.php。
+  api: "https://smsbower.page/stubs/handler_api.php"
+  # SMSBower API key；当前只供 protocol-reg-smsbower 独立工具使用，不会自动接入注册/登录流程。
+  key: ""
+  # 服务代码；SMSBower 服务表中 OpenAI (ChatGPT) 为 dr。
+  service: "dr"
+  # 国家代码；留空表示不指定。常用：美国实体号 187，美国虚拟号 12，中国 3，香港 14，加拿大 36，英国 16。
+  country: ""
+  # 可选价格过滤；留空表示不限制。
+  max_price: ""
+  min_price: ""
+  # 可选供应商过滤，多个 ID 用英文逗号分隔。
+  provider_ids: ""
+  except_provider_ids: ""
+  # 可选排除号码前缀，多个前缀用英文逗号分隔，例如 7918,7900111。
+  phone_exception: ""
+  # 等待短信验证码的最长秒数。
+  timeout: 180
+  # 轮询短信验证码的间隔秒数，最小会按 1 秒处理。
+  poll: 5.0
+  # SMSBower API 是否也走当前任务代理。
+  use_proxy: true
+checkout_sms:
+  # checkout 浏览器里 PayPal 手机验证的自动收码配置。可配置多个号码，脚本会按顺序选择。
+  timeout: 180
+  # 轮询短信链接的间隔秒数，最小会按 1 秒处理。
+  poll: 2.0
+  numbers:
+    - phone: "你的手机号"
+      sms_url: "http://a.62-us.com/api/get_sms?key=你的key"
+      label: "62-us PayPal"
 airgate_monitor:
   # AirGate core 的 admin API 基地址，例如 http://127.0.0.1:8080
   core_url: ""
