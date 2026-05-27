@@ -55,6 +55,7 @@ from .storage import (
     build_checkout_db_jsonl,
     build_tokens_db_jsonl,
     account_stats_db,
+    abandon_subscription_account_db,
     authenticate_web_user,
     claim_subscription_account_db,
     count_account_rows,
@@ -661,16 +662,16 @@ class JobManager:
             resolved_payload = payload.model_copy(
                 update={"mode": mode, "email": email, "password": password},
             )
-            proxy, proxy_count = self._next_proxy_locked(cfg)
+            proxy, proxy_count, proxy_label = self._next_proxy_locked(cfg, mode)
             job = WebJob(id=secrets.token_hex(8), mode=mode, email=email, proxy=proxy)
             self._jobs[job.id] = job
             self._queue.append((job, resolved_payload, proxy))
             self._refresh_queue_positions_locked()
             job.log(f"[队列] 已入队，排队位置 {job.queue_position}，并发上限 {self.max_concurrency}")
             if proxy_count > 1:
-                job.log(f"[代理] 轮询选择 {proxy_preview(proxy)}（代理池 {proxy_count} 个）")
+                job.log(f"[代理] {proxy_label}轮询选择 {proxy_preview(proxy)}（代理池 {proxy_count} 个）")
             elif proxy:
-                job.log(f"[代理] 使用 {proxy_preview(proxy)}")
+                job.log(f"[代理] {proxy_label}使用 {proxy_preview(proxy)}")
             to_start = self._schedule_locked()
         self._start_workers(to_start)
         return job
@@ -844,9 +845,9 @@ class JobManager:
         for job in sorted(completed, key=lambda item: item.updated_at)[: len(self._jobs) - 120]:
             self._jobs.pop(job.id, None)
 
-    def _next_proxy_locked(self, cfg: AppConfig) -> tuple[str, int]:
-        pool = _resolve_runtime_proxy_pool(self.runtime, cfg)
-        return pick_proxy_from_pool(pool), len(pool)
+    def _next_proxy_locked(self, cfg: AppConfig, mode: str = "") -> tuple[str, int, str]:
+        pool = _resolve_runtime_proxy_pool(self.runtime, cfg, mode=mode)
+        return pick_proxy_from_pool(pool), len(pool), "OAuth 授权专用" if _is_authorize_mode(mode) else ""
 
     def _archive_failed_job(self, job: WebJob) -> None:
         try:
@@ -1591,6 +1592,21 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         record_audit_log(int(user["id"]), "mark_failed", target_type="account", target_id=str(account_id), detail={"note": payload.note}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
         return {"item": _subscription_queue_item(saved, expose_checkout_url=True, operator_labels=_operator_label_map()), "stats": account_stats_db()}
+
+    @app.post("/api/operator/subscriptions/{account_id}/abandon")
+    def api_operator_abandon_subscription(account_id: int, payload: SubscriptionActionPayload, request: Request) -> dict[str, Any]:
+        user = _require_operator_user(request)
+        if not (_has_operator_permission(user, "abandon_subscription_account") or _has_operator_permission(user, "mark_subscription_failed")):
+            raise HTTPException(status_code=403, detail="当前账号没有该操作权限")
+        operator_id = None if str(user.get("role") or "").strip().lower() == AUTH_ROLE_ADMIN else int(user["id"])
+        try:
+            saved = abandon_subscription_account_db(account_id, operator_id, note=payload.note)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        record_audit_log(int(user["id"]), "abandon_subscription", target_type="account", target_id=str(account_id), detail={"note": payload.note}, ip=_request_ip(request), user_agent=str(request.headers.get("user-agent") or ""))
+        return {"item": _subscription_queue_item(saved, expose_checkout_url=True, operator_labels=_operator_label_map()), "stats": account_stats_db(), "abandoned": True}
 
     @app.post("/api/operator/subscriptions/{account_id}/open-checkout")
     def api_operator_open_checkout(account_id: int, payload: OpenCheckoutPayload, request: Request) -> dict[str, Any]:
@@ -2531,10 +2547,27 @@ def _job_view(job: WebJob) -> dict[str, Any]:
     }
 
 
-def _resolve_runtime_proxy_pool(runtime: WebRuntime, cfg: AppConfig | None = None) -> tuple[str, ...]:
+def _resolve_runtime_proxy_pool(
+    runtime: WebRuntime,
+    cfg: AppConfig | None = None,
+    *,
+    mode: str = "",
+) -> tuple[str, ...]:
     cfg = cfg or load_app_config(runtime.config_path)
+    runtime_pool = resolve_proxy_pool(runtime.proxy)
+    if runtime_pool:
+        return runtime_pool
+    authorize_env = resolve_proxy_pool(
+        os.environ.get("PROTOCOL_REG_AUTHORIZE_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_AUTHORIZE_PROXY", ""),
+        os.environ.get("PROTOCOL_REG_OAUTH_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_OAUTH_PROXY", ""),
+        cfg.authorize_proxies,
+        cfg.authorize_proxy,
+    )
+    if _is_authorize_mode(mode) and authorize_env:
+        return authorize_env
     return resolve_proxy_pool(
-        runtime.proxy,
         os.environ.get("PROTOCOL_REG_PROXIES", ""),
         os.environ.get("PROTOCOL_REG_PROXY", ""),
         cfg.proxies,
@@ -2607,6 +2640,10 @@ def _settings_from_runtime(runtime: WebRuntime, *, proxy: str | None = None) -> 
         use_proxy_for_smsbower=bool(use_proxy_for_smsbower),
         smsbower_reuse_limit=max(1, int(smsbower_reuse_limit)),
     )
+
+
+def _is_authorize_mode(mode: str) -> bool:
+    return str(mode or "").strip().lower() == "authorize"
 
 
 def _checkout_sms_config_view(cfg: AppConfig) -> dict[str, Any]:
@@ -7726,6 +7763,41 @@ ADMIN_USERS_PAGE = r"""
       transition: .18s ease;
     }
     .toast.show { opacity: 1; transform: translateY(0); }
+    .confirm-backdrop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 90;
+      padding: 22px;
+      background: rgba(17,16,13,.38);
+      backdrop-filter: blur(8px);
+    }
+    .confirm-backdrop.is-open { display: flex; }
+    .confirm-card {
+      width: min(420px, calc(100vw - 32px));
+      border-radius: 20px;
+      border: 1px solid rgba(17,16,13,.14);
+      background: rgba(245,239,226,.96);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .confirm-title {
+      font-family: var(--display);
+      font-size: 22px;
+      margin-bottom: 8px;
+    }
+    .confirm-message {
+      color: var(--muted);
+      line-height: 1.55;
+      margin-bottom: 16px;
+    }
+    .confirm-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
     @keyframes rise {
       from { opacity: 0; transform: translateY(18px); }
       to { opacity: 1; transform: translateY(0); }
@@ -7837,6 +7909,7 @@ ADMIN_USERS_PAGE = r"""
       ['claim_subscription_account', '领取订阅任务'],
       ['mark_subscription_done', '标记已订阅'],
       ['mark_subscription_failed', '标记失败'],
+      ['abandon_subscription_account', '废弃订阅账号'],
     ];
     const DEFAULT_PERMISSIONS = PERMISSIONS.map((item) => item[0]);
     let users = [];
@@ -8607,6 +8680,41 @@ OPERATOR_PAGE = r"""
       transition: .18s ease;
     }
     .toast.show { opacity: 1; transform: translateY(0); }
+    .confirm-backdrop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 90;
+      padding: 22px;
+      background: rgba(17,16,13,.38);
+      backdrop-filter: blur(8px);
+    }
+    .confirm-backdrop.is-open { display: flex; }
+    .confirm-card {
+      width: min(420px, calc(100vw - 32px));
+      border-radius: 20px;
+      border: 1px solid rgba(17,16,13,.14);
+      background: rgba(245,239,226,.96);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .confirm-title {
+      font-family: var(--display);
+      font-size: 22px;
+      margin-bottom: 8px;
+    }
+    .confirm-message {
+      color: var(--muted);
+      line-height: 1.55;
+      margin-bottom: 16px;
+    }
+    .confirm-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
     @keyframes rise {
       from { opacity: 0; transform: translateY(18px); }
       to { opacity: 1; transform: translateY(0); }
@@ -8675,6 +8783,16 @@ OPERATOR_PAGE = r"""
       </div>
     </section>
   </main>
+  <div class="confirm-backdrop" id="confirmBackdrop" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+    <div class="confirm-card">
+      <div class="confirm-title" id="confirmTitle">确认操作</div>
+      <div class="confirm-message" id="confirmMessage"></div>
+      <div class="confirm-actions">
+        <button type="button" id="confirmCancelBtn">取消</button>
+        <button class="bad" type="button" id="confirmOkBtn">确认</button>
+      </div>
+    </div>
+  </div>
   <div class="toast" id="toast"></div>
   <script>
     const $ = (id) => document.getElementById(id);
@@ -8683,6 +8801,7 @@ OPERATOR_PAGE = r"""
     let currentUser = {};
     let queueTimer = null;
     let queueLoadingPromise = null;
+    let confirmResolve = null;
     function hasValue(value) {
       const text = String(value ?? '').trim();
       return Boolean(text && text.toLowerCase() !== 'null');
@@ -8693,6 +8812,27 @@ OPERATOR_PAGE = r"""
       node.classList.add('show');
       clearTimeout(window.__toastTimer);
       window.__toastTimer = setTimeout(() => node.classList.remove('show'), 2200);
+    }
+    function showConfirm(message, options = {}) {
+      const { title = '确认操作', okText = '确认', cancelText = '取消', danger = false } = options;
+      $('confirmTitle').textContent = title;
+      $('confirmMessage').textContent = message;
+      $('confirmCancelBtn').textContent = cancelText;
+      const okBtn = $('confirmOkBtn');
+      okBtn.textContent = okText;
+      okBtn.className = danger ? 'bad' : 'primary';
+      $('confirmBackdrop').classList.add('is-open');
+      setTimeout(() => okBtn.focus(), 30);
+      return new Promise((resolve) => { confirmResolve = resolve; });
+    }
+    function closeConfirm(result) {
+      if (!$('confirmBackdrop').classList.contains('is-open')) return;
+      $('confirmBackdrop').classList.remove('is-open');
+      if (confirmResolve) {
+        const resolve = confirmResolve;
+        confirmResolve = null;
+        resolve(result);
+      }
     }
     async function request(url, options = {}) {
       const response = await fetch(url, { headers: { 'content-type': 'application/json' }, ...options });
@@ -8912,6 +9052,12 @@ OPERATOR_PAGE = r"""
         const canFinish = status === '处理中' && owned && hasPermission('mark_subscription_done');
         const canFail = status === '处理中' && owned && hasPermission('mark_subscription_failed');
         const canRelease = status === '处理中' && owned && hasPermission('claim_subscription_account');
+        const canAbandon = (hasPermission('abandon_subscription_account') || hasPermission('mark_subscription_failed')) && (
+          status === '已点击订阅' ||
+          status === '待订阅' ||
+          status === '订阅失败' ||
+          (status === '处理中' && (owned || currentUser.role === 'admin'))
+        );
         const actions = (() => {
           if (status === '处理中') {
             if (owned) {
@@ -8922,6 +9068,7 @@ OPERATOR_PAGE = r"""
                     <button type="button" data-submitted="${escapeHtml(item.id)}" class="good" ${canFinish ? '' : 'disabled'}>已订阅</button>
                     <button type="button" data-failed="${escapeHtml(item.id)}" class="bad" ${canFail ? '' : 'disabled'}>失败</button>
                     <button type="button" data-release="${escapeHtml(item.id)}" ${canRelease ? '' : 'disabled'}>释放</button>
+                    <button type="button" data-abandon-subscription="${escapeHtml(item.id)}" class="bad" ${canAbandon ? '' : 'disabled'}>废弃</button>
                   </div>
                 </div>
               `;
@@ -8931,12 +9078,24 @@ OPERATOR_PAGE = r"""
             }
             return '<span class="muted">处理中</span>';
           }
-          if (status === '已点击订阅') return '<span class="muted">自动核实中</span>';
+          if (status === '已点击订阅') {
+            return canAbandon
+              ? `<button type="button" data-abandon-subscription="${escapeHtml(item.id)}" class="bad">废弃</button>`
+              : '<span class="muted">自动核实中</span>';
+          }
           if (status === '已确认订阅') return '<span class="muted">已确认</span>';
           if (canClaim) {
-            return `<button type="button" data-claim="${escapeHtml(item.id)}" class="claim">${status === '订阅失败' ? '重新领取' : (owned ? '续领' : '领取')}</button>`;
+            const abandonButton = canAbandon ? `<button type="button" data-abandon-subscription="${escapeHtml(item.id)}" class="bad">废弃</button>` : '';
+            return `
+              <div class="action-row">
+                <button type="button" data-claim="${escapeHtml(item.id)}" class="claim">${status === '订阅失败' ? '重新领取' : (owned ? '续领' : '领取')}</button>
+                ${abandonButton}
+              </div>
+            `;
           }
-          return '<span class="muted">待处理</span>';
+          return canAbandon
+            ? `<button type="button" data-abandon-subscription="${escapeHtml(item.id)}" class="bad">废弃</button>`
+            : '<span class="muted">待处理</span>';
         })();
         return `
           <tr class="is-${tone}">
@@ -8966,6 +9125,9 @@ OPERATOR_PAGE = r"""
       });
       document.querySelectorAll('[data-release]').forEach((button) => {
         button.addEventListener('click', () => releaseAccount(button.dataset.release).catch((err) => toast(err.message)));
+      });
+      document.querySelectorAll('[data-abandon-subscription]').forEach((button) => {
+        button.addEventListener('click', () => abandonSubscription(button.dataset.abandonSubscription).catch((err) => toast(err.message)));
       });
       document.querySelectorAll('[data-open-checkout]').forEach((button) => {
         button.addEventListener('click', () => openCheckoutFresh(button.dataset.openCheckout, button).catch((err) => toast(err.message)));
@@ -9022,8 +9184,32 @@ OPERATOR_PAGE = r"""
       toast('已释放任务');
       await loadQueue();
     }
+    async function abandonSubscription(id) {
+      const item = items.find((entry) => String(entry.id) === String(id));
+      const email = item && item.email ? `「${item.email}」` : '该账号';
+      const ok = await showConfirm(`将${email}标记为废弃，并停止后续自动核实。`, {
+        title: '废弃订阅账号',
+        okText: '确认废弃',
+        danger: true,
+      });
+      if (!ok) return;
+      await request(`/api/operator/subscriptions/${encodeURIComponent(id)}/abandon`, {
+        method: 'POST',
+        body: JSON.stringify({ note: '订阅处理页废弃' }),
+      });
+      toast('已废弃账号');
+      await loadQueue();
+    }
     $('reloadBtn').addEventListener('click', () => loadQueue().catch((err) => toast(err.message)));
     $('refreshBtn').addEventListener('click', () => loadQueue().catch((err) => toast(err.message)));
+    $('confirmCancelBtn').addEventListener('click', () => closeConfirm(false));
+    $('confirmOkBtn').addEventListener('click', () => closeConfirm(true));
+    $('confirmBackdrop').addEventListener('click', (event) => {
+      if (event.target === $('confirmBackdrop')) closeConfirm(false);
+    });
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') closeConfirm(false);
+    });
     $('logoutBtn').addEventListener('click', async () => {
       try { await request('/api/auth/logout', { method: 'POST' }); } catch (err) {}
       window.location.href = '/login';

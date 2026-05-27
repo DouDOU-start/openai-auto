@@ -166,10 +166,24 @@ proxies:
   - "http://用户名:密码@主机2:端口"
 ```
 
+OAuth 授权任务可以单独配置代理池，用于分散授权阶段手机号验证的单 IP 限流；`authorize` 任务会优先使用 `authorize_proxies` / `authorize_proxy`，未配置时才回退到全局 `proxies` / `proxy`：
+
+```yaml
+authorize_proxies:
+  - "http://用户名:密码@授权主机1:端口"
+  - "http://用户名:密码@授权主机2:端口"
+```
+
 环境变量也支持多代理：
 
 ```bash
 PROTOCOL_REG_PROXIES="http://127.0.0.1:7897,http://127.0.0.1:7898" uv run protocol-reg-web
+```
+
+OAuth 授权专用代理池也可以用环境变量临时覆盖：
+
+```bash
+PROTOCOL_REG_AUTHORIZE_PROXIES="http://127.0.0.1:7899,http://127.0.0.1:7900" uv run protocol-reg-web
 ```
 
 配置文件还支持设置 Web 端任务最大并发数，超出的任务会自动排队：

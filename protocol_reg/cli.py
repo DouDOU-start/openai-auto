@@ -297,18 +297,14 @@ def main() -> None:
     cfg = load_app_config(config_path)
     mode = _resolve_mode(args.mode)
     # 优先级：命令行参数（非空 / >0）> 环境变量 > 配置文件。
-    proxy_pool = resolve_proxy_pool(
-        str(args.proxy or "").strip(),
-        os.environ.get("PROTOCOL_REG_PROXIES", ""),
-        os.environ.get("PROTOCOL_REG_PROXY", ""),
-        getattr(cfg, "proxies", ()),
-        getattr(cfg, "proxy", ""),
-    )
+    proxy_pool = _resolve_cli_proxy_pool(args, cfg, mode)
     proxy = pick_proxy_from_pool(proxy_pool)
     if len(proxy_pool) > 1:
-        print(f"[代理] 已配置 {len(proxy_pool)} 个代理，本次 CLI 轮询使用: {proxy_preview(proxy)}")
+        label = "OAuth 授权专用" if mode == "authorize" and not str(args.proxy or "").strip() else ""
+        print(f"[代理] {label}已配置 {len(proxy_pool)} 个代理，本次 CLI 轮询使用: {proxy_preview(proxy)}")
     elif proxy:
-        print(f"[代理] 使用代理: {proxy_preview(proxy)}")
+        label = "OAuth 授权专用" if mode == "authorize" and not str(args.proxy or "").strip() else ""
+        print(f"[代理] {label}使用代理: {proxy_preview(proxy)}")
     email_code_api = (
         str(args.email_code_api or "").strip()
         or os.environ.get("EMAIL_CODE_API", "").strip()
@@ -623,6 +619,29 @@ def _checkout_sms_runtime_config(cfg: object) -> dict[str, object]:
             for item in getattr(cfg, "checkout_sms_numbers", ()) or ()
         ],
     }
+
+
+def _resolve_cli_proxy_pool(args: argparse.Namespace, cfg: object, mode: str) -> tuple[str, ...]:
+    explicit_proxy = str(args.proxy or "").strip()
+    if explicit_proxy:
+        return resolve_proxy_pool(explicit_proxy)
+    if str(mode or "").strip().lower() == "authorize":
+        authorize_pool = resolve_proxy_pool(
+            os.environ.get("PROTOCOL_REG_AUTHORIZE_PROXIES", ""),
+            os.environ.get("PROTOCOL_REG_AUTHORIZE_PROXY", ""),
+            os.environ.get("PROTOCOL_REG_OAUTH_PROXIES", ""),
+            os.environ.get("PROTOCOL_REG_OAUTH_PROXY", ""),
+            getattr(cfg, "authorize_proxies", ()),
+            getattr(cfg, "authorize_proxy", ""),
+        )
+        if authorize_pool:
+            return authorize_pool
+    return resolve_proxy_pool(
+        os.environ.get("PROTOCOL_REG_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_PROXY", ""),
+        getattr(cfg, "proxies", ()),
+        getattr(cfg, "proxy", ""),
+    )
 
 
 def _positive_int(value: object, default: int) -> int:

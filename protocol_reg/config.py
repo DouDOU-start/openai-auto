@@ -33,6 +33,9 @@ class AppConfig:
     proxy: str = ""
     # 多代理列表；出网调用会按列表顺序轮询使用
     proxies: tuple[str, ...] = ()
+    # OAuth 授权任务专用代理；未配置时回退到 proxy/proxies
+    authorize_proxy: str = ""
+    authorize_proxies: tuple[str, ...] = ()
     # Web 端任务最大并发数
     max_concurrency: int = 3
     # 注册邮箱随机生成后缀
@@ -80,6 +83,12 @@ def load_app_config(path: Path) -> AppConfig:
 
     proxy = str(raw.get("proxy") or "").strip()
     proxies = parse_proxy_list(raw.get("proxies")) or parse_proxy_list(proxy)
+    authorize_proxy = str(raw.get("authorize_proxy") or raw.get("oauth_proxy") or "").strip()
+    authorize_proxies = (
+        parse_proxy_list(raw.get("authorize_proxies"))
+        or parse_proxy_list(raw.get("oauth_proxies"))
+        or parse_proxy_list(authorize_proxy)
+    )
     max_concurrency = _positive_int(raw.get("max_concurrency"), 3)
     email_suffixes = _load_email_suffixes(raw.get("email_suffixes"))
 
@@ -166,6 +175,8 @@ def load_app_config(path: Path) -> AppConfig:
     return AppConfig(
         proxy=proxy,
         proxies=proxies,
+        authorize_proxy=authorize_proxy,
+        authorize_proxies=authorize_proxies,
         max_concurrency=max_concurrency,
         email_suffixes=email_suffixes,
         email_code_api=_s("api", ""),
@@ -248,6 +259,8 @@ def config_template() -> dict[str, Any]:
     return {
         "proxy": "",
         "proxies": [],
+        "authorize_proxy": "",
+        "authorize_proxies": [],
         "max_concurrency": 3,
         "email_suffixes": [],
         "email_code": {

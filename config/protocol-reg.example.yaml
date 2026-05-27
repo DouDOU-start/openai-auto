@@ -6,6 +6,11 @@ proxy: ""
 proxies:
   # - "http://用户名:密码@主机1:端口"
   # - "http://用户名:密码@主机2:端口"
+# OAuth 授权专用代理池；authorize 任务优先使用这里，未配置则回退到上面的 proxies/proxy。
+authorize_proxy: ""
+authorize_proxies:
+  # - "http://用户名:密码@授权主机1:端口"
+  # - "http://用户名:密码@授权主机2:端口"
 # Web 端任务最大并发数；多余任务会排队等待。
 max_concurrency: 3
 # 注册模式邮箱留空时，会从这些后缀中随机生成邮箱；可写多个后缀。

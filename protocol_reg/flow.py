@@ -183,7 +183,7 @@ class RegisterFlow:
         did = str(session_data.get("did") or self.http.session.cookies.get("oai-did") or "")
         user_agent = str(session_data.get("user_agent") or DEFAULT_UA)
         print(f"[授权] 使用已保存会话打开 OAuth 授权链路: {mask_email(email)}")
-        _, current = self.http.follow_redirects(oauth.auth_url)
+        _, current = self.http.follow_redirects(oauth.auth_url, headers=self._navigation_headers(did, user_agent))
         return self._complete_oauth(oauth, did, user_agent, current, self.http.session, email, "已保存会话")
 
     def authorize_current_session(self, email: str, session_data: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -193,7 +193,7 @@ class RegisterFlow:
         did = str(session_data.get("did") or self.http.session.cookies.get("oai-did") or "")
         user_agent = str(session_data.get("user_agent") or DEFAULT_UA)
         print(f"[授权] 使用当前登录会话打开 OAuth 授权链路: {mask_email(email)}")
-        _, current = self.http.follow_redirects(oauth.auth_url)
+        _, current = self.http.follow_redirects(oauth.auth_url, headers=self._navigation_headers(did, user_agent))
         return self._complete_oauth(oauth, did, user_agent, current, self.http.session, email, "当前登录会话")
 
     def authorize(self, email: str, password: str) -> dict[str, Any]:
@@ -636,15 +636,23 @@ class RegisterFlow:
                     label="授权",
                 )
                 continue
-            if "/choose-an-account" in current:
-                selected = self._select_saved_account(session, did, current, email)
-                _, current = self.http.follow_redirects(selected)
+            if self._is_saved_account_selection_url(current):
+                selected = self._try_select_saved_account(session, did, current, email)
+                if not selected:
+                    break
+                if has_callback_code(selected):
+                    current = selected
+                    continue
+                _, current = self.http.follow_redirects(selected, headers=self._navigation_headers(did, user_agent))
                 continue
             if "/workspace" in current or current.endswith("/consent"):
                 selected = self._select_workspace_with_session(session, did, current)
                 if selected == current:
                     break
-                _, current = self.http.follow_redirects(selected)
+                if has_callback_code(selected):
+                    current = selected
+                    continue
+                _, current = self.http.follow_redirects(selected, headers=self._navigation_headers(did, user_agent))
                 continue
             break
         print(f"[诊断] {session_label} cookie 摘要: {self._cookie_debug_summary(session)}")
@@ -659,11 +667,18 @@ class RegisterFlow:
     ) -> str:
         resp = session.get(
             current_url,
-            headers=self.http.headers(did, {"Referer": current_url}),
+            headers=self._navigation_headers(did, referer=current_url),
+            allow_redirects=False,
             proxies=self.settings.proxies,
             verify=self.settings.ssl_verify,
             timeout=self.settings.timeout,
         )
+        location = str(getattr(resp, "headers", {}).get("Location", "") or "").strip()
+        if location:
+            return absolutize_auth_url(location)
+        response_url = str(getattr(resp, "url", "") or "")
+        if has_callback_code(response_url):
+            return response_url
         self._ensure_status(resp, 200, "读取账号选择页")
         sessions = self._parse_unified_sessions(resp.text)
         target = self._pick_unified_session_id(sessions, email)
@@ -680,6 +695,21 @@ class RegisterFlow:
         )
         self._ensure_status(select_resp, 200, "选择登录账号")
         return self._next_url(select_resp.json()) or current_url
+
+    def _try_select_saved_account(
+        self,
+        session: requests.Session,
+        did: str,
+        current_url: str,
+        email: str,
+    ) -> str:
+        try:
+            return self._select_saved_account(session, did, current_url, email)
+        except RuntimeError as exc:
+            if "没有找到可用登录会话" not in str(exc):
+                raise
+            print(f"[授权] 当前页面没有可自动选择的登录会话: {exc}")
+            return ""
 
     def _exchange_and_attach_session(
         self,
@@ -730,6 +760,31 @@ class RegisterFlow:
         if resp.status_code != 200:
             return current_url
         return self._next_url(resp.json()) or current_url
+
+    @staticmethod
+    def _is_saved_account_selection_url(url: str) -> bool:
+        text = str(url or "").lower()
+        return "/choose-an-account" in text or "/log-in" in text or "/oauth/authorize" in text
+
+    def _navigation_headers(
+        self,
+        did: str,
+        user_agent: str = "",
+        *,
+        referer: str = "",
+    ) -> dict[str, str]:
+        extra = {
+            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "user-agent": user_agent or DEFAULT_UA,
+            "upgrade-insecure-requests": "1",
+            "sec-fetch-dest": "document",
+            "sec-fetch-mode": "navigate",
+            "sec-fetch-site": "same-origin" if referer else "none",
+            "sec-fetch-user": "?1",
+        }
+        if referer:
+            extra["Referer"] = referer
+        return self.http.headers(did, extra)
 
     @staticmethod
     def _cookie_debug_summary(session: requests.Session) -> str:

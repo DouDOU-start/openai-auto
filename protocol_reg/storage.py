@@ -28,6 +28,7 @@ DEFAULT_OPERATOR_PERMISSIONS = (
     "claim_subscription_account",
     "mark_subscription_done",
     "mark_subscription_failed",
+    "abandon_subscription_account",
 )
 ADMIN_PERMISSIONS = ("*",)
 WEB_SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -524,7 +525,7 @@ def _get_account_db_by_email(email: str) -> dict[str, str] | None:
         cursor = db_manager.get_cursor(conn)
         row = db_manager.execute_sql(
             cursor,
-            """
+            f"""
             SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
@@ -843,6 +844,77 @@ def update_account_status_db(account_id: int, status: str) -> dict[str, str]:
     return account
 
 
+def abandon_subscription_account_db(
+    account_id: int,
+    operator_user_id: int | None = None,
+    *,
+    note: str = "",
+) -> dict[str, str]:
+    """从订阅处理队列直接废弃账号，并停止后续自动核实。"""
+
+    normalized_note = _field(note) if note else "订阅处理页废弃"
+    operator_id = _field(operator_user_id)
+    init_accounts_db()
+    db_manager = _db_manager()
+    now = utc_now()
+    with db_manager.get_db_conn(as_dict=True, is_write=True) as conn:
+        cursor = db_manager.get_cursor(conn)
+        existing = db_manager.execute_sql(
+            cursor,
+            """
+            SELECT id, status, subscription_operator_id, subscription_status
+            FROM accounts
+            WHERE id = ?
+            """,
+            (int(account_id),),
+        ).fetchone()
+        if existing is None:
+            raise KeyError(f"账号不存在: {account_id}")
+        account_status = _field(existing["status"]) if "status" in existing.keys() else ACCOUNT_STATUS_ACTIVE
+        if account_status == ACCOUNT_STATUS_ABANDONED:
+            raise ValueError("账号已是废弃状态")
+        current_status = _normalize_subscription_status(existing["subscription_status"]) if "subscription_status" in existing.keys() else SUBSCRIPTION_STATUS_PENDING
+        if current_status not in {
+            SUBSCRIPTION_STATUS_PENDING,
+            SUBSCRIPTION_STATUS_CLAIMED,
+            SUBSCRIPTION_STATUS_MARKED,
+            SUBSCRIPTION_STATUS_FAILED,
+        }:
+            raise ValueError("账号当前订阅状态不可废弃")
+        current_operator = _field(existing["subscription_operator_id"]) if "subscription_operator_id" in existing.keys() else NULL_VALUE
+        if operator_user_id is not None and current_operator not in {NULL_VALUE, operator_id}:
+            raise ValueError("账号已分配给其他操作员")
+        db_manager.execute_sql(
+            cursor,
+            """
+            UPDATE accounts
+            SET status = ?,
+                subscription_operator_id = NULL,
+                subscription_claimed_at = NULL,
+                subscription_claim_expires_at = NULL,
+                subscription_verify_next_at = NULL,
+                subscription_verify_last_message = ?,
+                subscription_note = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                ACCOUNT_STATUS_ABANDONED,
+                "已废弃",
+                normalized_note,
+                now,
+                int(account_id),
+            ),
+        )
+        if cursor.rowcount <= 0:
+            raise KeyError(f"账号不存在: {account_id}")
+    account = get_account_db(account_id)
+    if account is None:
+        raise RuntimeError("账号废弃后读取失败")
+    _invalidate_account_stats_cache()
+    return account
+
+
 def delete_account_db(account_id: int) -> bool:
     init_accounts_db()
     db_manager = _db_manager()
@@ -1118,7 +1190,7 @@ def list_due_subscription_verification_accounts_db(
         cursor = db_manager.get_cursor(conn)
         rows = db_manager.execute_sql(
             cursor,
-            """
+            f"""
             SELECT id, email, password, subscription_type, refresh_token, session_json, checkout_url,
                    login_session_json, auth_token_json, checkout_json,
                    subscription_status, subscription_operator_id, subscription_claimed_at,
@@ -1129,6 +1201,7 @@ def list_due_subscription_verification_accounts_db(
                    status, created_at, updated_at, last_login_at, last_authorized_at
             FROM accounts
             WHERE subscription_status = ?
+              AND COALESCE(status, '') != ?
               AND {_sql_non_paid_subscription_predicate()}
               AND COALESCE(subscription_verify_attempts, 0) < ?
               AND (
@@ -1149,6 +1222,7 @@ def list_due_subscription_verification_accounts_db(
             """,
             (
                 SUBSCRIPTION_STATUS_MARKED,
+                ACCOUNT_STATUS_ABANDONED,
                 effective_max_attempts,
                 now_value,
                 effective_limit,

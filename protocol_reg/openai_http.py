@@ -68,12 +68,19 @@ class OpenAIHTTP:
             timeout=self.settings.timeout,
         )
 
-    def follow_redirects(self, start_url: str, max_redirects: int = 12) -> tuple[Any, str]:
+    def follow_redirects(
+        self,
+        start_url: str,
+        max_redirects: int = 12,
+        headers: dict[str, str] | None = None,
+    ) -> tuple[Any, str]:
         current = absolutize_auth_url(start_url)
         response = None
+        request_headers = dict(headers or {})
         for _ in range(max_redirects):
             response = self.session.get(
                 current,
+                headers=request_headers or None,
                 allow_redirects=False,
                 proxies=self.settings.proxies,
                 verify=self.settings.ssl_verify,
