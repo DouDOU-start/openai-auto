@@ -102,12 +102,22 @@ var US_STATE_ALIASES = {
         try {
             prompt = hasSecurityCodePromptContent();
         } catch (e) {}
+        var otpCount = 0;
+        try {
+            otpCount = otpTargetsIn(document).length;
+        } catch (e) {}
+        var activeName = '-';
+        try {
+            activeName = elementDebugName(document.activeElement);
+        } catch (e) {}
         debugPanelNode.textContent = [
             'Protocol Reg Checkout Debug',
             'host=' + currentHost() + ' path=' + currentPath(),
             'smsPhone=' + (sms.phone || '-') + ' smsUrl=' + (sms.smsUrl ? maskUrl(sms.smsUrl) : '-'),
             'smsLease=' + smsLeaseStatusText(),
             'securityPrompt=' + prompt + ' handling=' + securityCodeHandling + ' watcherTicks=' + securityWatcherTicks,
+            'otpInputs=' + otpCount + ' promptText=' + securityPromptTextMatches(pageText()),
+            'active=' + activeName,
             'smsPolling=' + smsPollingActive,
             'fillAttempts=' + securityFillAttempts,
             'autoStopped=' + securityAutoStopped,
@@ -755,10 +765,17 @@ var US_STATE_ALIASES = {
         if (dialog) {
             return true;
         }
+        if (securityPromptTextMatches(pageText()) && otpTargetsIn(document).length >= 6) {
+            return true;
+        }
+        var text = pageText();
+        if (securityPromptTextMatches(text) && otpInputsIn(document).length >= 6) {
+            return true;
+        }
         if (currentPath().includes('/checkoutweb/signup')) {
             return false;
         }
-        return securityPromptTextMatches(pageText()) && otpInputsIn(document).length > 0;
+        return securityPromptTextMatches(text) && otpInputsIn(document).length > 0;
     }
 
     function hasOpenAIBillingAddressForm() {
@@ -1106,14 +1123,30 @@ var US_STATE_ALIASES = {
 
     function isSecurityCodeVisiblyFilled() {
         var inputs = securityCodeInputs();
-        if (inputs.length === 1) {
+        if (inputs.length === 1 && isWritableOtpElement(inputs[0])) {
             return /^\d{6}$/.test(String(inputs[0].value || '').trim());
         }
-        if (inputs.length >= 6) {
-            var code = inputs.slice(0, 6).map(function(el) {
-                return String(el.value || '').trim();
+        var active = document.activeElement;
+        if (isWritableOtpElement(active) && /^\d{6}$/.test(readOtpElementValue(active))) {
+            return true;
+        }
+        var writableInputs = inputs.filter(isWritableOtpElement);
+        if (writableInputs.length >= 6) {
+            var code = writableInputs.slice(0, 6).map(function(el) {
+                return readOtpElementValue(el);
             }).join('');
             return /^\d{6}$/.test(code);
+        }
+        if (writableInputs.length === 1) {
+            return /^\d{6}$/.test(readOtpElementValue(writableInputs[0]));
+        }
+        var root = securityCodeDialog() || document;
+        var text = String(root.innerText || root.textContent || '');
+        if (text) {
+            var visibleDigits = text.match(/\b\d\s*\d\s*\d\s*\d\s*\d\s*\d\b/);
+            if (visibleDigits && /^\d{6}$/.test(visibleDigits[0].replace(/\D/g, ''))) {
+                return true;
+            }
         }
         return false;
     }
@@ -1121,15 +1154,22 @@ var US_STATE_ALIASES = {
     function securityCodeInputs() {
         var root = securityCodeDialog();
         if (!root) {
+            if (securityPromptTextMatches(pageText())) {
+                var globalInputs = otpTargetsIn(document);
+                if (globalInputs.length) {
+                    log('当前：未找到验证码弹窗容器，使用页面全局 OTP 输入框');
+                    return globalInputs;
+                }
+            }
             log('未找到验证码弹窗容器');
             return [];
         }
-        return otpInputsIn(root);
+        return otpTargetsIn(root);
     }
 
     function otpInputsIn(root) {
-        var inputs = Array.prototype.slice.call(root.querySelectorAll('input')).filter(function(el) {
-            return el.offsetParent !== null && !el.disabled && !el.readOnly && !isPhoneOrCountryInput(el);
+        var inputs = queryOtpCandidates(root).filter(function(el) {
+            return !isDisabledOtpElement(el) && !isPhoneOrCountryInput(el);
         });
         var single = inputs.filter(function(el) {
             var id = inputMeta(el);
@@ -1140,11 +1180,12 @@ var US_STATE_ALIASES = {
         if (single.length) return [single[0]];
         var digitBoxes = inputs.filter(function(el) {
             var rect = el.getBoundingClientRect();
-            return rect.width >= 20 && rect.width <= 90 &&
+            return isVisibleElement(el) &&
+                   rect.width >= 20 && rect.width <= 90 &&
                    rect.height >= 20 && rect.height <= 90 &&
                    !isPhoneOrCountryInput(el);
         });
-        if (digitBoxes.length >= 6 && securityPromptTextMatches(root.innerText || '')) {
+        if (digitBoxes.length >= 6 && securityPromptTextMatches(rootText(root))) {
             return digitBoxes.slice(0, 6).sort(inputPositionSort);
         }
         return inputs.filter(function(el) {
@@ -1152,21 +1193,82 @@ var US_STATE_ALIASES = {
             var id = el.id || '';
             var name = el.name || '';
             var meta = inputMeta(el);
-            return (el.maxLength === 1 && /otp|code|security|verify|one-time|verification/i.test(meta)) ||
+            return (isVisibleElement(el) && el.maxLength === 1 && /otp|code|security|verify|one-time|verification/i.test(meta)) ||
                    /^ci-ciBasic-\d+$/.test(id) ||
                    /^ciBasic-\d+$/.test(name) ||
                    /^\d-6$/.test(el.getAttribute('aria-label') || '');
         }).sort(inputPositionSort);
     }
 
+    function otpTargetsIn(root) {
+        var inputs = otpInputsIn(root);
+        if (inputs.length) return inputs;
+        if (!securityPromptTextMatches(rootText(root))) return [];
+        return queryVisibleOtpBoxes(root).slice(0, 6);
+    }
+
+    function queryVisibleOtpBoxes(root) {
+        var boxes = [];
+        var seen = [];
+        function scan(scope) {
+            if (!scope || seen.indexOf(scope) >= 0) return;
+            seen.push(scope);
+            try {
+                Array.prototype.forEach.call(scope.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"], div, span'), function(el) {
+                    if (el === debugPanelNode || !isVisibleElement(el) || isPhoneOrCountryInput(el)) return;
+                    var rect = el.getBoundingClientRect();
+                    if (rect.width >= 24 && rect.width <= 72 && rect.height >= 32 && rect.height <= 72) {
+                        boxes.push(el);
+                    }
+                });
+                Array.prototype.forEach.call(scope.querySelectorAll('*'), function(el) {
+                    if (el.shadowRoot) scan(el.shadowRoot);
+                });
+            } catch (e) {}
+        }
+        scan(root || document);
+        return boxes.sort(inputPositionSort).filter(function(el, index, arr) {
+            var rect = el.getBoundingClientRect();
+            for (var i = 0; i < index; i++) {
+                var prev = arr[i].getBoundingClientRect();
+                if (Math.abs(prev.left - rect.left) < 3 && Math.abs(prev.top - rect.top) < 3) {
+                    return false;
+                }
+            }
+            return true;
+        });
+    }
+
+    function queryOtpCandidates(root) {
+        var found = [];
+        var seen = [];
+        function addAll(scope) {
+            if (!scope || seen.indexOf(scope) >= 0) return;
+            seen.push(scope);
+            try {
+                Array.prototype.forEach.call(scope.querySelectorAll('input, textarea, [contenteditable="true"], [role="textbox"]'), function(el) {
+                    if (found.indexOf(el) < 0) found.push(el);
+                });
+                Array.prototype.forEach.call(scope.querySelectorAll('*'), function(el) {
+                    if (el.matches && el.matches('iframe')) {
+                        try { addAll(el.contentDocument); } catch (_) {}
+                    }
+                    if (el.shadowRoot) addAll(el.shadowRoot);
+                });
+            } catch (e) {}
+        }
+        addAll(root || document);
+        return found;
+    }
+
     function securityCodeDialog() {
         var candidates = Array.prototype.slice.call(document.querySelectorAll(
             '[role="dialog"], [aria-modal="true"], .modal, .vx_modal, div'
         )).filter(function(el) {
-            if (el === debugPanelNode || !el || el.offsetParent === null) return false;
+            if (el === debugPanelNode || !el || !isVisibleElement(el)) return false;
             var text = String(el.innerText || '');
             if (!securityPromptTextMatches(text)) return false;
-            return el.querySelectorAll && otpInputsIn(el).length > 0;
+            return el.querySelectorAll && otpTargetsIn(el).length > 0;
         }).sort(function(a, b) {
             var ar = a.getBoundingClientRect();
             var br = b.getBoundingClientRect();
@@ -1180,8 +1282,29 @@ var US_STATE_ALIASES = {
         return null;
     }
 
+    function isVisibleElement(el) {
+        if (!el || !el.getBoundingClientRect) {
+            return false;
+        }
+        var rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) {
+            return false;
+        }
+        var style = window.getComputedStyle ? window.getComputedStyle(el) : null;
+        if (style && (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity || 1) === 0)) {
+            return false;
+        }
+        return true;
+    }
+
     function securityPromptTextMatches(text) {
         return /enter your code|we sent a 6-digit code|6-digit code to|resend|verification code|security code/i.test(String(text || ''));
+    }
+
+    function rootText(root) {
+        if (!root) return '';
+        if (root === document) return pageText();
+        return String(root.innerText || root.textContent || '');
     }
 
     function inputPositionSort(a, b) {
@@ -1193,11 +1316,14 @@ var US_STATE_ALIASES = {
     }
 
     function inputMeta(el) {
+        if (!el || !el.getAttribute) return '';
         return [
             el.id || '',
             el.name || '',
             el.autocomplete || '',
             el.getAttribute('aria-label') || '',
+            el.getAttribute('data-testid') || '',
+            el.getAttribute('role') || '',
             el.placeholder || '',
             el.type || ''
         ].join(' ');
@@ -1205,10 +1331,37 @@ var US_STATE_ALIASES = {
 
     function isPhoneOrCountryInput(el) {
         var meta = inputMeta(el);
-        return /phone|mobile|tel|country|calling|dial|prefix|codePhone|countryCode|phoneCode/i.test(meta) ||
-               el.type === 'tel' ||
+        if (isOtpLikeInput(el)) {
+            return false;
+        }
+        return /phone|mobile|country|calling|dial|prefix|codePhone|countryCode|phoneCode/i.test(meta) ||
                el.id === 'phone' ||
                el.name === 'phone';
+    }
+
+    function isDisabledOtpElement(el) {
+        return !el || el.disabled || el.readOnly || el.getAttribute('aria-disabled') === 'true';
+    }
+
+    function isOtpLikeInput(el) {
+        var meta = inputMeta(el);
+        return /otp|security|verify|verification|one-time|one time|auth|ciBasic|ci-ciBasic/i.test(meta) ||
+               el.autocomplete === 'one-time-code' ||
+               (el.maxLength === 1 && /numeric|decimal|tel/i.test(String(el.getAttribute('inputmode') || el.type || ''))) ||
+               (el.maxLength === 6 && /numeric|decimal|tel|text|password/i.test(String(el.getAttribute('inputmode') || el.type || '')));
+    }
+
+    function isWritableOtpElement(el) {
+        if (!el || isDisabledOtpElement(el)) return false;
+        if ('value' in el && /^(input|textarea|select)$/i.test(el.tagName || '')) return true;
+        if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') return true;
+        return (el.getAttribute('role') || '').toLowerCase() === 'textbox';
+    }
+
+    function readOtpElementValue(el) {
+        if (!el) return '';
+        if ('value' in el) return String(el.value || '').trim();
+        return String(el.textContent || '').replace(/\D/g, '').trim();
     }
 
     function fillSecurityCode(code) {
@@ -1236,23 +1389,116 @@ var US_STATE_ALIASES = {
         if (!inputs.length || !digits.length) {
             return;
         }
+        var writableInputs = inputs.filter(isWritableOtpElement);
         if (inputs.length === 1) {
-            try { inputs[0].focus(); inputs[0].click(); } catch (e) {}
-            fillOtpInput(inputs[0], String(code || ''));
+            var singleTarget = resolveOtpWritableTarget(inputs[0]);
+            if (singleTarget) {
+                log('当前：验证码真实输入目标 ' + elementDebugName(singleTarget));
+                writeWholeOtpCode(singleTarget, String(code || ''));
+                return;
+            }
+            clickOtpBoxAndType(inputs[0], String(code || ''));
+            return;
+        }
+        if (writableInputs.length === 1) {
+            log('当前：验证码真实输入目标 ' + elementDebugName(writableInputs[0]));
+            writeWholeOtpCode(writableInputs[0], String(code || ''));
+            return;
+        }
+        if (writableInputs.length >= 6) {
+            log('当前：开始逐位写入真实验证码输入框');
+            writeSplitOtpCode(writableInputs.slice(0, 6), digits);
+            return;
+        }
+        var resolvedList = resolveOtpWritableTargets(inputs[0]);
+        if (resolvedList.length >= 6) {
+            log('当前：从可见格解析到 6 个真实输入框，开始逐位写入');
+            writeSplitOtpCode(resolvedList.slice(0, 6), digits);
+            return;
+        }
+        var resolved = resolveOtpWritableTarget(inputs[0]);
+        if (resolved) {
+            log('当前：点击可见格后解析到真实输入目标 ' + elementDebugName(resolved));
+            writeWholeOtpCode(resolved, String(code || ''));
+            return;
+        }
+        if (inputs.length >= 6) {
+            clickOtpBoxAndType(inputs[0], String(code || ''));
             return;
         }
         log('当前：开始逐位写入验证码');
-        inputs[0].focus();
-        inputs[0].click();
+        focusOtpInput(inputs[0]);
         digits.slice(0, inputs.length).forEach(function(ch, index) {
             setTimeout(function() {
                 var target = inputs[index];
                 fillOtpInput(target, ch);
                 var next = inputs[index + 1];
-                if (next) next.focus();
+                if (next) focusOtpInput(next);
                 log('当前：已写入验证码位 #' + (index + 1));
             }, index * 80);
         });
+    }
+
+    function writeSplitOtpCode(targets, digits) {
+        focusOtpInput(targets[0]);
+        digits.slice(0, targets.length).forEach(function(ch, index) {
+            setTimeout(function() {
+                var target = targets[index];
+                fillOtpInput(target, ch);
+                var next = targets[index + 1];
+                if (next) focusOtpInput(next);
+                log('当前：已写入验证码真实输入位 #' + (index + 1));
+            }, index * 80);
+        });
+    }
+
+    function writeWholeOtpCode(target, code) {
+        focusOtpInput(target);
+        pasteOtpCode(target, code);
+        if (isWritableOtpElement(target)) {
+            fillOtpInput(target, code);
+        }
+        insertOtpTextByCommand(code);
+        sendOtpKeysToFocused(code);
+    }
+
+    function clickOtpBoxAndType(box, code) {
+        focusOtpInput(box);
+        var active = deepActiveElement();
+        log('当前：点击验证码格后焦点 ' + elementDebugName(active));
+        var writable = isWritableOtpElement(active) ? active : resolveOtpWritableTarget(box);
+        if (writable) {
+            log('当前：使用焦点/邻近真实输入目标 ' + elementDebugName(writable));
+            writeWholeOtpCode(writable, code);
+            return;
+        }
+        pasteOtpCode(box, code);
+        sendOtpKeysToFocused(code);
+    }
+
+    function sendOtpKeysToFocused(code) {
+        String(code || '').split('').slice(0, 6).forEach(function(ch, index) {
+            setTimeout(function() {
+                var active = deepActiveElement();
+                var target = active && active !== document.body ? active : document;
+                dispatchKey(target, 'keydown', ch);
+                dispatchKey(target, 'keypress', ch);
+                dispatchBeforeInput(target, ch);
+                if (isWritableOtpElement(active)) {
+                    fillOtpInput(active, appendOtpDigit(readOtpElementValue(active), ch));
+                } else {
+                    dispatchInput(target, ch);
+                }
+                dispatchKey(target, 'keyup', ch);
+                log('当前：已向当前焦点发送验证码位 #' + (index + 1) + ' focus=' + elementDebugName(active));
+            }, index * 120);
+        });
+    }
+
+    function appendOtpDigit(current, digit) {
+        var value = String(current || '').replace(/\D/g, '');
+        if (value.length >= 6) return value;
+        return value + String(digit || '').replace(/\D/g, '').slice(0, 1);
     }
 
     function dispatchBeforeInput(el, value) {
@@ -1281,12 +1527,140 @@ var US_STATE_ALIASES = {
 
     function fillOtpInput(el, val) {
         var value = String(val == null ? '' : val);
-        try { el.focus(); } catch (e) {}
-        try { el.click(); } catch (e) {}
-        dispatchBeforeInput(el, value);
-        fillElement(el, value);
-        dispatchInput(el, value);
+        focusOtpInput(el);
+        dispatchKey(el, 'keydown', value.slice(-1) || value);
+        dispatchKey(el, 'keypress', value.slice(-1) || value);
+        if ('value' in el) {
+            dispatchBeforeInput(el, value);
+            fillElement(el, value);
+            dispatchInput(el, value);
+        } else if (el.isContentEditable || el.getAttribute('contenteditable') === 'true') {
+            dispatchBeforeInput(el, value);
+            el.textContent = value;
+            dispatchInput(el, value);
+        } else {
+            var active = document.activeElement && document.activeElement !== document.body ? document.activeElement : el;
+            dispatchBeforeInput(active, value);
+            dispatchInput(active, value);
+        }
         dispatchKey(el, 'keyup', value.slice(-1) || value);
+    }
+
+    function pasteOtpCode(target, code) {
+        var value = String(code || '');
+        focusOtpInput(target);
+        var active = deepActiveElement();
+        if (!active || active === document.body) active = target;
+        var root = securityCodeDialog() || active;
+        log('当前：尝试 paste 整串验证码到 ' + elementDebugName(active));
+        dispatchPaste(active, value);
+        if (root !== active) dispatchPaste(root, value);
+        dispatchBeforeInput(active, value);
+        dispatchInput(active, value);
+    }
+
+    function insertOtpTextByCommand(code) {
+        try {
+            if (document.queryCommandSupported && document.queryCommandSupported('insertText')) {
+                document.execCommand('selectAll', false, null);
+                document.execCommand('insertText', false, String(code || ''));
+                log('当前：已尝试 execCommand 写入验证码');
+            }
+        } catch (e) {}
+    }
+
+    function resolveOtpWritableTarget(seed) {
+        if (isWritableOtpElement(seed)) return seed;
+        focusOtpInput(seed);
+        var active = deepActiveElement();
+        log('当前：解析验证码输入目标，点击后焦点 ' + elementDebugName(active));
+        if (isWritableOtpElement(active) && !isPhoneOrCountryInput(active)) return active;
+        var near = findWritableOtpNear(seed);
+        if (near) return near;
+        var all = resolveOtpWritableTargets(seed);
+        if (all.length === 1) return all[0];
+        if (all.length >= 6) return all[0];
+        return null;
+    }
+
+    function resolveOtpWritableTargets(seed) {
+        var root = securityCodeDialog() || rootNodeOf(seed) || document;
+        return queryOtpCandidates(root).filter(function(el) {
+            return isWritableOtpElement(el) && !isPhoneOrCountryInput(el);
+        }).sort(inputPositionSort);
+    }
+
+    function findWritableOtpNear(seed) {
+        var current = seed;
+        for (var depth = 0; current && depth < 6; depth += 1) {
+            var found = firstWritableOtpIn(current);
+            if (found) return found;
+            current = current.parentElement || current.parentNode;
+        }
+        var root = rootNodeOf(seed);
+        if (root && root !== document) {
+            return firstWritableOtpIn(root);
+        }
+        return null;
+    }
+
+    function firstWritableOtpIn(root) {
+        var found = queryOtpCandidates(root).filter(function(el) {
+            return isWritableOtpElement(el) && !isPhoneOrCountryInput(el);
+        }).sort(inputPositionSort);
+        return found[0] || null;
+    }
+
+    function deepActiveElement() {
+        var active = document.activeElement;
+        var guard = 0;
+        while (active && active.shadowRoot && active.shadowRoot.activeElement && guard < 8) {
+            active = active.shadowRoot.activeElement;
+            guard += 1;
+        }
+        try {
+            if (active && active.tagName === 'IFRAME' && active.contentDocument && active.contentDocument.activeElement) {
+                active = active.contentDocument.activeElement;
+            }
+        } catch (e) {}
+        return active;
+    }
+
+    function rootNodeOf(el) {
+        try {
+            return el && el.getRootNode ? el.getRootNode() : null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function dispatchPaste(el, text) {
+        try {
+            var dt = new DataTransfer();
+            dt.setData('text/plain', text);
+            el.dispatchEvent(new ClipboardEvent('paste', {
+                bubbles: true,
+                cancelable: true,
+                clipboardData: dt
+            }));
+        } catch (e) {
+            try {
+                el.dispatchEvent(new Event('paste', { bubbles: true, cancelable: true }));
+            } catch (_) {}
+        }
+    }
+
+    function elementDebugName(el) {
+        if (!el) return 'null';
+        return String((el.tagName || 'node') + '#' + (el.id || '') + '.' + (el.className || '')).slice(0, 120);
+    }
+
+    function focusOtpInput(el) {
+        try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+        try { el.focus({ preventScroll: true }); } catch (e) {
+            try { el.focus(); } catch (_) {}
+        }
+        try { el.click(); } catch (e) {}
     }
 
     function dispatchKey(el, type, key) {

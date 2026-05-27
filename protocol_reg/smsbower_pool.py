@@ -19,6 +19,7 @@ class _PooledActivation:
     activation_id: str
     phone_number: str
     successful_uses: int = 0
+    received_codes: int = 0
 
 
 class SmsBowerPhonePool:
@@ -108,7 +109,19 @@ class SmsBowerPhonePool:
                     code = self._client.wait_code(pooled.activation_id).code
                 except SmsBowerTimeout as exc:
                     last_error = str(exc)
-                    log(f"[SMSBower] 等待验证码超时，触发 OpenAI 重发并继续等待: {last_error}")
+                    if pooled.successful_uses <= 0 and pooled.received_codes <= 0:
+                        log(f"[SMSBower] 新号码首次等码超时，取消当前号码并立即换号: {last_error}")
+                        self._cancel_current(log)
+                        current = "https://auth.openai.com/add-phone"
+                        phone_attempt += 1
+                        break
+                    if code_attempt >= max_code_attempts:
+                        log(f"[SMSBower] 已收过码的号码等码超时且达到重试上限，取消后换号: {last_error}")
+                        self._cancel_current(log)
+                        current = "https://auth.openai.com/add-phone"
+                        phone_attempt += 1
+                        break
+                    log(f"[SMSBower] 已收过码的号码等待验证码超时，触发 OpenAI 重发并继续等待: {last_error}")
                     self._request_resend(flow, http, did, user_agent, ctx, current, label, pooled, log)
                     continue
                 except SmsBowerApiError as exc:
@@ -119,6 +132,7 @@ class SmsBowerPhonePool:
                     phone_attempt += 1
                     break
 
+                pooled.received_codes += 1
                 verify_resp = flow._validate_phone_otp(http, did, user_agent, ctx, current, code)
                 if verify_resp.status_code == 200:
                     next_url = flow._next_url_from_response(verify_resp) or current
