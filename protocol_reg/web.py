@@ -34,6 +34,7 @@ from .airgate_monitor import AirGate401Monitor, AirGateMonitorConfig
 from .flow import PHONE_CHANGE_COMMAND, PhoneVerificationError, RegisterFlow
 from .proxy_pool import pick_proxy_from_pool
 from .settings import Settings, proxy_preview, resolve_proxy_pool
+from .smsbower_pool import SmsBowerPhonePool
 from .storage import (
     ACCOUNT_STATUS_ACTIVE,
     ACCOUNT_STATUS_ABANDONED,
@@ -211,6 +212,11 @@ class CheckoutSmsPayload(BaseModel):
     numbers: list[CheckoutSmsNumberPayload] = Field(default_factory=list)
 
 
+class CheckoutSmsLeasePayload(BaseModel):
+    token: str = ""
+    numbers: list[CheckoutSmsNumberPayload] = Field(default_factory=list)
+
+
 WEB_SESSION_COOKIE = "protocol_reg_session"
 
 
@@ -329,6 +335,164 @@ class WebJob:
         with self._condition:
             if self._cancel_requested or self.status == "cancelled":
                 raise RuntimeError("任务已取消")
+
+
+@dataclass(frozen=True)
+class CheckoutSmsLease:
+    lease_id: str
+    phone: str
+    sms_url: str
+    label: str
+    token: str
+    acquired_at: float
+    expires_at: float
+    wait_seconds: float
+
+
+class CheckoutSmsLeaseManager:
+    def __init__(self) -> None:
+        self._condition = threading.Condition()
+        self._next_by_signature: dict[tuple[tuple[str, str, str], ...], int] = {}
+        self._leases_by_key: dict[tuple[str, str, str], CheckoutSmsLease] = {}
+        self._leases_by_token: dict[str, CheckoutSmsLease] = {}
+        self._active_tokens: set[str] = set()
+
+    def issue_token(self) -> str:
+        token = secrets.token_urlsafe(24)
+        with self._condition:
+            self._active_tokens.add(token)
+            return token
+
+    def acquire(
+        self,
+        token: str,
+        numbers: tuple[CheckoutSmsNumberConfig, ...],
+        *,
+        ttl_seconds: int,
+        wait_seconds: float,
+    ) -> CheckoutSmsLease:
+        clean_token = str(token or "").strip()
+        if not clean_token:
+            raise HTTPException(status_code=403, detail="缺少短信租约 token")
+        if not numbers:
+            raise HTTPException(status_code=400, detail="未配置 Checkout 短信号码")
+        ttl = max(5, int(ttl_seconds or 180))
+        deadline = time.monotonic() + max(1.0, float(wait_seconds or 25.0))
+        signature = tuple((item.phone, item.sms_url, item.label) for item in numbers)
+        wait_started = time.monotonic()
+        with self._condition:
+            if clean_token not in self._active_tokens:
+                raise HTTPException(status_code=403, detail="短信租约 token 无效或已释放")
+            existing = self._leases_by_token.get(clean_token)
+            if existing is not None:
+                refreshed = self._refresh_lease_locked(existing, ttl)
+                return CheckoutSmsLease(
+                    lease_id=refreshed.lease_id,
+                    phone=refreshed.phone,
+                    sms_url=refreshed.sms_url,
+                    label=refreshed.label,
+                    token=refreshed.token,
+                    acquired_at=refreshed.acquired_at,
+                    expires_at=refreshed.expires_at,
+                    wait_seconds=time.monotonic() - wait_started,
+                )
+
+            while True:
+                now = time.monotonic()
+                self._expire_locked(now)
+                start = self._next_by_signature.get(signature, 0) % len(numbers)
+                for offset in range(len(numbers)):
+                    index = (start + offset) % len(numbers)
+                    item = numbers[index]
+                    key = self._lease_key(item)
+                    if key in self._leases_by_key:
+                        continue
+                    lease = CheckoutSmsLease(
+                        lease_id=secrets.token_urlsafe(18),
+                        phone=item.phone,
+                        sms_url=item.sms_url,
+                        label=item.label,
+                        token=clean_token,
+                        acquired_at=now,
+                        expires_at=now + ttl,
+                        wait_seconds=time.monotonic() - wait_started,
+                    )
+                    self._leases_by_key[key] = lease
+                    self._leases_by_token[clean_token] = lease
+                    self._next_by_signature[signature] = (index + 1) % len(numbers)
+                    return lease
+                remaining = deadline - now
+                if remaining <= 0:
+                    raise HTTPException(status_code=409, detail="暂无可用短信号码，请稍后重试")
+                next_release = min(
+                    (lease.expires_at for lease in self._leases_by_key.values()),
+                    default=now + remaining,
+                )
+                self._condition.wait(timeout=max(0.2, min(1.5, remaining, next_release - now)))
+
+    def release(self, token: str) -> bool:
+        clean_token = str(token or "").strip()
+        if not clean_token:
+            return False
+        with self._condition:
+            lease = self._leases_by_token.pop(clean_token, None)
+            if lease is not None:
+                self._leases_by_key.pop(self._lease_key_from_values(lease.phone, lease.sms_url, lease.label), None)
+            self._active_tokens.discard(clean_token)
+            self._condition.notify_all()
+            return lease is not None
+
+    def status(self) -> dict[str, Any]:
+        with self._condition:
+            now = time.monotonic()
+            self._expire_locked(now)
+            return {
+                "active": len(self._leases_by_key),
+                "tokens": len(self._active_tokens),
+                "leases": [
+                    {
+                        "phone": lease.phone,
+                        "label": lease.label,
+                        "age_seconds": round(max(0.0, now - lease.acquired_at), 1),
+                        "ttl_seconds": round(max(0.0, lease.expires_at - now), 1),
+                    }
+                    for lease in self._leases_by_key.values()
+                ],
+            }
+
+    def _refresh_lease_locked(self, lease: CheckoutSmsLease, ttl_seconds: int) -> CheckoutSmsLease:
+        refreshed = CheckoutSmsLease(
+            lease_id=lease.lease_id,
+            phone=lease.phone,
+            sms_url=lease.sms_url,
+            label=lease.label,
+            token=lease.token,
+            acquired_at=lease.acquired_at,
+            expires_at=time.monotonic() + ttl_seconds,
+            wait_seconds=lease.wait_seconds,
+        )
+        key = self._lease_key_from_values(refreshed.phone, refreshed.sms_url, refreshed.label)
+        self._leases_by_key[key] = refreshed
+        self._leases_by_token[refreshed.token] = refreshed
+        return refreshed
+
+    def _expire_locked(self, now: float) -> None:
+        expired = [key for key, lease in self._leases_by_key.items() if lease.expires_at <= now]
+        for key in expired:
+            lease = self._leases_by_key.pop(key, None)
+            if lease is not None:
+                self._leases_by_token.pop(lease.token, None)
+                self._active_tokens.discard(lease.token)
+        if expired:
+            self._condition.notify_all()
+
+    @staticmethod
+    def _lease_key(item: CheckoutSmsNumberConfig) -> tuple[str, str, str]:
+        return CheckoutSmsLeaseManager._lease_key_from_values(item.phone, item.sms_url, item.label)
+
+    @staticmethod
+    def _lease_key_from_values(phone: str, sms_url: str, label: str) -> tuple[str, str, str]:
+        return (str(phone or ""), str(sms_url or ""), str(label or ""))
 
 
 class JobWriter:
@@ -479,6 +643,8 @@ class JobManager:
         self._queue: list[tuple[WebJob, OperationPayload, str]] = []
         self._running_ids: set[str] = set()
         self._lock = threading.RLock()
+        self._smsbower_pool: SmsBowerPhonePool | None = None
+        self._smsbower_signature: tuple[Any, ...] | None = None
 
     def start(self, payload: OperationPayload) -> WebJob:
         mode = payload.mode.strip().lower()
@@ -599,7 +765,8 @@ class JobManager:
                     raise ValueError(f"邮箱已存在于数据库，避免重复注册: {email}")
                 job.email = email
                 job.log(f"[任务] 开始执行 {payload.mode}: {email}")
-                flow = RegisterFlow(settings, prompt=job.wait_input)
+                phone_solver = self._phone_solver(payload, settings, job)
+                flow = RegisterFlow(settings, prompt=job.wait_input, phone_solver=phone_solver)
                 job.raise_if_cancelled()
                 result = _execute_operation(job, payload, settings, flow, email, password, self.runtime)
                 job.raise_if_cancelled()
@@ -627,6 +794,44 @@ class JobManager:
             self._prune_jobs_locked()
             to_start = self._schedule_locked()
         self._start_workers(to_start)
+
+    def _phone_solver(self, payload: OperationPayload, settings: Settings, job: WebJob) -> Any:
+        if payload.mode.strip().lower() != "authorize":
+            return None
+        if not settings.smsbower_api_key.strip():
+            return None
+        pool = self._smsbower_pool_for_settings(settings)
+
+        def solve(**kwargs: Any) -> str:
+            if str(kwargs.get("label") or "") != "授权":
+                return kwargs["flow"]._manual_phone_verification(**kwargs)
+            return pool.solve(log=job.log, **kwargs)
+
+        return solve
+
+    def _smsbower_pool_for_settings(self, settings: Settings) -> SmsBowerPhonePool:
+        signature = (
+            settings.smsbower_api_base,
+            settings.smsbower_api_key,
+            settings.smsbower_service,
+            settings.smsbower_country,
+            settings.smsbower_max_price,
+            settings.smsbower_min_price,
+            settings.smsbower_provider_ids,
+            settings.smsbower_except_provider_ids,
+            settings.smsbower_phone_exception,
+            settings.smsbower_timeout,
+            settings.smsbower_poll_interval,
+            settings.use_proxy_for_smsbower,
+            settings.smsbower_reuse_limit,
+            settings.ssl_verify,
+            settings.timeout,
+        )
+        with self._lock:
+            if self._smsbower_pool is None or self._smsbower_signature != signature:
+                self._smsbower_pool = SmsBowerPhonePool(settings)
+                self._smsbower_signature = signature
+            return self._smsbower_pool
 
     def _prune_jobs_locked(self) -> None:
         completed = [
@@ -975,6 +1180,7 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         )
     app_cfg = load_app_config(runtime.config_path)
     manager = JobManager(runtime)
+    checkout_sms_leases = CheckoutSmsLeaseManager()
     auto_scheduler = AutoRegisterScheduler(manager)
     subscription_verify_scheduler = SubscriptionVerifyScheduler(runtime)
     airgate_monitor = AirGate401Monitor(
@@ -1045,7 +1251,14 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
                 target = "/operator" if role == AUTH_ROLE_OPERATOR else "/"
                 return RedirectResponse(url=target, status_code=303)
             return await call_next(request)
-        public_paths = {"/login", "/api/auth/login", "/api/auth/logout", "/api/auth/bootstrap"}
+        public_paths = {
+            "/login",
+            "/api/auth/login",
+            "/api/auth/logout",
+            "/api/auth/bootstrap",
+            "/api/ops/checkout-sms/acquire",
+            "/api/ops/checkout-sms/release",
+        }
         if path in public_paths:
             response = await call_next(request)
             return response
@@ -1393,7 +1606,13 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         if not _has_value(checkout_url):
             raise HTTPException(status_code=400, detail="该账号没有 checkout 长链接")
         try:
-            result = _open_checkout_in_fresh_browser(checkout_url, runtime, automation_js=payload.automation_js)
+            result = _open_checkout_in_fresh_browser(
+                checkout_url,
+                runtime,
+                automation_js=payload.automation_js,
+                checkout_sms_leases=checkout_sms_leases,
+                base_url=_request_base_url(request),
+            )
         except BrowserAutomationError as exc:
             raise HTTPException(status_code=502, detail=f"JS 自动化失败: {exc}") from exc
         except BrowserLaunchError as exc:
@@ -1592,7 +1811,13 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         if not _has_value(checkout_url):
             raise HTTPException(status_code=400, detail="该账号没有 checkout 长链接")
         try:
-            result = _open_checkout_in_fresh_browser(checkout_url, runtime, automation_js=payload.automation_js)
+            result = _open_checkout_in_fresh_browser(
+                checkout_url,
+                runtime,
+                automation_js=payload.automation_js,
+                checkout_sms_leases=checkout_sms_leases,
+                base_url=_request_base_url(request),
+            )
         except BrowserAutomationError as exc:
             raise HTTPException(status_code=502, detail=f"JS 自动化失败: {exc}") from exc
         except BrowserLaunchError as exc:
@@ -1908,6 +2133,37 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
         )
         return {"checkout_sms": _checkout_sms_config_view(load_app_config(runtime.config_path)), "queue": manager.stats()}
 
+    @app.post("/api/ops/checkout-sms/acquire")
+    def api_checkout_sms_acquire(payload: CheckoutSmsLeasePayload, request: Request) -> dict[str, Any]:
+        cfg = load_app_config(runtime.config_path)
+        numbers = tuple(cfg.checkout_sms_numbers)
+        if not numbers:
+            numbers = tuple(_checkout_sms_numbers_from_payload(CheckoutSmsPayload(numbers=payload.numbers)))
+        wait_seconds = float(request.query_params.get("wait", "25") or 25)
+        lease = checkout_sms_leases.acquire(
+            payload.token,
+            numbers,
+            ttl_seconds=max(5, int(cfg.checkout_sms_timeout or 180)),
+            wait_seconds=max(1.0, wait_seconds),
+        )
+        return {
+            "ok": True,
+            "number": {
+                "phone": lease.phone,
+                "smsUrl": lease.sms_url,
+                "label": lease.label,
+            },
+            "leaseId": lease.lease_id,
+            "waitSeconds": round(max(0.0, lease.wait_seconds), 3),
+            "expiresInSeconds": round(max(0.0, lease.expires_at - time.monotonic()), 1),
+            "status": checkout_sms_leases.status(),
+        }
+
+    @app.post("/api/ops/checkout-sms/release")
+    def api_checkout_sms_release(payload: CheckoutSmsLeasePayload) -> dict[str, Any]:
+        released = checkout_sms_leases.release(payload.token)
+        return {"ok": True, "released": released, "status": checkout_sms_leases.status()}
+
     @app.get("/api/ops/airgate-monitor")
     def api_airgate_monitor_status() -> dict[str, Any]:
         return {"airgate": airgate_monitor.status()}
@@ -2083,6 +2339,14 @@ def _request_ip(request: Request) -> str:
         return forwarded
     client = request.client
     return str(getattr(client, "host", "") or "")
+
+
+def _request_base_url(request: Request) -> str:
+    forwarded_proto = str(request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+    forwarded_host = str(request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+    if forwarded_proto and forwarded_host:
+        return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
+    return str(request.base_url).rstrip("/")
 
 
 def _unique_positive_ids(ids: list[int]) -> list[int]:
@@ -2298,6 +2562,18 @@ def _settings_from_runtime(runtime: WebRuntime, *, proxy: str | None = None) -> 
         cfg.otp_poll_max_attempts,
     )
     use_proxy_for_email = _boolish(os.environ.get("EMAIL_CODE_USE_PROXY"), cfg.use_proxy_for_email)
+    smsbower_api = os.environ.get("SMSBOWER_API", "").strip() or cfg.smsbower_api
+    smsbower_key = (
+        os.environ.get("SMSBOWER_API_KEY", "").strip()
+        or os.environ.get("SMSBOWER_KEY", "").strip()
+        or cfg.smsbower_key
+    )
+    smsbower_service = os.environ.get("SMSBOWER_SERVICE", "").strip() or cfg.smsbower_service or "dr"
+    smsbower_country = os.environ.get("SMSBOWER_COUNTRY", "").strip() or cfg.smsbower_country
+    smsbower_timeout = int(os.environ.get("SMSBOWER_TIMEOUT", "0") or 0) or cfg.smsbower_timeout
+    smsbower_poll = float(os.environ.get("SMSBOWER_POLL", "0") or 0) or cfg.smsbower_poll
+    smsbower_reuse_limit = _positive_int(os.environ.get("SMSBOWER_REUSE_LIMIT"), cfg.smsbower_reuse_limit)
+    use_proxy_for_smsbower = _boolish(os.environ.get("SMSBOWER_USE_PROXY"), cfg.use_proxy_for_smsbower)
     return Settings(
         project_root=runtime.repo_root.resolve(),
         proxy=proxy,
@@ -2313,6 +2589,23 @@ def _settings_from_runtime(runtime: WebRuntime, *, proxy: str | None = None) -> 
         otp_max_retries=max(1, int(otp_max_retries)),
         otp_poll_max_attempts=max(1, int(otp_poll_max_attempts)),
         use_proxy_for_email=bool(use_proxy_for_email),
+        smsbower_api_base=str(smsbower_api or "").strip(),
+        smsbower_api_key=str(smsbower_key or "").strip(),
+        smsbower_service=str(smsbower_service or "dr").strip() or "dr",
+        smsbower_country=str(smsbower_country or "").strip(),
+        smsbower_max_price=str(os.environ.get("SMSBOWER_MAX_PRICE", "").strip() or cfg.smsbower_max_price).strip(),
+        smsbower_min_price=str(os.environ.get("SMSBOWER_MIN_PRICE", "").strip() or cfg.smsbower_min_price).strip(),
+        smsbower_provider_ids=str(os.environ.get("SMSBOWER_PROVIDER_IDS", "").strip() or cfg.smsbower_provider_ids).strip(),
+        smsbower_except_provider_ids=str(
+            os.environ.get("SMSBOWER_EXCEPT_PROVIDER_IDS", "").strip() or cfg.smsbower_except_provider_ids
+        ).strip(),
+        smsbower_phone_exception=str(
+            os.environ.get("SMSBOWER_PHONE_EXCEPTION", "").strip() or cfg.smsbower_phone_exception
+        ).strip(),
+        smsbower_timeout=max(5, int(smsbower_timeout)),
+        smsbower_poll_interval=max(1.0, float(smsbower_poll)),
+        use_proxy_for_smsbower=bool(use_proxy_for_smsbower),
+        smsbower_reuse_limit=max(1, int(smsbower_reuse_limit)),
     )
 
 
@@ -2352,10 +2645,15 @@ def _checkout_sms_numbers_from_payload(payload: CheckoutSmsPayload) -> list[Chec
     return numbers
 
 
-def _checkout_sms_runtime_config(runtime: WebRuntime) -> dict[str, Any]:
+def _checkout_sms_runtime_config(
+    runtime: WebRuntime,
+    *,
+    checkout_sms_leases: CheckoutSmsLeaseManager | None = None,
+    base_url: str = "",
+) -> dict[str, Any]:
     cfg = load_app_config(runtime.config_path)
     view = _checkout_sms_config_view(cfg)
-    return {
+    data: dict[str, Any] = {
         "timeoutSeconds": view["timeout"],
         "pollSeconds": view["poll"],
         "numbers": [
@@ -2367,6 +2665,14 @@ def _checkout_sms_runtime_config(runtime: WebRuntime) -> dict[str, Any]:
             for item in view["numbers"]
         ],
     }
+    if checkout_sms_leases is not None and base_url:
+        data["lease"] = {
+            "acquireUrl": f"{base_url.rstrip('/')}/api/ops/checkout-sms/acquire",
+            "releaseUrl": f"{base_url.rstrip('/')}/api/ops/checkout-sms/release",
+            "token": checkout_sms_leases.issue_token(),
+            "waitSeconds": 25.0,
+        }
+    return data
 
 
 def _airgate_monitor_proxy(monitor: AirGate401Monitor) -> str:
@@ -2560,13 +2866,24 @@ def _store_checkout_for_account(email: str, checkout: object, runtime: WebRuntim
     return checkout_url
 
 
-def _open_checkout_in_fresh_browser(checkout_url: str, runtime: WebRuntime, *, automation_js: str = ""):
+def _open_checkout_in_fresh_browser(
+    checkout_url: str,
+    runtime: WebRuntime,
+    *,
+    automation_js: str = "",
+    checkout_sms_leases: CheckoutSmsLeaseManager | None = None,
+    base_url: str = "",
+):
     return open_url_in_fresh_browser(
         checkout_url,
         profile_root=(runtime.repo_root / "data" / "browser_profiles").resolve(),
         automation_js=str(automation_js or ""),
         inject_auto_filler=True,
-        checkout_sms=_checkout_sms_runtime_config(runtime),
+        checkout_sms=_checkout_sms_runtime_config(
+            runtime,
+            checkout_sms_leases=checkout_sms_leases,
+            base_url=base_url,
+        ),
     )
 
 
@@ -5498,7 +5815,7 @@ HTML_PAGE = r"""
       const ids = selectedIds();
       if (!ids.length) return toast('请先选择账号');
       const ok = await showConfirm(
-        `将对选中的 ${ids.length} 个账号启动 OAuth 授权任务。遇到手机验证时，请在任务列表中点击对应邮箱的等待任务并输入手机号/验证码。`,
+        `将对选中的 ${ids.length} 个账号启动 OAuth 授权任务。已配置 SMSBower 时，仅 OAuth 授权阶段的手机验证会自动租号接码并默认每个号码成功复用 3 次；注册/登录阶段仍不自动接码。`,
         { title: '批量 OAuth 授权', okText: '开始授权' },
       );
       if (!ok) return;

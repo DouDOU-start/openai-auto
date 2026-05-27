@@ -88,9 +88,13 @@ class CheckoutSmsRuntimeConfig:
     numbers: tuple[dict[str, str], ...] = ()
     timeout_seconds: int = 180
     poll_seconds: float = 2.0
+    lease_acquire_url: str = ""
+    lease_release_url: str = ""
+    lease_token: str = ""
+    lease_wait_seconds: float = 25.0
 
     def to_public_dict(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "numbers": [
                 {
                     "phone": item.get("phone", ""),
@@ -102,6 +106,14 @@ class CheckoutSmsRuntimeConfig:
             "timeoutSeconds": max(5, int(self.timeout_seconds or 180)),
             "pollSeconds": max(1.0, float(self.poll_seconds or 2.0)),
         }
+        if self.lease_acquire_url and self.lease_release_url and self.lease_token:
+            data["lease"] = {
+                "acquireUrl": self.lease_acquire_url,
+                "releaseUrl": self.lease_release_url,
+                "token": self.lease_token,
+                "waitSeconds": max(1.0, float(self.lease_wait_seconds or 25.0)),
+            }
+        return data
 
 
 def open_url_in_fresh_browser(
@@ -122,11 +134,12 @@ def open_url_in_fresh_browser(
     profile_dir = _new_profile_dir(profile_root)
     _write_us_profile_preferences(profile_dir)
     proxy_config = _browser_proxy_config(browser_proxy)
+    checkout_sms_config = _normalize_checkout_sms_config(checkout_sms)
     extension_dir = _build_auto_filler_extension(
         profile_dir,
         auto_filler_script or DEFAULT_CHECKOUT_USERSCRIPT,
         proxy_config=proxy_config,
-        checkout_sms=_normalize_checkout_sms_config(checkout_sms),
+        checkout_sms=checkout_sms_config,
     ) if inject_auto_filler else None
     automation_script = str(automation_js or "").strip()
     debug_port = _free_port() if automation_script else None
@@ -278,10 +291,42 @@ def _normalize_checkout_sms_config(value: object) -> CheckoutSmsRuntimeConfig:
         raw_numbers = value.get("numbers")
         timeout = value.get("timeoutSeconds", value.get("timeout_seconds", value.get("timeout", 180)))
         poll = value.get("pollSeconds", value.get("poll_seconds", value.get("poll", 2.0)))
+        lease = value.get("lease") if isinstance(value.get("lease"), dict) else {}
+        lease_acquire_url = str(
+            lease.get("acquireUrl")
+            or lease.get("acquire_url")
+            or value.get("leaseAcquireUrl")
+            or value.get("lease_acquire_url")
+            or ""
+        ).strip()
+        lease_release_url = str(
+            lease.get("releaseUrl")
+            or lease.get("release_url")
+            or value.get("leaseReleaseUrl")
+            or value.get("lease_release_url")
+            or ""
+        ).strip()
+        lease_token = str(
+            lease.get("token")
+            or value.get("leaseToken")
+            or value.get("lease_token")
+            or ""
+        ).strip()
+        lease_wait = (
+            lease.get("waitSeconds")
+            or lease.get("wait_seconds")
+            or value.get("leaseWaitSeconds")
+            or value.get("lease_wait_seconds")
+            or 25.0
+        )
     else:
         raw_numbers = value
         timeout = 180
         poll = 2.0
+        lease_acquire_url = ""
+        lease_release_url = ""
+        lease_token = ""
+        lease_wait = 25.0
     if isinstance(raw_numbers, dict):
         items = [raw_numbers]
     elif isinstance(raw_numbers, (list, tuple)):
@@ -316,6 +361,10 @@ def _normalize_checkout_sms_config(value: object) -> CheckoutSmsRuntimeConfig:
         numbers=tuple(numbers),
         timeout_seconds=_coerce_int(timeout, 180, minimum=5),
         poll_seconds=_coerce_float(poll, 2.0, minimum=1.0),
+        lease_acquire_url=lease_acquire_url,
+        lease_release_url=lease_release_url,
+        lease_token=lease_token,
+        lease_wait_seconds=_coerce_float(lease_wait, 25.0, minimum=1.0),
     )
 
 
@@ -363,6 +412,14 @@ def _build_auto_filler_extension(
         *[
             permission
             for permission in (_host_permission_for_url(item.get("smsUrl", "")) for item in checkout_sms.numbers)
+            if permission
+        ],
+        *[
+            permission
+            for permission in (
+                _host_permission_for_url(checkout_sms.lease_acquire_url),
+                _host_permission_for_url(checkout_sms.lease_release_url),
+            )
             if permission
         ],
     ]

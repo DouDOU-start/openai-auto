@@ -31,7 +31,7 @@ email_code:
 smsbower:
   # SMSBower API 地址；文档要求请求 https://smsbower.page/stubs/handler_api.php。
   api: "https://smsbower.page/stubs/handler_api.php"
-  # SMSBower API key；当前只供 protocol-reg-smsbower 独立工具使用，不会自动接入注册/登录流程。
+  # SMSBower API key；配置后仅 Web 批量 OAuth 授权阶段遇到手机验证会自动接码。
   key: ""
   # 服务代码；SMSBower 服务表中 OpenAI (ChatGPT) 为 dr。
   service: "dr"
@@ -46,11 +46,13 @@ smsbower:
   # 可选排除号码前缀，多个前缀用英文逗号分隔，例如 7918,7900111。
   phone_exception: ""
   # 等待短信验证码的最长秒数。
-  timeout: 180
+  timeout: 30
   # 轮询短信验证码的间隔秒数，最小会按 1 秒处理。
   poll: 5.0
   # SMSBower API 是否也走当前任务代理。
   use_proxy: true
+  # 同一个号码成功验证多少次后 setStatus=6 完成释放；默认按 3 次复用，减少浪费。
+  reuse_limit: 3
 checkout_sms:
   # checkout 浏览器里 PayPal 手机验证的自动收码配置。可配置多个号码，脚本会按顺序选择。
   timeout: 180

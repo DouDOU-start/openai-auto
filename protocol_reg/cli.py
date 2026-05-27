@@ -341,6 +341,7 @@ def main() -> None:
         cfg.otp_poll_max_attempts,
     )
     use_proxy_for_email = _boolish(os.environ.get("EMAIL_CODE_USE_PROXY"), cfg.use_proxy_for_email)
+    smsbower_reuse_limit = _positive_int(os.environ.get("SMSBOWER_REUSE_LIMIT"), cfg.smsbower_reuse_limit)
     settings = Settings(
         project_root=_default_project_root(repo_root).resolve(),
         proxy=str(proxy or "").strip(),
@@ -357,6 +358,7 @@ def main() -> None:
         otp_max_retries=max(1, int(otp_max_retries)),
         otp_poll_max_attempts=max(1, int(otp_poll_max_attempts)),
         use_proxy_for_email=bool(use_proxy_for_email),
+        smsbower_reuse_limit=max(1, int(smsbower_reuse_limit)),
     )
     checkout_profile_root = _resolve_checkout_profile_root(repo_root, args.checkout_browser_profile_root)
     checkout_automation_js = _resolve_checkout_automation_js(args.checkout_js, args.checkout_js_file)

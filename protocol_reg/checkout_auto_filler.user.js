@@ -21,12 +21,16 @@ var CONFIG = {
     cardNumber: '1234561234568888', // 卡号兜底
     smsPollSeconds: 2,
     smsTimeoutSeconds: 180,
-    smsNumbers: []
+    smsNumbers: [],
+    smsLease: null
 };
 // ========================
 
 let cachedProfile = null;
 let selectedSmsNumber = null;
+let smsLeaseAcquiring = false;
+let smsLeaseReleased = false;
+let smsLeaseWaitStartedAt = 0;
 let securityCodeHandling = false;
 let smsPollingActive = false;
 let lastSecurityFillAt = 0;
@@ -102,6 +106,7 @@ var US_STATE_ALIASES = {
             'Protocol Reg Checkout Debug',
             'host=' + currentHost() + ' path=' + currentPath(),
             'smsPhone=' + (sms.phone || '-') + ' smsUrl=' + (sms.smsUrl ? maskUrl(sms.smsUrl) : '-'),
+            'smsLease=' + smsLeaseStatusText(),
             'securityPrompt=' + prompt + ' handling=' + securityCodeHandling + ' watcherTicks=' + securityWatcherTicks,
             'smsPolling=' + smsPollingActive,
             'fillAttempts=' + securityFillAttempts,
@@ -178,10 +183,21 @@ var US_STATE_ALIASES = {
         });
         CONFIG.smsTimeoutSeconds = Number(sms.timeoutSeconds || sms.timeout_seconds || sms.timeout || CONFIG.smsTimeoutSeconds) || CONFIG.smsTimeoutSeconds;
         CONFIG.smsPollSeconds = Number(sms.pollSeconds || sms.poll_seconds || sms.poll || CONFIG.smsPollSeconds) || CONFIG.smsPollSeconds;
+        var lease = sms.lease || {};
+        CONFIG.smsLease = lease && lease.acquireUrl && lease.releaseUrl && lease.token ? {
+            acquireUrl: String(lease.acquireUrl || '').trim(),
+            releaseUrl: String(lease.releaseUrl || '').trim(),
+            token: String(lease.token || '').trim(),
+            waitSeconds: Number(lease.waitSeconds || lease.wait_seconds || 25) || 25
+        } : null;
         if (CONFIG.smsNumbers.length) {
-            selectedSmsNumber = CONFIG.smsNumbers[0];
-            CONFIG.phone = selectedSmsNumber.phone;
-            log('当前：已加载 checkout 短信配置 ' + CONFIG.smsNumbers.length + ' 组，使用 ' + CONFIG.phone);
+            if (CONFIG.smsLease) {
+                log('当前：已加载 checkout 短信配置 ' + CONFIG.smsNumbers.length + ' 组，将在手机验证步骤排队取号');
+            } else {
+                selectedSmsNumber = CONFIG.smsNumbers[0];
+                CONFIG.phone = selectedSmsNumber.phone;
+                log('当前：已加载 checkout 短信配置 ' + CONFIG.smsNumbers.length + ' 组，使用 ' + CONFIG.phone);
+            }
         } else {
             log('当前：未配置 checkout 短信收码，使用脚本默认手机号');
         }
@@ -191,7 +207,7 @@ var US_STATE_ALIASES = {
         if (selectedSmsNumber && selectedSmsNumber.phone && selectedSmsNumber.smsUrl) {
             return selectedSmsNumber;
         }
-        if (CONFIG.smsNumbers && CONFIG.smsNumbers.length) {
+        if (!CONFIG.smsLease && CONFIG.smsNumbers && CONFIG.smsNumbers.length) {
             selectedSmsNumber = CONFIG.smsNumbers[0];
             CONFIG.phone = selectedSmsNumber.phone;
             return selectedSmsNumber;
@@ -205,6 +221,168 @@ var US_STATE_ALIASES = {
 
     function configuredPhone() {
         return currentSmsNumber().phone || CONFIG.phone;
+    }
+
+    function fillPhoneWithLease(cb) {
+        ensureCheckoutSmsLease(function(sms) {
+            if (!sms || !sms.phone) {
+                log('未获取到短信号码，停止提交并等待人工处理');
+                cb && cb(false);
+                return;
+            }
+            fill('phone', sms.phone);
+            cb && cb(true);
+        });
+    }
+
+    function ensureCheckoutSmsLease(cb, retries) {
+        retries = retries || 0;
+        if (selectedSmsNumber && selectedSmsNumber.phone && selectedSmsNumber.smsUrl) {
+            cb(selectedSmsNumber);
+            return;
+        }
+        if (!CONFIG.smsLease) {
+            cb(currentSmsNumber());
+            return;
+        }
+        if (smsLeaseAcquiring) {
+            if (retries % 5 === 0) {
+                log('等待：短信号码正在排队获取中');
+            }
+            setTimeout(function() { ensureCheckoutSmsLease(cb, retries + 1); }, 1000);
+            return;
+        }
+        smsLeaseAcquiring = true;
+        smsLeaseReleased = false;
+        smsLeaseWaitStartedAt = Date.now();
+        requestCheckoutSmsLease(cb);
+    }
+
+    function requestCheckoutSmsLease(cb) {
+        var lease = CONFIG.smsLease || {};
+        var waitSeconds = Math.max(1, Number(lease.waitSeconds || 25) || 25);
+        var url = lease.acquireUrl + (lease.acquireUrl.indexOf('?') === -1 ? '?' : '&') + 'wait=' + encodeURIComponent(waitSeconds) + '&_ts=' + Date.now();
+        smsLeaseAcquiring = true;
+        log('当前：进入手机验证步骤，开始排队获取短信号码');
+        httpRequest({
+            method: 'POST',
+            url: url,
+            headers: { 'Content-Type': 'application/json' },
+            data: JSON.stringify({ token: lease.token, numbers: leaseRequestNumbers() }),
+            onload: function(r) {
+                smsLeaseAcquiring = false;
+                try {
+                    var d = JSON.parse(r.responseText || '{}');
+                    if (Number(r.status || 0) >= 400) {
+                        throw new Error(apiErrorMessage(d, r.status));
+                    }
+                    var item = d.number || {};
+                    if (!item.phone || !item.smsUrl) {
+                        throw new Error(apiErrorMessage(d, r.status) || '接口未返回可用号码');
+                    }
+                    selectedSmsNumber = {
+                        phone: String(item.phone || '').trim(),
+                        smsUrl: String(item.smsUrl || item.sms_url || '').trim(),
+                        label: String(item.label || '').trim(),
+                        leaseId: String(d.leaseId || '')
+                    };
+                    CONFIG.phone = selectedSmsNumber.phone;
+                    log('已获取短信号码租约：' + CONFIG.phone + '，等待 ' + (d.waitSeconds || 0) + ' 秒');
+                    cb(selectedSmsNumber);
+                } catch (e) {
+                    log('短信号码租约解析失败：' + e.message);
+                    handleCheckoutSmsLeaseFailure(cb, e.message);
+                }
+            },
+            onerror: function(e) {
+                log('短信号码暂不可用或租约请求失败：' + (e.statusText || 'network error'));
+                handleCheckoutSmsLeaseFailure(cb, e.statusText || 'network error');
+            }
+        });
+    }
+
+    function apiErrorMessage(data, status) {
+        var d = data || {};
+        var detail = d.detail || d.message || d.error || d.msg || '';
+        if (Array.isArray(detail)) {
+            detail = detail.map(function(item) {
+                return item && item.msg ? item.msg : String(item || '');
+            }).join('; ');
+        }
+        detail = String(detail || '').trim();
+        return detail || (status ? 'HTTP ' + status : '');
+    }
+
+    function retryCheckoutSmsLease(cb) {
+        var elapsed = Date.now() - smsLeaseWaitStartedAt;
+        var timeoutMs = Math.max(30000, (Number(CONFIG.smsTimeoutSeconds) || 180) * 1000);
+        if (elapsed >= timeoutMs) {
+            smsLeaseAcquiring = false;
+            log('等待结束：超过短信配置等待时间，未获取到可用号码');
+            cb(fallbackSmsNumberAfterLeaseFailure());
+            return;
+        }
+        log('等待：3 秒后继续排队获取短信号码');
+        setTimeout(function() {
+            requestCheckoutSmsLease(cb);
+        }, 3000);
+    }
+
+    function handleCheckoutSmsLeaseFailure(cb, reason) {
+        var text = String(reason || '');
+        if (/未登录|会话已过期|token 无效|403|401|400/i.test(text)) {
+            smsLeaseAcquiring = false;
+            cb(fallbackSmsNumberAfterLeaseFailure());
+            return;
+        }
+        retryCheckoutSmsLease(cb);
+    }
+
+    function releaseCheckoutSmsLease(reason) {
+        var lease = CONFIG.smsLease || {};
+        if (!lease.releaseUrl || !lease.token || smsLeaseReleased) {
+            return;
+        }
+        smsLeaseReleased = true;
+        log('当前：释放短信号码租约 reason=' + (reason || 'done'));
+        httpRequest({
+            method: 'POST',
+            url: lease.releaseUrl,
+            headers: { 'Content-Type': 'application/json' },
+            data: JSON.stringify({ token: lease.token }),
+            onload: function() {},
+            onerror: function(e) {
+                log('短信号码租约释放失败：' + (e.statusText || 'network error'));
+            }
+        });
+    }
+
+    function leaseRequestNumbers() {
+        return (CONFIG.smsNumbers || []).map(function(item) {
+            return {
+                phone: item.phone,
+                sms_url: item.smsUrl,
+                label: item.label || ''
+            };
+        });
+    }
+
+    function fallbackSmsNumberAfterLeaseFailure() {
+        if (CONFIG.smsNumbers && CONFIG.smsNumbers.length) {
+            selectedSmsNumber = CONFIG.smsNumbers[0];
+            CONFIG.phone = selectedSmsNumber.phone;
+            log('降级：使用本地第一组短信号码 ' + CONFIG.phone + '，并发时可能需要手动确认');
+            return selectedSmsNumber;
+        }
+        return null;
+    }
+
+    function smsLeaseStatusText() {
+        if (!CONFIG.smsLease) return 'local';
+        if (selectedSmsNumber && !smsLeaseReleased) return 'leased';
+        if (smsLeaseAcquiring) return 'waiting';
+        if (smsLeaseReleased) return 'released';
+        return 'not-acquired';
     }
 
     function usStateName(value) {
@@ -574,14 +752,13 @@ var US_STATE_ALIASES = {
 
     function hasSecurityCodePromptContent() {
         var dialog = securityCodeDialog();
-        var text = dialog ? String(dialog.innerText || '') : pageText();
-        if (/enter your code|we sent a 6-digit code|6-digit code to|resend/i.test(text)) {
+        if (dialog) {
             return true;
         }
-        var root = dialog || document;
-        return !!root.querySelector('input[autocomplete="one-time-code"]') ||
-               !!root.querySelector('input[name*="code" i]') ||
-               !!root.querySelector('input[id*="code" i]');
+        if (currentPath().includes('/checkoutweb/signup')) {
+            return false;
+        }
+        return securityPromptTextMatches(pageText()) && otpInputsIn(document).length > 0;
     }
 
     function hasOpenAIBillingAddressForm() {
@@ -682,7 +859,20 @@ var US_STATE_ALIASES = {
         }
         smsPollingActive = true;
 
-        var smsConfig = currentSmsNumber();
+        ensureCheckoutSmsLease(function(smsConfig) {
+            if (!smsConfig) {
+                smsPollingActive = false;
+                log('未获取到短信号码，无法轮询验证码');
+                releaseCheckoutSmsLease('lease-unavailable');
+                cb(null);
+                return;
+            }
+            pollSecurityCodeWithSms(smsConfig, cb, retries);
+        });
+    }
+
+    function pollSecurityCodeWithSms(smsConfig, cb, retries) {
+        retries = retries || 0;
         var paypalSmsApiUrl = smsConfig.smsUrl || '';
         if (!paypalSmsApiUrl) {
             smsPollingActive = false;
@@ -872,6 +1062,7 @@ var US_STATE_ALIASES = {
         if (!hasSecurityCodePrompt()) {
             securityCodeHandling = false;
             log('当前：验证码弹窗已关闭，继续后续流程');
+            releaseCheckoutSmsLease('security-dismissed');
             setTimeout(function() { clickBtnWithRetry(); }, 1000);
             return;
         }
@@ -933,34 +1124,39 @@ var US_STATE_ALIASES = {
             log('未找到验证码弹窗容器');
             return [];
         }
+        return otpInputsIn(root);
+    }
+
+    function otpInputsIn(root) {
         var inputs = Array.prototype.slice.call(root.querySelectorAll('input')).filter(function(el) {
-            return el.offsetParent !== null && !el.disabled && !el.readOnly;
+            return el.offsetParent !== null && !el.disabled && !el.readOnly && !isPhoneOrCountryInput(el);
         });
         var single = inputs.filter(function(el) {
-            var id = (el.id || '') + ' ' + (el.name || '') + ' ' + (el.autocomplete || '') + ' ' + (el.getAttribute('aria-label') || '');
-            return /code|otp|security|verify|one-time/i.test(id) ||
+            var id = inputMeta(el);
+            return /otp|security|verify|one-time|verification/i.test(id) ||
                    el.autocomplete === 'one-time-code' ||
-                   (el.maxLength && el.maxLength === 6);
+                   (el.maxLength && el.maxLength === 6 && !isPhoneOrCountryInput(el));
         });
         if (single.length) return [single[0]];
+        var digitBoxes = inputs.filter(function(el) {
+            var rect = el.getBoundingClientRect();
+            return rect.width >= 20 && rect.width <= 90 &&
+                   rect.height >= 20 && rect.height <= 90 &&
+                   !isPhoneOrCountryInput(el);
+        });
+        if (digitBoxes.length >= 6 && securityPromptTextMatches(root.innerText || '')) {
+            return digitBoxes.slice(0, 6).sort(inputPositionSort);
+        }
         return inputs.filter(function(el) {
             var rect = el.getBoundingClientRect();
             var id = el.id || '';
             var name = el.name || '';
-            var meta = id + ' ' + name + ' ' + (el.autocomplete || '') + ' ' + (el.getAttribute('aria-label') || '') + ' ' + (el.placeholder || '');
-            return (el.maxLength === 1 && /otp|code|security|verify|one-time/i.test(meta)) ||
+            var meta = inputMeta(el);
+            return (el.maxLength === 1 && /otp|code|security|verify|one-time|verification/i.test(meta)) ||
                    /^ci-ciBasic-\d+$/.test(id) ||
                    /^ciBasic-\d+$/.test(name) ||
-                   /^\d-6$/.test(el.getAttribute('aria-label') || '') ||
-                   (el.maxLength === 1 && hasSecurityCodePromptContent()) ||
-                   (hasSecurityCodePromptContent() && rect.width > 20 && rect.width < 80 && rect.height > 20 && rect.height < 80);
-        }).sort(function(a, b) {
-            var ar = a.getBoundingClientRect();
-            var br = b.getBoundingClientRect();
-            if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
-            if (Math.abs(ar.left - br.left) > 4) return ar.left - br.left;
-            return 0;
-        });
+                   /^\d-6$/.test(el.getAttribute('aria-label') || '');
+        }).sort(inputPositionSort);
     }
 
     function securityCodeDialog() {
@@ -969,8 +1165,8 @@ var US_STATE_ALIASES = {
         )).filter(function(el) {
             if (el === debugPanelNode || !el || el.offsetParent === null) return false;
             var text = String(el.innerText || '');
-            if (!/enter your code|we sent a 6-digit code|6-digit code to|resend/i.test(text)) return false;
-            return el.querySelectorAll && el.querySelectorAll('input').length > 0;
+            if (!securityPromptTextMatches(text)) return false;
+            return el.querySelectorAll && otpInputsIn(el).length > 0;
         }).sort(function(a, b) {
             var ar = a.getBoundingClientRect();
             var br = b.getBoundingClientRect();
@@ -982,6 +1178,37 @@ var US_STATE_ALIASES = {
             return candidates[0];
         }
         return null;
+    }
+
+    function securityPromptTextMatches(text) {
+        return /enter your code|we sent a 6-digit code|6-digit code to|resend|verification code|security code/i.test(String(text || ''));
+    }
+
+    function inputPositionSort(a, b) {
+        var ar = a.getBoundingClientRect();
+        var br = b.getBoundingClientRect();
+        if (Math.abs(ar.top - br.top) > 8) return ar.top - br.top;
+        if (Math.abs(ar.left - br.left) > 4) return ar.left - br.left;
+        return 0;
+    }
+
+    function inputMeta(el) {
+        return [
+            el.id || '',
+            el.name || '',
+            el.autocomplete || '',
+            el.getAttribute('aria-label') || '',
+            el.placeholder || '',
+            el.type || ''
+        ].join(' ');
+    }
+
+    function isPhoneOrCountryInput(el) {
+        var meta = inputMeta(el);
+        return /phone|mobile|tel|country|calling|dial|prefix|codePhone|countryCode|phoneCode/i.test(meta) ||
+               el.type === 'tel' ||
+               el.id === 'phone' ||
+               el.name === 'phone';
     }
 
     function fillSecurityCode(code) {
@@ -1357,6 +1584,7 @@ var US_STATE_ALIASES = {
     if (currentHost().includes('paypal.com') && window.location.href.includes('/webapps/hermes')) {
         if (window.location.href.includes('/billingweb/review')) {
             log('当前流程：PayPal review 页面，准备点同意按钮');
+            releaseCheckoutSmsLease('review-page');
             setTimeout(function() {
                 clickConsentButton();
             }, 1000);
@@ -1382,7 +1610,6 @@ var US_STATE_ALIASES = {
                 var addr = profile.address;
                 var card = profile.card;
                 fill('email', randEmail());
-                fill('phone', configuredPhone());
                 fill('cardNumber', card.number);
                 fill('cardExpiry', card.expiry);
                 fill('cardCvv', card.cvv);
@@ -1394,7 +1621,12 @@ var US_STATE_ALIASES = {
                         if (!filled) {
                             return;
                         }
-                        setTimeout(function() { clickBtnWithRetry(); }, 500);
+                        fillPhoneWithLease(function(ok) {
+                            if (!ok) {
+                                return;
+                            }
+                            setTimeout(function() { clickBtnWithRetry(); }, 500);
+                        });
                     });
                 });
             });
@@ -1423,7 +1655,6 @@ var US_STATE_ALIASES = {
                 var password = randPass();
                 log('当前：已生成邮箱和密码，准备填写');
                 fill('email', email);
-                fill('phone', configuredPhone());
                 fill('cardNumber', card.number);
                 fill('cardExpiry', card.expiry);
                 fill('cardCvv', card.cvv);
@@ -1431,7 +1662,12 @@ var US_STATE_ALIASES = {
                 fill('firstName', 'James');
                 fill('lastName', 'Smith');
                 fillGoogleAddress('#billingLine1', '#billingCity', '#billingPostalCode', 'billingState', addr, function() {
-                    setTimeout(function() { clickBtnWithRetry(); }, 500);
+                    fillPhoneWithLease(function(ok) {
+                        if (!ok) {
+                            return;
+                        }
+                        setTimeout(function() { clickBtnWithRetry(); }, 500);
+                    });
                 });
             });
         }

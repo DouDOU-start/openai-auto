@@ -97,7 +97,7 @@ uv run protocol-reg --mode register --open-checkout --checkout-js-file scripts/c
 
 内置自动填表脚本会作为临时 Chrome 扩展加载，能随 checkout 跳转持续在 `pay.openai.com`、`checkout.stripe.com` 和 `paypal.com` 页面生效。`--checkout-js` / `--checkout-js-file` 是额外的一次性 JS 执行入口，支持 `await`，返回值会打印到终端。
 
-PayPal 短信收码可以在 Web 设置页 `/settings` 的“Checkout 短信收码”里配置多组手机号和收码 URL。打开 checkout 时脚本默认使用第一组可用配置填写手机号，并轮询对应 URL 自动读取 6 位验证码后填写提交。配置也会保存到 `config/protocol-reg.yaml` 的 `checkout_sms.numbers`。
+PayPal 短信收码可以在 Web 设置页 `/settings` 的“Checkout 短信收码”里配置多组手机号和收码 URL。多个 checkout 浏览器可以并行打开和填写资料；脚本只会在 PayPal 手机验证/取验证码步骤向 Web 后端排队获取号码租约，同一号码在租约释放或超时前不会被其它 checkout 复用。脚本会填写租约手机号，并轮询对应 URL 自动读取 6 位验证码后填写提交。配置会保存到 `config/protocol-reg.yaml` 的 `checkout_sms.numbers`。
 
 需要关闭内置自动填表脚本时：
 
@@ -199,7 +199,7 @@ email_code:
 
 这个开关也兼容 `use_proxy_for_email` 写法。
 
-SMSBower 先作为独立工具接入，不会自动参与注册/登录手机号验证。SMSBower 文档页说明所有请求使用 `https://smsbower.page/stubs/handler_api.php`，并通过 `api_key`、`action` 参数调用；服务表中 OpenAI (ChatGPT) 的服务代码是 `dr`。后续租号、号码复用和实际提交手机号会再按业务策略适配。
+SMSBower 已接入 Web 批量 OAuth 授权阶段的手机验证。配置 `smsbower.key` 后，`/admin` 里批量 OAuth 授权在“授权”步骤遇到手机验证会自动 `getNumber` 租号、提交手机号、轮询 `getStatus` 获取验证码，并在同一号码成功验证 `reuse_limit` 次后调用 `setStatus=6` 完成释放；默认 `reuse_limit: 3`，避免每个账号都浪费一个号码。注册和登录阶段仍保留人工手机号验证，不自动消耗 SMSBower 号码。SMSBower 文档页说明所有请求使用 `https://smsbower.page/stubs/handler_api.php`，并通过 `api_key`、`action` 参数调用；服务表中 OpenAI (ChatGPT) 的服务代码是 `dr`。
 
 ```yaml
 smsbower:
@@ -210,9 +210,10 @@ smsbower:
   country: ""
   max_price: ""
   min_price: ""
-  timeout: 180
+  timeout: 30
   poll: 5.0
   use_proxy: true
+  reuse_limit: 3
 ```
 
 CLI 也支持临时覆盖：
@@ -221,7 +222,7 @@ CLI 也支持临时覆盖：
 SMSBOWER_API_KEY="你的 key" uv run protocol-reg-smsbower balance
 ```
 
-查 OpenAI (ChatGPT) 便宜国家/供应商：
+查 OpenAI (ChatGPT) 便宜国家/供应商，用来选择更便宜的 `country`、`max_price` 或供应商过滤：
 
 ```bash
 uv run protocol-reg-smsbower cheap --service dr --limit 20 --min-count 1
@@ -349,7 +350,7 @@ uv run protocol-reg --license-file /path/to/wenfxl.license
 
 ## 边界
 
-- 当前注册/登录流程仍使用人工手机号验证；SMSBower 只作为独立工具接出，租号、号码复用和自动提交会后续单独适配。
+- 当前注册/登录流程仍使用人工手机号验证；Web 批量 OAuth 授权配置 SMSBower 后会自动处理授权阶段的手机验证。
 - `login` 和 `authorize` 已拆开；`authorize` 优先使用已保存 cookies，没有 cookies 时会要求输入密码并即时登录。
 - `register` 和 `login` 不做 OAuth 授权，只获取 ChatGPT session 身份信息。
 - 当前版本不自动读邮箱；验证码由手动输入。

@@ -59,9 +59,10 @@ class AppConfig:
     smsbower_provider_ids: str = ""
     smsbower_except_provider_ids: str = ""
     smsbower_phone_exception: str = ""
-    smsbower_timeout: int = 180
+    smsbower_timeout: int = 30
     smsbower_poll: float = 5.0
     use_proxy_for_smsbower: bool = True
+    smsbower_reuse_limit: int = 3
     # Checkout 浏览器自动填手机号和短信验证码
     checkout_sms_numbers: tuple[CheckoutSmsNumberConfig, ...] = ()
     checkout_sms_timeout: int = 180
@@ -139,12 +140,15 @@ def load_app_config(path: Path) -> AppConfig:
         except Exception:
             return default
 
-    smsbower_timeout = _sms_i("timeout", 180)
+    smsbower_timeout = _sms_i("timeout", 30)
     if smsbower_timeout < 5:
         smsbower_timeout = 5
     smsbower_poll = _sms_f("poll", 5.0)
     if smsbower_poll < 1:
         smsbower_poll = 1.0
+    smsbower_reuse_limit = _sms_i("reuse_limit", 3)
+    if smsbower_reuse_limit < 1:
+        smsbower_reuse_limit = 1
     smsbower_use_proxy_value = smsbower.get("use_proxy")
     if smsbower_use_proxy_value in {None, ""} and "use_proxy_for_smsbower" in smsbower:
         smsbower_use_proxy_value = smsbower.get("use_proxy_for_smsbower")
@@ -184,6 +188,7 @@ def load_app_config(path: Path) -> AppConfig:
         smsbower_timeout=smsbower_timeout,
         smsbower_poll=smsbower_poll,
         use_proxy_for_smsbower=_bool(smsbower_use_proxy_value, True),
+        smsbower_reuse_limit=smsbower_reuse_limit,
         checkout_sms_numbers=_load_checkout_sms_numbers(checkout_sms.get("numbers")),
         checkout_sms_timeout=checkout_sms_timeout,
         checkout_sms_poll=checkout_sms_poll,
@@ -265,9 +270,10 @@ def config_template() -> dict[str, Any]:
             "provider_ids": "",
             "except_provider_ids": "",
             "phone_exception": "",
-            "timeout": 180,
+            "timeout": 30,
             "poll": 5.0,
             "use_proxy": True,
+            "reuse_limit": 3,
         },
         "checkout_sms": {
             "timeout": 180,

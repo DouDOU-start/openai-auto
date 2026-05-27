@@ -96,9 +96,10 @@ class Settings:
     smsbower_provider_ids: str = ""
     smsbower_except_provider_ids: str = ""
     smsbower_phone_exception: str = ""
-    smsbower_timeout: int = 180
+    smsbower_timeout: int = 30
     smsbower_poll_interval: float = 5.0
     use_proxy_for_smsbower: bool = True
+    smsbower_reuse_limit: int = 3
 
     @property
     def email_code_proxies(self) -> dict[str, str] | None:

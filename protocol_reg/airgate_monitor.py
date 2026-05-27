@@ -439,6 +439,19 @@ def _override_proxy(settings: Settings, config: AirGateMonitorConfig) -> Setting
         otp_max_retries=settings.otp_max_retries,
         otp_poll_max_attempts=settings.otp_poll_max_attempts,
         use_proxy_for_email=settings.use_proxy_for_email,
+        smsbower_api_base=settings.smsbower_api_base,
+        smsbower_api_key=settings.smsbower_api_key,
+        smsbower_service=settings.smsbower_service,
+        smsbower_country=settings.smsbower_country,
+        smsbower_max_price=settings.smsbower_max_price,
+        smsbower_min_price=settings.smsbower_min_price,
+        smsbower_provider_ids=settings.smsbower_provider_ids,
+        smsbower_except_provider_ids=settings.smsbower_except_provider_ids,
+        smsbower_phone_exception=settings.smsbower_phone_exception,
+        smsbower_timeout=settings.smsbower_timeout,
+        smsbower_poll_interval=settings.smsbower_poll_interval,
+        use_proxy_for_smsbower=settings.use_proxy_for_smsbower,
+        smsbower_reuse_limit=settings.smsbower_reuse_limit,
     )
 
 

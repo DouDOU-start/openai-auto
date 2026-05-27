@@ -17,6 +17,7 @@ from .utils import absolutize_auth_url, mask_email, random_profile
 
 
 Prompt = Callable[[str], str]
+PhoneSolver = Callable[..., str]
 PHONE_CHANGE_COMMAND = "__protocol_reg_change_phone__"
 
 
@@ -25,9 +26,10 @@ class PhoneVerificationError(RuntimeError):
 
 
 class RegisterFlow:
-    def __init__(self, settings: Settings, prompt: Prompt):
+    def __init__(self, settings: Settings, prompt: Prompt, phone_solver: PhoneSolver | None = None):
         self.settings = settings
         self.prompt = prompt
+        self.phone_solver = phone_solver
         self.auth_core = AuthCoreClient(settings.project_root, settings.license_file)
         self.http = OpenAIHTTP(settings, self.auth_core)
         self.email_code = EmailCodeClient(settings)
@@ -757,6 +759,38 @@ class RegisterFlow:
         current_url: str,
         label: str,
     ) -> str:
+        if self.phone_solver is not None:
+            return self.phone_solver(
+                flow=self,
+                http=http,
+                did=did,
+                user_agent=user_agent,
+                ctx=ctx,
+                current_url=current_url,
+                label=label,
+            )
+        return self._manual_phone_verification(
+            flow=self,
+            http=http,
+            did=did,
+            user_agent=user_agent,
+            ctx=ctx,
+            current_url=current_url,
+            label=label,
+        )
+
+    def _manual_phone_verification(
+        self,
+        *,
+        flow: "RegisterFlow" | None = None,
+        http: OpenAIHTTP,
+        did: str,
+        user_agent: str,
+        ctx: dict[str, Any],
+        current_url: str,
+        label: str,
+    ) -> str:
+        _ = flow
         print(f"[{label}] 触发手机号验证，需要人工输入手机号和短信验证码")
         current = absolutize_auth_url(current_url or "https://auth.openai.com/add-phone")
         max_retries = max(1, int(self.settings.otp_max_retries or 1))

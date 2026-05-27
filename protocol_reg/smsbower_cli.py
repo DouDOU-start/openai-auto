@@ -23,10 +23,10 @@ def main() -> None:
         getattr(cfg, "proxies", ()),
         getattr(cfg, "proxy", ""),
     )
-    proxy = pick_proxy_from_pool(proxy_pool)
-    if len(proxy_pool) > 1:
+    proxy = "" if args.no_proxy else pick_proxy_from_pool(proxy_pool)
+    if not args.no_proxy and len(proxy_pool) > 1:
         print(f"[代理] 已配置 {len(proxy_pool)} 个代理，本次使用: {proxy_preview(proxy)}")
-    elif proxy:
+    elif not args.no_proxy and proxy:
         print(f"[代理] 使用代理: {proxy_preview(proxy)}")
 
     settings = _settings_from_args(repo_root, cfg, args, proxy)
@@ -186,6 +186,7 @@ def _settings_from_args(repo_root: Path, cfg: Any, args: argparse.Namespace, pro
     smsbower_timeout = int(args.timeout) if int(args.timeout or 0) > 0 else int(os.environ.get("SMSBOWER_TIMEOUT", "0") or 0) or cfg.smsbower_timeout
     smsbower_poll = float(args.poll) if float(args.poll or 0) > 0 else float(os.environ.get("SMSBOWER_POLL", "0") or 0) or cfg.smsbower_poll
     use_proxy = False if args.no_proxy else _boolish(os.environ.get("SMSBOWER_USE_PROXY"), cfg.use_proxy_for_smsbower)
+    smsbower_reuse_limit = _positive_int(os.environ.get("SMSBOWER_REUSE_LIMIT"), cfg.smsbower_reuse_limit)
     return Settings(
         project_root=repo_root.resolve(),
         proxy=str(proxy or "").strip(),
@@ -214,6 +215,7 @@ def _settings_from_args(repo_root: Path, cfg: Any, args: argparse.Namespace, pro
         smsbower_timeout=max(5, int(smsbower_timeout)),
         smsbower_poll_interval=max(1.0, float(smsbower_poll)),
         use_proxy_for_smsbower=bool(use_proxy),
+        smsbower_reuse_limit=max(1, int(smsbower_reuse_limit)),
     )
 
 
@@ -234,6 +236,14 @@ def _boolish(value: object, default: bool) -> bool:
     if text in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return default
+    return parsed if parsed > 0 else default
 
 
 if __name__ == "__main__":
