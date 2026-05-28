@@ -15,7 +15,9 @@ from .storage import (
     ACCOUNT_STATUS_ABANDONED,
     NULL_VALUE,
     get_account_db_by_email,
+    save_authorization_token_db,
     save_login_session_db,
+    try_load_login_session_db,
     update_account_status_db,
 )
 
@@ -328,34 +330,60 @@ class AirGate401Monitor:
         if local_account is None:
             raise AirGateAdminError("本地账号池里没有这个邮箱")
         password = str(local_account.get("password") or "").strip()
-        if not password or password.lower() == NULL_VALUE:
-            raise AirGateAdminError("本地账号缺少密码，无法重新登录")
 
         settings = self._settings_factory()
         settings = _override_proxy(settings, config)
         flow = RegisterFlow(settings, prompt=self._prompt_factory)
+        session_data: dict[str, Any] | None = None
+        token_data: dict[str, Any] | None = None
         try:
-            print(f"[AirGate] 重新登录获取 session: {email}")
+            print(f"[AirGate] 重新登录并授权获取 rt: {email}")
             try:
-                session_data = flow.login(email, password, create_checkout=False)
+                saved_session = try_load_login_session_db(email)
+                if saved_session is not None:
+                    print(f"[AirGate] 优先使用本地登录会话发起 OAuth: {email}")
+                    token_data = flow.authorize_from_session(email, saved_session)
             except Exception as exc:
-                if _is_forbidden_error(exc):
-                    self._abandon_local_account(local_account)
-                    raise AirGateAdminError(f"登录触发 403，已将本地账号废弃: {email}") from exc
-                raise
+                print(f"[AirGate] 本地登录会话授权失败，准备改用账号密码重登: {email} -> {exc}")
+                token_data = None
+
+            if token_data is None:
+                if not password or password.lower() == NULL_VALUE:
+                    raise AirGateAdminError("本地账号缺少密码且没有可用登录会话，无法重新授权")
+                try:
+                    session_data = flow.login(email, password, create_checkout=False)
+                except Exception as exc:
+                    if _is_forbidden_error(exc):
+                        self._abandon_local_account(local_account)
+                        raise AirGateAdminError(f"登录触发 403，已将本地账号废弃: {email}") from exc
+                    raise
+                save_login_session_db(email, password, session_data)
+                token_data = flow.authorize_current_session(email, session_data)
+
+            refresh_token = _clean_text(token_data.get("refresh_token")) or _clean_text(token_data.get("refreshToken"))
+            if not refresh_token:
+                raise AirGateAdminError(f"OAuth 授权完成但未拿到 refresh_token: {email}")
         finally:
             try:
                 flow.close()
             except Exception:
                 pass
 
-        session_payload = _session_payload(session_data)
+        saved = save_authorization_token_db(email, password, token_data) or local_account
+        session_payload = _session_payload(session_data or {})
         access_token = _session_access_token(session_payload)
+        if not access_token:
+            access_token = _clean_text(token_data.get("access_token")) or _clean_text(token_data.get("accessToken"))
         if not access_token:
             raise AirGateAdminError("登录完成但未拿到新的 session accessToken")
 
-        saved = save_login_session_db(email, password, session_data) or local_account
-        merged_credentials = _build_credentials(core_account, saved, session_payload, session_data)
+        merged_credentials = _build_credentials(
+            core_account,
+            saved,
+            session_payload,
+            session_data,
+            auth_payload=token_data,
+        )
         client = AirGateCoreClient(config.core_url, config.admin_key, timeout=settings.timeout)
         client.update_account(int(core_account.get("id") or 0), credentials=merged_credentials, state="active")
         return f"{email} -> core#{core_account.get('id')}"
@@ -386,6 +414,8 @@ def _build_credentials(
     local_account: dict[str, Any],
     session_payload: dict[str, Any],
     session_data: dict[str, Any],
+    *,
+    auth_payload: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     existing = core_account.get("credentials") if isinstance(core_account.get("credentials"), dict) else {}
     result: dict[str, str] = {}
@@ -394,23 +424,51 @@ def _build_credentials(
         if text:
             result[str(key)] = text
 
-    access_token = _session_access_token(session_payload)
+    auth_payload = auth_payload or {}
+    access_token = (
+        _session_access_token(session_payload)
+        or _clean_text(auth_payload.get("access_token"))
+        or _clean_text(auth_payload.get("accessToken"))
+    )
     if not access_token:
-        raise AirGateAdminError("session 中缺少 accessToken")
+        raise AirGateAdminError("登录/授权结果中缺少 accessToken")
     result["access_token"] = access_token
-    session_token = _session_nested_text(session_payload, "sessionToken") or _session_nested_text(session_payload, "session_token")
+    session_token = (
+        _session_nested_text(session_payload, "sessionToken")
+        or _session_nested_text(session_payload, "session_token")
+        or _clean_text(auth_payload.get("session_token"))
+        or _clean_text(auth_payload.get("sessionToken"))
+    )
     if session_token:
         result["session_token"] = session_token
-    account_id = _session_nested_text(session_payload, "account", "id")
+    account_id = (
+        _session_nested_text(session_payload, "account", "id")
+        or _clean_text(auth_payload.get("account_id"))
+        or _clean_text(auth_payload.get("chatgpt_account_id"))
+    )
     if account_id:
         result["chatgpt_account_id"] = account_id
-    email = _session_nested_text(session_payload, "user", "email") or _clean_text(local_account.get("email"))
+    email = (
+        _session_nested_text(session_payload, "user", "email")
+        or _clean_text(auth_payload.get("email"))
+        or _clean_text(local_account.get("email"))
+    )
     if email:
         result["email"] = email
-    plan_type = _session_nested_text(session_payload, "account", "planType") or _clean_text(local_account.get("subscription_type"))
+    plan_type = (
+        _session_nested_text(session_payload, "account", "planType")
+        or _session_nested_text(session_payload, "account", "plan_type")
+        or _clean_text(auth_payload.get("plan_type"))
+        or _clean_text(auth_payload.get("planType"))
+        or _clean_text(local_account.get("subscription_type"))
+    )
     if plan_type:
         result["plan_type"] = plan_type
-    refresh_token = _clean_text(local_account.get("refresh_token"))
+    refresh_token = (
+        _clean_text(auth_payload.get("refresh_token"))
+        or _clean_text(auth_payload.get("refreshToken"))
+        or _clean_text(local_account.get("refresh_token"))
+    )
     if refresh_token and refresh_token.lower() != NULL_VALUE:
         result["refresh_token"] = refresh_token
     if "base_url" not in result:
@@ -418,7 +476,12 @@ def _build_credentials(
     if "provider" not in result:
         result["provider"] = ""
     if "subscription_active_until" not in result:
-        result["subscription_active_until"] = _session_nested_text(session_data, "subscription_active_until") or ""
+        result["subscription_active_until"] = (
+            _clean_text(auth_payload.get("subscription_active_until"))
+            or _clean_text(auth_payload.get("subscriptionActiveUntil"))
+            or _session_nested_text(session_data, "subscription_active_until")
+            or ""
+        )
     return result
 
 
@@ -498,7 +561,12 @@ def _looks_like_401_account(account: dict[str, Any]) -> bool:
     reason = " ".join(
         [
             _clean_text(account.get("error_msg")),
+            _clean_text(account.get("errorMsg")),
+            _clean_text(account.get("reason")),
+            _clean_text(account.get("disabled_reason")),
+            _clean_text(account.get("disable_reason")),
             _clean_text(_credential_value(account, "error_msg")),
+            _clean_text(_credential_value(account, "reason")),
         ]
     ).lower()
     return (
@@ -510,6 +578,12 @@ def _looks_like_401_account(account: dict[str, Any]) -> bool:
         or "expired" in reason
         or "失效" in reason
         or "无效" in reason
+        or "手动关闭" in reason
+        or "手动禁用" in reason
+        or "manual close" in reason
+        or "manual closed" in reason
+        or "manual disable" in reason
+        or "manually disabled" in reason
     )
 
 

@@ -25,6 +25,12 @@ class PhoneVerificationError(RuntimeError):
     """手机号验证失败，不应被授权流程当作登录会话失效处理。"""
 
 
+_AUTH_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+_AUTH_RETRY_MAX_ATTEMPTS = 4
+_AUTH_RETRY_BASE_DELAY_SECONDS = 30.0
+_AUTH_RETRY_MAX_DELAY_SECONDS = 180.0
+
+
 class RegisterFlow:
     def __init__(self, settings: Settings, prompt: Prompt, phone_solver: PhoneSolver | None = None):
         self.settings = settings
@@ -50,7 +56,9 @@ class RegisterFlow:
         ctx: dict[str, Any] = {"email": email}
 
         print("[注册] 提交邮箱")
-        signup_resp = self.http.post_json(
+        signup_resp = self._post_json_with_retry(
+            self.http,
+            label="提交邮箱",
             url="https://auth.openai.com/api/accounts/authorize/continue",
             did=did,
             flow="authorize_continue",
@@ -63,7 +71,9 @@ class RegisterFlow:
         self._ensure_status(signup_resp, 200, "提交邮箱")
 
         print("[注册] 设置密码")
-        pwd_resp = self.http.post_json(
+        pwd_resp = self._post_json_with_retry(
+            self.http,
+            label="设置密码",
             url="https://auth.openai.com/api/accounts/user/register",
             did=did,
             flow="username_password_create",
@@ -393,6 +403,58 @@ class RegisterFlow:
     def close(self) -> None:
         self.http.close()
 
+    def _post_json_with_retry(
+        self,
+        http: OpenAIHTTP,
+        *,
+        label: str,
+        url: str,
+        did: str,
+        flow: str,
+        proxy: str,
+        user_agent: str,
+        ctx: dict[str, Any],
+        referer: str,
+        payload: dict[str, Any],
+    ) -> Any:
+        last_error = ""
+        for attempt in range(1, _AUTH_RETRY_MAX_ATTEMPTS + 1):
+            try:
+                resp = http.post_json(
+                    url=url,
+                    did=did,
+                    flow=flow,
+                    proxy=proxy,
+                    user_agent=user_agent,
+                    ctx=ctx,
+                    referer=referer,
+                    payload=payload,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt >= _AUTH_RETRY_MAX_ATTEMPTS:
+                    raise
+                delay = self._auth_retry_delay(attempt)
+                print(f"[警告] {label} 请求异常，{delay:.0f}s 后重试: {exc}")
+                time.sleep(delay)
+                continue
+
+            if resp.status_code in _AUTH_RETRY_STATUS_CODES and attempt < _AUTH_RETRY_MAX_ATTEMPTS:
+                reason = self._response_text(resp)[:300] or f"HTTP {resp.status_code}"
+                delay = self._auth_retry_delay(attempt)
+                print(f"[警告] {label} 返回可重试错误，{delay:.0f}s 后重试: {reason}")
+                time.sleep(delay)
+                continue
+            return resp
+
+        raise RuntimeError(f"{label}请求失败: {last_error}")
+
+    @staticmethod
+    def _auth_retry_delay(attempt: int) -> float:
+        attempt = max(1, int(attempt))
+        delay = _AUTH_RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1))
+        return min(_AUTH_RETRY_MAX_DELAY_SECONDS, delay)
+
     def _password_login(
         self,
         email: str,
@@ -404,7 +466,9 @@ class RegisterFlow:
         label: str,
     ) -> str:
         print(f"[{label}] 提交账号邮箱")
-        login_resp = self.http.post_json(
+        login_resp = self._post_json_with_retry(
+            self.http,
+            label=f"{label}邮箱提交",
             url="https://auth.openai.com/api/accounts/authorize/continue",
             did=did,
             flow="authorize_continue",
@@ -430,7 +494,9 @@ class RegisterFlow:
                 )
 
         print(f"[{label}] 校验账号密码")
-        pwd_resp = self.http.post_json(
+        pwd_resp = self._post_json_with_retry(
+            self.http,
+            label=f"{label}密码校验",
             url="https://auth.openai.com/api/accounts/password/verify",
             did=did,
             flow="password_verify",
@@ -535,7 +601,9 @@ class RegisterFlow:
                     current_url=current,
                     label="授权",
                 )
-            login_resp = login_http.post_json(
+            login_resp = self._post_json_with_retry(
+                login_http,
+                label="登录邮箱提交",
                 url="https://auth.openai.com/api/accounts/authorize/continue",
                 did=did,
                 flow="authorize_continue",
@@ -559,7 +627,9 @@ class RegisterFlow:
                     current_url=current,
                     label="授权",
                 )
-            pwd_resp = login_http.post_json(
+            pwd_resp = self._post_json_with_retry(
+                login_http,
+                label="密码登录",
                 url="https://auth.openai.com/api/accounts/password/verify",
                 did=did,
                 flow="password_verify",

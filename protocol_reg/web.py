@@ -1186,7 +1186,10 @@ def create_app(runtime: WebRuntime | None = None) -> FastAPI:
     subscription_verify_scheduler = SubscriptionVerifyScheduler(runtime)
     airgate_monitor = AirGate401Monitor(
         app_cfg.airgate_monitor,
-        lambda: _settings_from_runtime(runtime, proxy=_airgate_monitor_proxy(airgate_monitor)),
+        lambda: _settings_from_runtime(
+            runtime,
+            proxy=_airgate_monitor_proxy(runtime, app_cfg, airgate_monitor),
+        ),
     )
 
     app = FastAPI(title="Protocol Reg 账号管理", version="0.1.0")
@@ -2712,12 +2715,40 @@ def _checkout_sms_runtime_config(
     return data
 
 
-def _airgate_monitor_proxy(monitor: AirGate401Monitor) -> str:
+def _airgate_monitor_proxy(runtime: WebRuntime, cfg: AppConfig, monitor: AirGate401Monitor) -> str:
     try:
         config = monitor.current_config()
     except Exception:
-        return ""
-    return str(config.proxy or "").strip()
+        config = AirGateMonitorConfig()
+
+    proxy = str(config.proxy or "").strip()
+    if proxy:
+        return proxy
+
+    runtime_proxy = str(runtime.proxy or "").strip()
+    if runtime_proxy:
+        return runtime_proxy
+
+    authorize_pool = resolve_proxy_pool(
+        os.environ.get("PROTOCOL_REG_AUTHORIZE_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_AUTHORIZE_PROXY", ""),
+        os.environ.get("PROTOCOL_REG_OAUTH_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_OAUTH_PROXY", ""),
+        cfg.authorize_proxies,
+        cfg.authorize_proxy,
+    )
+    if authorize_pool:
+        return pick_proxy_from_pool(authorize_pool)
+
+    global_pool = resolve_proxy_pool(
+        os.environ.get("PROTOCOL_REG_PROXIES", ""),
+        os.environ.get("PROTOCOL_REG_PROXY", ""),
+        cfg.proxies,
+        cfg.proxy,
+    )
+    if global_pool:
+        return pick_proxy_from_pool(global_pool)
+    return ""
 
 
 def _airgate_monitor_config_from_payload(payload: AirGateMonitorPayload, *, enabled: bool) -> AirGateMonitorConfig:
