@@ -64,9 +64,9 @@ checkout_sms:
   # 轮询短信链接的间隔秒数，最小会按 1 秒处理。
   poll: 2.0
   numbers:
-    - phone: "你的手机号"
-      sms_url: "http://a.62-us.com/api/get_sms?key=你的key"
-      label: "62-us PayPal"
+    - phone: "9012345678"
+      sms_url: "https://example.com/api/get_sms?key=你的key"
+      label: "JP PayPal"
 airgate_monitor:
   # AirGate core 的 admin API 基地址，例如 http://127.0.0.1:8080
   core_url: ""

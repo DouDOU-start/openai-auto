@@ -132,7 +132,7 @@ def open_url_in_fresh_browser(
     profile_root.mkdir(parents=True, exist_ok=True)
     cleanup_old_browser_profiles(profile_root)
     profile_dir = _new_profile_dir(profile_root)
-    _write_us_profile_preferences(profile_dir)
+    _write_jp_profile_preferences(profile_dir)
     proxy_config = _browser_proxy_config(browser_proxy)
     checkout_sms_config = _normalize_checkout_sms_config(checkout_sms)
     extension_dir = _build_auto_filler_extension(
@@ -217,7 +217,7 @@ def _new_profile_dir(profile_root: Path) -> Path:
     return path
 
 
-def _write_us_profile_preferences(profile_dir: Path) -> None:
+def _write_jp_profile_preferences(profile_dir: Path) -> None:
     default_dir = profile_dir / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
     prefs = {
@@ -226,7 +226,7 @@ def _write_us_profile_preferences(profile_dir: Path) -> None:
             "profile_enabled": False,
         },
         "credentials_enable_service": False,
-        "intl": {"accept_languages": "en-US,en"},
+        "intl": {"accept_languages": "ja-JP,ja,en-US,en"},
         "payments": {"can_make_payment_enabled": False},
         "profile": {
             "password_manager_enabled": False,
@@ -237,7 +237,7 @@ def _write_us_profile_preferences(profile_dir: Path) -> None:
     (profile_dir / "Local State").write_text(
         json.dumps(
             {
-                "intl": {"app_locale": "en-US"},
+                "intl": {"app_locale": "ja-JP"},
                 "browser": {"enabled_labs_experiments": []},
             },
             ensure_ascii=False,
@@ -512,22 +512,22 @@ def _environment_content_script() -> str:
         Object.defineProperty(target, prop, { get: () => value, configurable: true });
       } catch (_) {}
     };
-    defineGetter(Navigator.prototype, 'language', 'en-US');
-    defineGetter(Navigator.prototype, 'languages', ['en-US', 'en']);
-    defineGetter(navigator, 'language', 'en-US');
-    defineGetter(navigator, 'languages', ['en-US', 'en']);
+    defineGetter(Navigator.prototype, 'language', 'ja-JP');
+    defineGetter(Navigator.prototype, 'languages', ['ja-JP', 'ja', 'en-US', 'en']);
+    defineGetter(navigator, 'language', 'ja-JP');
+    defineGetter(navigator, 'languages', ['ja-JP', 'ja', 'en-US', 'en']);
     const RealDateTimeFormat = Intl.DateTimeFormat;
-    function USDateTimeFormat(locales, options) {
+    function JPDateTimeFormat(locales, options) {
       options = Object.assign({}, options || {});
-      if (!options.timeZone) options.timeZone = 'America/New_York';
-      return new RealDateTimeFormat(locales || 'en-US', options);
+      if (!options.timeZone) options.timeZone = 'Asia/Tokyo';
+      return new RealDateTimeFormat(locales || 'ja-JP', options);
     }
-    USDateTimeFormat.prototype = RealDateTimeFormat.prototype;
-    Object.setPrototypeOf(USDateTimeFormat, RealDateTimeFormat);
-    USDateTimeFormat.supportedLocalesOf = RealDateTimeFormat.supportedLocalesOf.bind(RealDateTimeFormat);
-    Intl.DateTimeFormat = USDateTimeFormat;
+    JPDateTimeFormat.prototype = RealDateTimeFormat.prototype;
+    Object.setPrototypeOf(JPDateTimeFormat, RealDateTimeFormat);
+    JPDateTimeFormat.supportedLocalesOf = RealDateTimeFormat.supportedLocalesOf.bind(RealDateTimeFormat);
+    Intl.DateTimeFormat = JPDateTimeFormat;
   } catch (error) {
-    console.warn('[PP] 美国地区环境覆盖失败', error);
+    console.warn('[PP] 日本地区环境覆盖失败', error);
   }
 })();`;
   const node = document.createElement('script');
@@ -757,9 +757,9 @@ def _browser_args(
         "--no-default-browser-check",
         "--disable-sync",
         "--disable-save-password-bubble",
-        "--lang=en-US",
-        "--accept-lang=en-US,en",
-        "--timezone=America/New_York",
+        "--lang=ja-JP",
+        "--accept-lang=ja-JP,ja,en-US,en",
+        "--timezone=Asia/Tokyo",
         "--new-window",
     ]
     if extension_dir:

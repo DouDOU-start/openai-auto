@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PayPal Auto Filler
 // @namespace    http://tampermonkey.net/
-// @version      30.0
+// @version      32.0
 // @description  Auto-fill PayPal/OpenAI checkout pages
 // @match        https://www.paypal.com/*
 // @match        https://pay.openai.com/*
@@ -15,7 +15,7 @@
 
 // ========== 配置 ==========
 var CONFIG = {
-    phone: '5822599791', // 电话号码
+    phone: '9012345678', // 日本手机号（去掉 +81 后的本地号码）
     cardExpiry: '03 / 30', // 有效期
     cardCvv: '996', // CVV
     cardNumber: '1234561234568888', // 卡号兜底
@@ -39,9 +39,55 @@ let securityAutoStopped = false;
 let debugPanelNode = null;
 let debugLogLines = [];
 let securityWatcherTicks = 0;
-var US_FALLBACK_ADDRESS = { street:'1600 Amphitheatre Pkwy', city:'Mountain View', state:'California', stateCode:'CA', zip:'94043' };
-var US_STATE_ALIASES = {
-    AL:'Alabama', AK:'Alaska', AZ:'Arizona', AR:'Arkansas', CA:'California', CO:'Colorado', CT:'Connecticut', DE:'Delaware', DC:'District of Columbia', FL:'Florida', GA:'Georgia', HI:'Hawaii', ID:'Idaho', IL:'Illinois', IN:'Indiana', IA:'Iowa', KS:'Kansas', KY:'Kentucky', LA:'Louisiana', ME:'Maine', MD:'Maryland', MA:'Massachusetts', MI:'Michigan', MN:'Minnesota', MS:'Mississippi', MO:'Missouri', MT:'Montana', NE:'Nebraska', NV:'Nevada', NH:'New Hampshire', NJ:'New Jersey', NM:'New Mexico', NY:'New York', NC:'North Carolina', ND:'North Dakota', OH:'Ohio', OK:'Oklahoma', OR:'Oregon', PA:'Pennsylvania', RI:'Rhode Island', SC:'South Carolina', SD:'South Dakota', TN:'Tennessee', TX:'Texas', UT:'Utah', VT:'Vermont', VA:'Virginia', WA:'Washington', WV:'West Virginia', WI:'Wisconsin', WY:'Wyoming', AS:'American Samoa', GU:'Guam', MP:'Northern Mariana Islands', PR:'Puerto Rico', VI:'Virgin Islands'
+var JP_FALLBACK_ADDRESS = { street:'2-8-1 Nishishinjuku', city:'Shinjuku-ku', state:'Tokyo', stateNative:'Tokyo-to', stateCode:'13', zip:'163-8001' };
+var JP_PREFECTURE_ALIASES = {
+    '01': { name:'Hokkaido', native:'Hokkaido', local:'北海道' },
+    '02': { name:'Aomori', native:'Aomori-ken', local:'青森県' },
+    '03': { name:'Iwate', native:'Iwate-ken', local:'岩手県' },
+    '04': { name:'Miyagi', native:'Miyagi-ken', local:'宮城県' },
+    '05': { name:'Akita', native:'Akita-ken', local:'秋田県' },
+    '06': { name:'Yamagata', native:'Yamagata-ken', local:'山形県' },
+    '07': { name:'Fukushima', native:'Fukushima-ken', local:'福島県' },
+    '08': { name:'Ibaraki', native:'Ibaraki-ken', local:'茨城県' },
+    '09': { name:'Tochigi', native:'Tochigi-ken', local:'栃木県' },
+    '10': { name:'Gunma', native:'Gunma-ken', local:'群馬県' },
+    '11': { name:'Saitama', native:'Saitama-ken', local:'埼玉県' },
+    '12': { name:'Chiba', native:'Chiba-ken', local:'千葉県' },
+    '13': { name:'Tokyo', native:'Tokyo-to', local:'東京都' },
+    '14': { name:'Kanagawa', native:'Kanagawa-ken', local:'神奈川県' },
+    '15': { name:'Niigata', native:'Niigata-ken', local:'新潟県' },
+    '16': { name:'Toyama', native:'Toyama-ken', local:'富山県' },
+    '17': { name:'Ishikawa', native:'Ishikawa-ken', local:'石川県' },
+    '18': { name:'Fukui', native:'Fukui-ken', local:'福井県' },
+    '19': { name:'Yamanashi', native:'Yamanashi-ken', local:'山梨県' },
+    '20': { name:'Nagano', native:'Nagano-ken', local:'長野県' },
+    '21': { name:'Gifu', native:'Gifu-ken', local:'岐阜県' },
+    '22': { name:'Shizuoka', native:'Shizuoka-ken', local:'静岡県' },
+    '23': { name:'Aichi', native:'Aichi-ken', local:'愛知県' },
+    '24': { name:'Mie', native:'Mie-ken', local:'三重県' },
+    '25': { name:'Shiga', native:'Shiga-ken', local:'滋賀県' },
+    '26': { name:'Kyoto', native:'Kyoto-fu', local:'京都府' },
+    '27': { name:'Osaka', native:'Osaka-fu', local:'大阪府' },
+    '28': { name:'Hyogo', native:'Hyogo-ken', local:'兵庫県' },
+    '29': { name:'Nara', native:'Nara-ken', local:'奈良県' },
+    '30': { name:'Wakayama', native:'Wakayama-ken', local:'和歌山県' },
+    '31': { name:'Tottori', native:'Tottori-ken', local:'鳥取県' },
+    '32': { name:'Shimane', native:'Shimane-ken', local:'島根県' },
+    '33': { name:'Okayama', native:'Okayama-ken', local:'岡山県' },
+    '34': { name:'Hiroshima', native:'Hiroshima-ken', local:'広島県' },
+    '35': { name:'Yamaguchi', native:'Yamaguchi-ken', local:'山口県' },
+    '36': { name:'Tokushima', native:'Tokushima-ken', local:'徳島県' },
+    '37': { name:'Kagawa', native:'Kagawa-ken', local:'香川県' },
+    '38': { name:'Ehime', native:'Ehime-ken', local:'愛媛県' },
+    '39': { name:'Kochi', native:'Kochi-ken', local:'高知県' },
+    '40': { name:'Fukuoka', native:'Fukuoka-ken', local:'福岡県' },
+    '41': { name:'Saga', native:'Saga-ken', local:'佐賀県' },
+    '42': { name:'Nagasaki', native:'Nagasaki-ken', local:'長崎県' },
+    '43': { name:'Kumamoto', native:'Kumamoto-ken', local:'熊本県' },
+    '44': { name:'Oita', native:'Oita-ken', local:'大分県' },
+    '45': { name:'Miyazaki', native:'Miyazaki-ken', local:'宮崎県' },
+    '46': { name:'Kagoshima', native:'Kagoshima-ken', local:'鹿児島県' },
+    '47': { name:'Okinawa', native:'Okinawa-ken', local:'沖縄県' }
 };
 
 (function() {
@@ -55,7 +101,7 @@ var US_STATE_ALIASES = {
     };
     applyRuntimeConfig();
     ensureDebugPanel();
-    log('自动填充脚本已注入，版本 30.0-debug');
+    log('自动填充脚本已注入，版本 32.0-debug');
 
     // 隐藏验证码和地址补全
     var st = document.createElement('style');
@@ -152,6 +198,28 @@ var US_STATE_ALIASES = {
         return true;
     }
 
+    function fillIfPresent(id, val) {
+        var el = document.getElementById(id);
+        if (!el) return false;
+        if (fieldText(el) === String(val == null ? '' : val).trim()) return false;
+        fillElement(el, val);
+        log('已填写字段：' + id + ' = ' + el.value);
+        return true;
+    }
+
+    function fillElementIfChanged(el, val, label) {
+        if (!el) return false;
+        var before = fieldText(el);
+        if (before === String(val == null ? '' : val).trim()) return false;
+        fillElement(el, val);
+        var after = fieldText(el);
+        if (after !== before) {
+            log('已填写字段：' + (label || elementDebugName(el)) + ' = ' + after);
+            return true;
+        }
+        return false;
+    }
+
     // 按选择器填写
     function fillSel(sel, val) {
         var el = document.querySelector(sel);
@@ -163,11 +231,22 @@ var US_STATE_ALIASES = {
 
     function fillElement(el, val) {
         var value = String(val == null ? '' : val);
+        try { el.focus({ preventScroll: true }); } catch (e) {
+            try { el.focus(); } catch (_) {}
+        }
         var proto = null;
         if (el instanceof HTMLInputElement) proto = HTMLInputElement.prototype;
         else if (el instanceof HTMLTextAreaElement) proto = HTMLTextAreaElement.prototype;
         else if (el instanceof HTMLSelectElement) proto = HTMLSelectElement.prototype;
         var desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+        try {
+            el.dispatchEvent(new InputEvent('beforeinput', {
+                bubbles: true,
+                cancelable: true,
+                inputType: 'insertReplacementText',
+                data: value
+            }));
+        } catch (e) {}
         if (desc && typeof desc.set === 'function') {
             desc.set.call(el, value);
         } else {
@@ -395,37 +474,55 @@ var US_STATE_ALIASES = {
         return 'not-acquired';
     }
 
-    function usStateName(value) {
+    function jpPrefecture(value) {
         var raw = String(value || '').trim();
-        if (!raw) return US_FALLBACK_ADDRESS.state;
+        if (!raw) return JP_PREFECTURE_ALIASES[JP_FALLBACK_ADDRESS.stateCode];
         var upper = raw.toUpperCase();
-        if (US_STATE_ALIASES[upper]) return US_STATE_ALIASES[upper];
-        for (var code in US_STATE_ALIASES) {
-            if (Object.prototype.hasOwnProperty.call(US_STATE_ALIASES, code) &&
-                US_STATE_ALIASES[code].toLowerCase() === raw.toLowerCase()) {
-                return US_STATE_ALIASES[code];
+        var normalizedCode = /^\d$/.test(upper) ? '0' + upper : upper;
+        if (JP_PREFECTURE_ALIASES[normalizedCode]) return JP_PREFECTURE_ALIASES[normalizedCode];
+        for (var code in JP_PREFECTURE_ALIASES) {
+            if (!Object.prototype.hasOwnProperty.call(JP_PREFECTURE_ALIASES, code)) {
+                continue;
+            }
+            var pref = JP_PREFECTURE_ALIASES[code];
+            if (pref.name.toLowerCase() === raw.toLowerCase() ||
+                pref.native.toLowerCase() === raw.toLowerCase() ||
+                String(pref.local || '').toLowerCase() === raw.toLowerCase() ||
+                (pref.name + '-to').toLowerCase() === raw.toLowerCase() ||
+                (pref.name + '-fu').toLowerCase() === raw.toLowerCase() ||
+                (pref.name + '-ken').toLowerCase() === raw.toLowerCase()) {
+                return pref;
             }
         }
-        return US_FALLBACK_ADDRESS.state;
+        return JP_PREFECTURE_ALIASES[JP_FALLBACK_ADDRESS.stateCode];
     }
 
-    function usStateCode(value) {
+    function jpPrefectureNative(value) {
+        return jpPrefecture(value).native;
+    }
+
+    function jpPrefectureLocal(value) {
+        return jpPrefecture(value).local;
+    }
+
+    function jpPrefectureCode(value) {
         var raw = String(value || '').trim();
-        if (!raw) return US_FALLBACK_ADDRESS.stateCode;
-        var upper = raw.toUpperCase();
-        if (US_STATE_ALIASES[upper]) return upper;
-        for (var code in US_STATE_ALIASES) {
-            if (Object.prototype.hasOwnProperty.call(US_STATE_ALIASES, code) &&
-                US_STATE_ALIASES[code].toLowerCase() === raw.toLowerCase()) {
+        var normalizedCode = /^\d$/.test(raw) ? '0' + raw : raw;
+        if (JP_PREFECTURE_ALIASES[normalizedCode]) return normalizedCode;
+        var pref = jpPrefecture(raw);
+        for (var code in JP_PREFECTURE_ALIASES) {
+            if (Object.prototype.hasOwnProperty.call(JP_PREFECTURE_ALIASES, code) &&
+                JP_PREFECTURE_ALIASES[code] === pref) {
                 return code;
             }
         }
-        return US_FALLBACK_ADDRESS.stateCode;
+        return JP_FALLBACK_ADDRESS.stateCode;
     }
 
-    function usZip(value) {
-        var m = String(value || '').match(/\b(\d{5})(?:-\d{4})?\b/);
-        return m ? m[1] : US_FALLBACK_ADDRESS.zip;
+    function jpPostalCode(value) {
+        var text = String(value || '').trim();
+        var m = text.match(/\b(\d{3})[-\s]?(\d{4})\b/);
+        return m ? (m[1] + '-' + m[2]) : JP_FALLBACK_ADDRESS.zip;
     }
 
     function firstText(values, fallback) {
@@ -436,27 +533,406 @@ var US_STATE_ALIASES = {
         return fallback;
     }
 
-    function normalizeUsAddress(addr) {
-        // PayPal 对 city/state/ZIP 的一致性校验很严，支付页固定使用一组确定有效的美国地址。
+    function normalizeJpAddress(addr) {
+        // PayPal 对 city/prefecture/postal code 的一致性校验很严，支付页固定使用一组确定有效的日本地址。
+        var pref = jpPrefecture(JP_FALLBACK_ADDRESS.stateCode);
         return {
-            street: US_FALLBACK_ADDRESS.street,
-            city: US_FALLBACK_ADDRESS.city,
-            state: usStateName(US_FALLBACK_ADDRESS.state),
-            stateCode: usStateCode(US_FALLBACK_ADDRESS.stateCode),
-            zip: usZip(US_FALLBACK_ADDRESS.zip)
+            street: JP_FALLBACK_ADDRESS.street,
+            city: JP_FALLBACK_ADDRESS.city,
+            state: pref.name,
+            stateNative: pref.native,
+            stateLocal: pref.local,
+            stateCode: JP_FALLBACK_ADDRESS.stateCode,
+            zip: jpPostalCode(JP_FALLBACK_ADDRESS.zip)
         };
     }
 
-    function ensureCountryUS(id) {
+    function ensureCountryJP(id) {
         var el = document.getElementById(id);
         if (!el) { log('未找到国家字段：' + id); return; }
         var before = el.value;
-        fillSelect(id, 'US');
-        if (el.value === before && String(el.value || '').toUpperCase() !== 'US') {
-            el.value = 'US';
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-            log('当前：国家字段已强制切到 US');
+        fillSelect(id, 'JP');
+        if (String(el.value || '').toUpperCase() !== 'JP') {
+            fillSelect(id, 'Japan');
         }
+        if (el.value === before && String(el.value || '').toUpperCase() !== 'JP') {
+            el.value = 'JP';
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            log('当前：国家字段已强制切到 JP');
+        }
+    }
+
+    function ensureAnyCountryJP(ids) {
+        var changed = false;
+        for (var i = 0; i < ids.length; i++) {
+            var el = document.getElementById(ids[i]);
+            if (!el) continue;
+            if (String(el.value || '').toUpperCase() !== 'JP') {
+                ensureCountryJP(ids[i]);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    var JP_IDENTITY = {
+        firstKana: 'タロウ',
+        lastKana: 'ヤマダ',
+        firstKanji: '太郎',
+        lastKanji: '山田',
+        birthIso: '1990-01-01',
+        birthSlash: '1990/01/01'
+    };
+
+    function fillJapaneseNames() {
+        var filled = false;
+        filled = fillIfPresent('full-name', JP_IDENTITY.lastKanji + ' ' + JP_IDENTITY.firstKanji) || filled;
+        filled = fillIfPresent('countrySpecificFirstName', JP_IDENTITY.firstKana) || filled;
+        filled = fillIfPresent('countrySpecificLastName', JP_IDENTITY.lastKana) || filled;
+        filled = fillIfPresent('kanaFirstName', JP_IDENTITY.firstKana) || filled;
+        filled = fillIfPresent('kanaLastName', JP_IDENTITY.lastKana) || filled;
+        filled = fillIfPresent('firstNameKana', JP_IDENTITY.firstKana) || filled;
+        filled = fillIfPresent('lastNameKana', JP_IDENTITY.lastKana) || filled;
+        filled = fillIfPresent('firstName', JP_IDENTITY.firstKanji) || filled;
+        filled = fillIfPresent('lastName', JP_IDENTITY.lastKanji) || filled;
+        filled = fillSemanticJapaneseNameFields() || filled;
+        return filled;
+    }
+
+    function fillJapaneseBirthdate() {
+        var fields = birthdateFields();
+        var filled = false;
+        for (var i = 0; i < fields.length; i++) {
+            filled = fillBirthdateElement(fields[i]) || filled;
+        }
+        if (!fields.length) {
+            filled = fillIfPresent('dateOfBirth', JP_IDENTITY.birthIso) ||
+                     fillIfPresent('birthdate', JP_IDENTITY.birthIso) ||
+                     fillIfPresent('dob', JP_IDENTITY.birthIso);
+        }
+        return filled;
+    }
+
+    function fillSemanticJapaneseNameFields() {
+        var filled = false;
+        var fields = japaneseNameFields();
+        for (var i = 0; i < fields.length; i++) {
+            var el = fields[i];
+            var kind = japaneseNameKind(el);
+            if (!kind) continue;
+            var script = preferredJapaneseNameScript(el);
+            if (!script) continue;
+            filled = fillJapaneseNameElement(el, kind, script) || filled;
+        }
+        return fillJapaneseNameRowsByPosition(fields) || filled;
+    }
+
+    function fillJapaneseNameRowsByPosition(fields) {
+        var rows = groupNameRows(fields || japaneseNameFields());
+        var filled = false;
+        for (var i = 0; i < rows.length; i++) {
+            var row = rows[i];
+            if (!row.first && !row.last) continue;
+            var script = row.script || '';
+            if (!script && rows.length >= 2) {
+                script = i === 0 ? 'kana' : 'kanji';
+            }
+            if (!script) script = 'kanji';
+            if (row.first) filled = fillJapaneseNameElement(row.first, 'first', script) || filled;
+            if (row.last) filled = fillJapaneseNameElement(row.last, 'last', script) || filled;
+        }
+        return filled;
+    }
+
+    function fillJapaneseNameElement(el, kind, script) {
+        var value = '';
+        if (kind === 'full') {
+            value = script === 'kana'
+                ? JP_IDENTITY.lastKana + ' ' + JP_IDENTITY.firstKana
+                : JP_IDENTITY.lastKanji + ' ' + JP_IDENTITY.firstKanji;
+        } else if (kind === 'first') {
+            value = script === 'kana' ? JP_IDENTITY.firstKana : JP_IDENTITY.firstKanji;
+        } else if (kind === 'last') {
+            value = script === 'kana' ? JP_IDENTITY.lastKana : JP_IDENTITY.lastKanji;
+        }
+        if (!value) return false;
+        return fillElementIfChanged(el, value, 'JP name ' + kind + '/' + script);
+    }
+
+    function japaneseNameFields() {
+        var nodes = Array.prototype.slice.call(document.querySelectorAll('input, textarea'));
+        return uniqueElements(nodes.filter(function(el) {
+            if (!isVisibleElement(el) || el.disabled || el.readOnly) return false;
+            var type = String(el.type || '').toLowerCase();
+            if (/^(hidden|email|password|button|submit|checkbox|radio|file|search)$/.test(type)) return false;
+            var directMeta = [
+                inputMeta(el),
+                labelTextFor(el),
+                el.getAttribute('placeholder') || '',
+                el.getAttribute('aria-label') || ''
+            ].join(' ');
+            if (isNonNameFieldMeta(directMeta)) return false;
+            return /countrySpecific|firstName|lastName|given|family|surname|full[-_\s]?name|kana|kanji|phonetic|furigana|フリガナ|ふりがな|かな|カナ|ひらがな|カタカナ|漢字|氏名|名前|姓|名/i.test(directMeta) ||
+                   /^(名|姓)$/.test(String(el.getAttribute('placeholder') || '').trim());
+        }));
+    }
+
+    function isNonNameFieldMeta(meta) {
+        return /email|mail|card|cc-|credit|cvv|cvc|expiry|expire|expiration|address|billingLine|billingAddress|city|locality|postal|zip|phone|mobile|password|security|otp|one-time|birth|bday|dob|date|country|state|prefecture|administrative|captcha/i.test(String(meta || ''));
+    }
+
+    function japaneseNameKind(el) {
+        var idName = [
+            el.id || '',
+            el.name || '',
+            el.autocomplete || '',
+            el.getAttribute('data-testid') || ''
+        ].join(' ');
+        var placeholder = String(el.getAttribute('placeholder') || '').trim();
+        var labels = labelTextFor(el);
+        var meta = [idName, placeholder, labels, el.getAttribute('aria-label') || ''].join(' ');
+        if (/full[-_\s]?name|fullName|氏名/i.test(meta)) return 'full';
+        if (/last|family|surname|countrySpecificLast|姓/i.test(meta) || placeholder === '姓') return 'last';
+        if (/first|given|countrySpecificFirst|名/i.test(meta) || placeholder === '名') return 'first';
+        return '';
+    }
+
+    function japaneseNameScript(el) {
+        var meta = nameElementText(el);
+        if (/countrySpecific|kana|phonetic|furigana|フリガナ|ふりがな|かな|カナ|ひらがな|カタカナ/i.test(meta)) {
+            return 'kana';
+        }
+        if (/kanji|漢字/i.test(meta)) {
+            return 'kanji';
+        }
+        return '';
+    }
+
+    function preferredJapaneseNameScript(el) {
+        var meta = inputMeta(el);
+        var exact = String(el.id || el.name || '').trim();
+        if (/countrySpecific|kana|phonetic|furigana/i.test(meta)) return 'kana';
+        if (/^(firstName|lastName)$/i.test(exact)) return 'kanji';
+        return japaneseNameScript(el);
+    }
+
+    function groupNameRows(fields) {
+        var sorted = (fields || []).filter(function(el) {
+            return japaneseNameKind(el) && japaneseNameKind(el) !== 'full';
+        }).sort(inputPositionSort);
+        var rows = [];
+        for (var i = 0; i < sorted.length; i++) {
+            var el = sorted[i];
+            var rect = el.getBoundingClientRect();
+            var row = rows.length ? rows[rows.length - 1] : null;
+            if (!row || Math.abs(row.top - rect.top) > 28) {
+                row = { top: rect.top, fields: [], first: null, last: null, script: '' };
+                rows.push(row);
+            }
+            row.fields.push(el);
+            var kind = japaneseNameKind(el);
+            if (kind === 'first') row.first = el;
+            if (kind === 'last') row.last = el;
+            row.script = row.script || preferredJapaneseNameScript(el);
+        }
+        return rows.filter(function(row) {
+            return row.fields.length > 0;
+        });
+    }
+
+    function nameElementText(el) {
+        var parts = [
+            inputMeta(el),
+            labelTextFor(el)
+        ];
+        var node = el;
+        for (var depth = 0; node && depth < 5; depth += 1) {
+            var text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text && text.length <= 280) parts.push(text);
+            node = node.parentElement;
+        }
+        return parts.join(' ');
+    }
+
+    function labelTextFor(el) {
+        var parts = [];
+        try {
+            if (el.labels) {
+                Array.prototype.forEach.call(el.labels, function(label) {
+                    parts.push(String(label.innerText || label.textContent || '').trim());
+                });
+            }
+        } catch (e) {}
+        var id = el && el.id ? el.id : '';
+        if (id) {
+            try {
+                Array.prototype.forEach.call(document.querySelectorAll('label[for="' + cssEscape(id) + '"]'), function(label) {
+                    parts.push(String(label.innerText || label.textContent || '').trim());
+                });
+            } catch (e) {}
+        }
+        var labelledBy = el && el.getAttribute ? String(el.getAttribute('aria-labelledby') || '') : '';
+        labelledBy.split(/\s+/).forEach(function(ref) {
+            var node = ref ? document.getElementById(ref) : null;
+            if (node) parts.push(String(node.innerText || node.textContent || '').trim());
+        });
+        return parts.filter(Boolean).join(' ');
+    }
+
+    function cssEscape(value) {
+        if (window.CSS && typeof window.CSS.escape === 'function') {
+            return window.CSS.escape(value);
+        }
+        return String(value || '').replace(/"/g, '\\"');
+    }
+
+    function birthdateFields() {
+        var selectors = [
+            '#dateOfBirth',
+            '#birthdate',
+            '#birthDate',
+            '#dob',
+            'input[name="dateOfBirth"]',
+            'input[name="birthdate"]',
+            'input[name="birthDate"]',
+            'input[name="dob"]',
+            'input[autocomplete="bday"]',
+            'input[id*="birth" i]',
+            'input[name*="birth" i]',
+            'input[id*="dob" i]',
+            'input[name*="dob" i]',
+            'input[placeholder*="生年月日"]',
+            'input[aria-label*="生年月日"]'
+        ];
+        var found = [];
+        for (var i = 0; i < selectors.length; i++) {
+            try {
+                Array.prototype.forEach.call(document.querySelectorAll(selectors[i]), function(el) {
+                    found.push(el);
+                });
+            } catch (e) {}
+        }
+        Array.prototype.forEach.call(document.querySelectorAll('input'), function(el) {
+            var meta = [inputMeta(el), labelTextFor(el), String(el.parentElement ? (el.parentElement.innerText || '') : '')].join(' ');
+            if (/date of birth|birthdate|birthday|生年月日/i.test(meta)) found.push(el);
+        });
+        return uniqueElements(found).filter(function(el) {
+            return isVisibleElement(el) && !el.disabled && !el.readOnly;
+        });
+    }
+
+    function fillBirthdateElement(el) {
+        if (!birthdateNeedsRepair(el)) {
+            return true;
+        }
+        var values = birthdateCandidates(el);
+        if (!values.length) return false;
+        writeBirthdateValue(el, values[0], 0);
+        scheduleBirthdateFallbacks(el, values, 1);
+        return fieldText(el) !== '';
+    }
+
+    function birthdateCandidates(el) {
+        var type = String(el.type || el.getAttribute('type') || '').toLowerCase();
+        if (type === 'date') {
+            return [JP_IDENTITY.birthIso];
+        }
+        return [
+            '19900101',
+            JP_IDENTITY.birthSlash,
+            JP_IDENTITY.birthIso,
+            '1990年01月01日',
+            '01/01/1990'
+        ];
+    }
+
+    function writeBirthdateValue(el, value, index) {
+        var type = String(el.type || el.getAttribute('type') || '').toLowerCase();
+        if (type === 'date') {
+            fillElementIfChanged(el, value, index ? 'birthdate fallback' : 'birthdate');
+        } else {
+            typeTextLikeUser(el, value, index ? 'birthdate fallback' : 'birthdate');
+        }
+    }
+
+    function scheduleBirthdateFallbacks(el, values, index) {
+        if (index >= values.length) return;
+        setTimeout(function() {
+            if (!birthdateNeedsRepair(el)) {
+                return;
+            }
+            writeBirthdateValue(el, values[index], index);
+            scheduleBirthdateFallbacks(el, values, index + 1);
+        }, 550);
+    }
+
+    function typeTextLikeUser(el, value, label) {
+        if (!el) return false;
+        var text = String(value == null ? '' : value);
+        try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+        try { el.focus({ preventScroll: true }); } catch (e) {
+            try { el.focus(); } catch (_) {}
+        }
+        fillElement(el, '');
+        for (var i = 0; i < text.length; i++) {
+            var ch = text.charAt(i);
+            dispatchKey(el, 'keydown', ch);
+            dispatchKey(el, 'keypress', ch);
+            dispatchBeforeInput(el, ch);
+            setInputValue(el, String(el.value || '') + ch);
+            dispatchInput(el, ch);
+            dispatchKey(el, 'keyup', ch);
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
+        log('已模拟输入字段：' + (label || elementDebugName(el)) + ' = ' + fieldText(el));
+        return true;
+    }
+
+    function setInputValue(el, value) {
+        var proto = null;
+        if (el instanceof HTMLInputElement) proto = HTMLInputElement.prototype;
+        else if (el instanceof HTMLTextAreaElement) proto = HTMLTextAreaElement.prototype;
+        else if (el instanceof HTMLSelectElement) proto = HTMLSelectElement.prototype;
+        var desc = proto ? Object.getOwnPropertyDescriptor(proto, 'value') : null;
+        if (desc && typeof desc.set === 'function') {
+            desc.set.call(el, value);
+        } else {
+            el.value = value;
+        }
+    }
+
+    function birthdateValueLooksAccepted(el) {
+        if (!el) return false;
+        var value = fieldText(el);
+        if (!value) return false;
+        if (el.validity && el.validity.valid === false) return false;
+        if (String(el.getAttribute('aria-invalid') || '').toLowerCase() === 'true') return false;
+        return true;
+    }
+
+    function birthdateNeedsRepair(el) {
+        if (!birthdateValueLooksAccepted(el)) return true;
+        return /正しい日付|有効な日付|invalid date|date is invalid/i.test(fieldContextText(el));
+    }
+
+    function fieldContextText(el) {
+        var parts = [];
+        var node = el;
+        for (var depth = 0; node && depth < 5; depth += 1) {
+            var text = String(node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+            if (text && text.length <= 500) parts.push(text);
+            node = node.parentElement;
+        }
+        return parts.join(' ');
+    }
+
+    function uniqueElements(items) {
+        var out = [];
+        for (var i = 0; i < items.length; i++) {
+            if (items[i] && out.indexOf(items[i]) < 0) out.push(items[i]);
+        }
+        return out;
     }
 
     // 填写下拉框
@@ -515,7 +991,7 @@ var US_STATE_ALIASES = {
     }
 
     function fillGoogleAddress(line1Sel, citySel, zipSel, stateId, addr, cb) {
-        addr = normalizeUsAddress(addr);
+        addr = normalizeJpAddress(addr);
         fillSel(line1Sel, addr.street);
         selectGoogleAddressFirst(line1Sel, function() {
             rewriteAddressFields(line1Sel, citySel, zipSel, stateId, addr, 0);
@@ -533,22 +1009,24 @@ var US_STATE_ALIASES = {
         fillSel(citySel, addr.city);
         fillSel(zipSel, addr.zip);
         fillState(stateId, addr);
-        log('当前：已重写美国账单地址 #' + pass + ' ' + JSON.stringify(addr));
+        log('当前：已重写日本账单地址 #' + pass + ' ' + JSON.stringify(addr));
     }
 
     function fillState(stateId, addr) {
-        var stateName = addr && addr.state ? addr.state : US_FALLBACK_ADDRESS.state;
-        var stateCode = addr && addr.stateCode ? addr.stateCode : usStateCode(stateName);
-        if (fillSelect(stateId, stateCode) || fillSelect(stateId, stateName)) {
+        var stateName = addr && addr.state ? addr.state : JP_FALLBACK_ADDRESS.state;
+        var stateNative = addr && addr.stateNative ? addr.stateNative : jpPrefectureNative(stateName);
+        var stateLocal = addr && addr.stateLocal ? addr.stateLocal : jpPrefectureLocal(stateName);
+        var stateCode = addr && addr.stateCode ? addr.stateCode : jpPrefectureCode(stateName);
+        if (fillSelect(stateId, stateCode) || fillSelect(stateId, stateName) || fillSelect(stateId, stateNative) || fillSelect(stateId, stateLocal)) {
             return true;
         }
         var el = document.getElementById(stateId);
         if (!el) {
-            log('未找到州字段：' + stateId);
+            log('未找到都道府县字段：' + stateId);
             return false;
         }
         fillElement(el, stateName);
-        log('已填写州字段：' + stateId + ' = ' + stateName);
+        log('已填写都道府县字段：' + stateId + ' = ' + stateName);
         return true;
     }
 
@@ -575,6 +1053,8 @@ var US_STATE_ALIASES = {
     function selectStateElement(el, addr) {
         if (!el) return false;
         var stateName = addr.state;
+        var stateNative = addr.stateNative || jpPrefectureNative(stateName);
+        var stateLocal = addr.stateLocal || jpPrefectureLocal(stateName);
         var stateCode = addr.stateCode;
         if (el instanceof HTMLSelectElement) {
             for (var i = 0; i < el.options.length; i++) {
@@ -583,11 +1063,13 @@ var US_STATE_ALIASES = {
                 var text = String(option.text || '').trim();
                 if (value.toUpperCase() === stateCode.toUpperCase() ||
                     text.toLowerCase() === stateName.toLowerCase() ||
+                    text.toLowerCase() === stateNative.toLowerCase() ||
+                    text.toLowerCase() === stateLocal.toLowerCase() ||
                     value.toLowerCase() === stateName.toLowerCase()) {
                     el.value = option.value;
                     el.dispatchEvent(new Event('change', { bubbles: true }));
                     el.dispatchEvent(new Event('blur', { bubbles: true }));
-                    log('已选择州字段：' + text);
+                    log('已选择都道府县字段：' + text);
                     return true;
                 }
             }
@@ -599,21 +1081,24 @@ var US_STATE_ALIASES = {
         }
         el.click();
         setTimeout(function() {
-            clickStateOption(stateName, stateCode);
+            clickStateOption(stateName, stateCode, stateNative, stateLocal);
         }, 150);
         return true;
     }
 
-    function clickStateOption(stateName, stateCode) {
+    function clickStateOption(stateName, stateCode, stateNative, stateLocal) {
         var nodes = Array.prototype.slice.call(document.querySelectorAll('[role="option"], li, button, div'));
         for (var i = 0; i < nodes.length; i++) {
             var node = nodes[i];
             if (node.offsetParent === null) continue;
             var text = String(node.textContent || '').trim();
             if (!text) continue;
-            if (text.toLowerCase() === stateName.toLowerCase() || text.toUpperCase() === stateCode.toUpperCase()) {
+            if (text.toLowerCase() === stateName.toLowerCase() ||
+                text.toLowerCase() === String(stateNative || '').toLowerCase() ||
+                text.toLowerCase() === String(stateLocal || '').toLowerCase() ||
+                text.toUpperCase() === stateCode.toUpperCase()) {
                 node.click();
-                log('已点击州候选：' + text);
+                log('已点击都道府县候选：' + text);
                 return true;
             }
         }
@@ -659,12 +1144,14 @@ var US_STATE_ALIASES = {
         var raw = String(value || '').trim().toLowerCase();
         if (!raw) return false;
         return raw.indexOf(String(addr.state || '').toLowerCase()) !== -1 ||
+               raw.indexOf(String(addr.stateNative || '').toLowerCase()) !== -1 ||
+               raw.indexOf(String(addr.stateLocal || '').toLowerCase()) !== -1 ||
                raw.split(/\s+/).indexOf(String(addr.stateCode || '').toLowerCase()) !== -1 ||
                raw === String(addr.stateCode || '').toLowerCase();
     }
 
     function isPayPalBillingAddressValid() {
-        var addr = normalizeUsAddress();
+        var addr = normalizeJpAddress();
         var fields = paypalAddressFields();
         if (!fields.line1 || !fields.city || !fields.zip || !fields.state) return false;
         return fieldText(fields.line1).toLowerCase().indexOf(addr.street.toLowerCase()) !== -1 &&
@@ -673,11 +1160,56 @@ var US_STATE_ALIASES = {
                isStateValue(addr, fieldText(fields.state));
     }
 
+    function isPayPalIdentityValid() {
+        if (!currentHost().includes('paypal.com') || !currentPath().includes('/checkoutweb/')) {
+            return true;
+        }
+        var required = paypalRequiredIdentityFields();
+        for (var i = 0; i < required.length; i++) {
+            var el = required[i];
+            if (!fieldText(el) || hasFieldError(el)) return false;
+        }
+        var birth = birthdateFields();
+        for (var j = 0; j < birth.length; j++) {
+            if (birthdateNeedsRepair(birth[j])) return false;
+        }
+        return true;
+    }
+
+    function paypalRequiredIdentityFields() {
+        var fields = japaneseNameFields().concat(birthdateFields());
+        return uniqueElements(fields).filter(function(el) {
+            if (!isVisibleElement(el)) return false;
+            if (el.required || el.getAttribute('aria-required') === 'true') return true;
+            return hasFieldError(el) || /countrySpecific|dateOfBirth|birth|dob|kana|kanji|firstName|lastName|full-name/i.test(inputMeta(el));
+        });
+    }
+
+    function hasFieldError(el) {
+        if (!el) return false;
+        if (el.validity && el.validity.valid === false) return true;
+        if (String(el.getAttribute('aria-invalid') || '').toLowerCase() === 'true') return true;
+        return /正しい日付|有効な日付|ひらがな.*カタカナ.*使用|カタカナ.*使用|ひらがな.*使用|必須|required|invalid|入力してください/i.test(fieldContextText(el));
+    }
+
+    function repairPayPalIdentity(reason) {
+        if (!currentHost().includes('paypal.com') || !currentPath().includes('/checkoutweb/')) {
+            return false;
+        }
+        var nameFilled = fillJapaneseNames();
+        var birthFilled = fillJapaneseBirthdate();
+        if (nameFilled || birthFilled) {
+            log('当前：已修复 PayPal 日本姓名/生日 ' + (reason || ''));
+            return true;
+        }
+        return false;
+    }
+
     function repairPayPalBillingAddress(reason) {
         if (!currentHost().includes('paypal.com') || !currentPath().includes('/checkoutweb/')) {
             return false;
         }
-        var addr = normalizeUsAddress();
+        var addr = normalizeJpAddress();
         var fields = paypalAddressFields();
         if (!fields.line1 && !fields.city && !fields.zip && !fields.state) {
             return false;
@@ -701,8 +1233,11 @@ var US_STATE_ALIASES = {
         setInterval(function() {
             ticks += 1;
             if (ticks > 120) return;
+            repairPayPalIdentity('watcher #' + ticks);
             repairPayPalBillingAddress('watcher #' + ticks);
         }, 1000);
+        setTimeout(function() { repairPayPalIdentity('startup'); }, 500);
+        setTimeout(function() { repairPayPalIdentity('startup-late'); }, 2500);
         setTimeout(function() { repairPayPalBillingAddress('startup'); }, 500);
         setTimeout(function() { repairPayPalBillingAddress('startup-late'); }, 2500);
     }
@@ -793,7 +1328,7 @@ var US_STATE_ALIASES = {
 
     function isSignupAddressFilled() {
         if (currentHost().includes('paypal.com')) {
-            return isPayPalBillingAddressValid();
+            return isPayPalBillingAddressValid() && isPayPalIdentityValid();
         }
         return !!(getValue('billingLine1') &&
                   getValue('billingCity') &&
@@ -927,7 +1462,7 @@ var US_STATE_ALIASES = {
 
                 if (shouldPollSmsAgain(retries)) {
                     log('等待：' + CONFIG.smsPollSeconds + ' 秒后继续轮询短信验证码 #' + (retries + 1));
-                    setTimeout(function() { getSecurityCode(cb, retries + 1); }, CONFIG.smsPollSeconds * 1000);
+                    setTimeout(function() { pollSecurityCodeWithSms(smsConfig, cb, retries + 1); }, CONFIG.smsPollSeconds * 1000);
                     return;
                 }
                 smsPollingActive = false;
@@ -937,7 +1472,7 @@ var US_STATE_ALIASES = {
                 log('短信验证码请求失败：' + (e.statusText || 'network error'));
                 if (shouldPollSmsAgain(retries)) {
                     log('等待：' + CONFIG.smsPollSeconds + ' 秒后继续轮询短信验证码 #' + (retries + 1));
-                    setTimeout(function() { getSecurityCode(cb, retries + 1); }, CONFIG.smsPollSeconds * 1000);
+                    setTimeout(function() { pollSecurityCodeWithSms(smsConfig, cb, retries + 1); }, CONFIG.smsPollSeconds * 1000);
                     return;
                 }
                 smsPollingActive = false;
@@ -947,7 +1482,7 @@ var US_STATE_ALIASES = {
     }
 
     function maskUrl(url) {
-        return String(url || '').replace(/([?&](?:token|key|api_key|apikey)=)[^&]+/ig, '$1***');
+        return String(url || '').replace(/([?&](?:token|key|api_key|apikey|phone)=)[^&]+/ig, '$1***');
     }
 
     function maskSmsText(text) {
@@ -961,10 +1496,36 @@ var US_STATE_ALIASES = {
         var text = String(responseText || '');
         try {
             var d = JSON.parse(text);
-            return d.data || d.message || d.msg || d.sms || d.text || d.content || text;
+            return extractSmsTextFromJson(d) || text;
         } catch (e) {
             return text;
         }
+    }
+
+    function extractSmsTextFromJson(value) {
+        if (!value) return '';
+        if (typeof value === 'string' || typeof value === 'number') {
+            var direct = String(value || '').trim();
+            return /^(null|undefined|none)$/i.test(direct) ? '' : direct;
+        }
+        if (Array.isArray(value)) {
+            return value.map(extractSmsTextFromJson).filter(Boolean).join('\n');
+        }
+        if (typeof value === 'object') {
+            var keys = [
+                'SmsCode', 'smsCode', 'code', 'Code', 'verifyCode', 'verificationCode',
+                'SmsContent', 'smsContent', 'content', 'Content', 'sms', 'text', 'message', 'msg', 'data'
+            ];
+            var parts = [];
+            for (var i = 0; i < keys.length; i++) {
+                if (Object.prototype.hasOwnProperty.call(value, keys[i])) {
+                    var part = extractSmsTextFromJson(value[keys[i]]);
+                    if (part) parts.push(part);
+                }
+            }
+            return parts.join('\n');
+        }
+        return '';
     }
 
     function shouldPollSmsAgain(retries) {
@@ -1097,7 +1658,7 @@ var US_STATE_ALIASES = {
         });
         for (var i = 0; i < buttons.length; i++) {
             var text = String(buttons[i].textContent || '').trim();
-            if (/^(continue|submit|verify|confirm|next|done|继续|提交|验证|确认|下一步)$/i.test(text)) {
+            if (/^(continue|submit|verify|confirm|next|done|继续|提交|验证|确认|下一步|続行|送信|確認|次へ|完了)$/i.test(text)) {
                 log('当前：正在点击验证码提交按钮 ' + text);
                 buttons[i].click();
                 return true;
@@ -1298,7 +1859,7 @@ var US_STATE_ALIASES = {
     }
 
     function securityPromptTextMatches(text) {
-        return /enter your code|we sent a 6-digit code|6-digit code to|resend|verification code|security code/i.test(String(text || ''));
+        return /enter your code|we sent a 6-digit code|6-digit code to|resend|verification code|security code|コードを入力|6桁のコード|6\s*桁|セキュリティコード|確認コード|認証コード|再送|送信しました/i.test(String(text || ''));
     }
 
     function rootText(root) {
@@ -1700,7 +2261,7 @@ var US_STATE_ALIASES = {
 
     function fallbackProfile() {
         return {
-            address: normalizeUsAddress(US_FALLBACK_ADDRESS),
+            address: normalizeJpAddress(JP_FALLBACK_ADDRESS),
             card: {
                 number: CONFIG.cardNumber,
                 expiry: CONFIG.cardExpiry,
@@ -1726,7 +2287,7 @@ var US_STATE_ALIASES = {
                     var d = JSON.parse(r.responseText);
                     var a = d.address || d;
                     var profile = {
-                        address: normalizeUsAddress(a),
+                        address: normalizeJpAddress(a),
                         card: {
                             number: a.Credit_Card_Number || d.Credit_Card_Number || CONFIG.cardNumber,
                             expiry: a.Expires || a.Expiry || d.Expires || CONFIG.cardExpiry,
@@ -1882,7 +2443,16 @@ var US_STATE_ALIASES = {
         if (currentHost().includes('paypal.com') && /^\/pay\/?$/.test(currentPath())) {
             return handlePayEntryFlow(retries);
         }
+        repairPayPalIdentity('before submit');
         repairPayPalBillingAddress('before submit');
+        if (currentHost().includes('paypal.com') &&
+            currentPath().includes('/checkoutweb/signup') &&
+            !isPayPalIdentityValid() &&
+            retries < 8) {
+            log('等待：日本姓名/生日仍未通过页面校验，暂不提交');
+            setTimeout(function() { clickBtnWithRetry(originUrl, retries + 1); }, 1200);
+            return;
+        }
         var before = originUrl || window.location.href;
         var clicked = clickBtn();
         if (!clicked) {
@@ -1928,7 +2498,7 @@ var US_STATE_ALIASES = {
                 getProfile(function(profile) {
                     var addr = profile.address;
                     log('当前：准备填写账单地址 ' + JSON.stringify(addr));
-                    ensureCountryUS('billingCountry');
+                    ensureCountryJP('billingCountry');
                     fillGoogleAddress('#billingAddressLine1', '#billingLocality', '#billingPostalCode', 'billingAdministrativeArea', addr, function() {
                         waitForOpenAIAddressFilled(function(filled) {
                             if (!filled) {
@@ -1976,9 +2546,9 @@ var US_STATE_ALIASES = {
     if (currentHost().includes('paypal.com') && currentPath().includes('/checkoutweb/signup')) {
         log('当前流程：PayPal signup 页面，准备填写地址和卡信息');
         setTimeout(function() {
-            var country = document.getElementById('billingCountry');
-            if (country && country.value !== 'US') {
-                ensureCountryUS('billingCountry');
+            var countryChanged = ensureAnyCountryJP(['billingCountry', 'country']);
+            if (countryChanged) {
+                log('当前：signup 国家已切到 JP，等待表单刷新');
             }
             getProfile(function(profile) {
                 var addr = profile.address;
@@ -1988,8 +2558,8 @@ var US_STATE_ALIASES = {
                 fill('cardExpiry', card.expiry);
                 fill('cardCvv', card.cvv);
                 fill('password', randPass());
-                fill('firstName', 'James');
-                fill('lastName', 'Smith');
+                fillJapaneseNames();
+                fillJapaneseBirthdate();
                 fillGoogleAddress('#billingLine1', '#billingCity', '#billingPostalCode', 'billingState', addr, function() {
                     waitForSignupAddressFilled(function(filled) {
                         if (!filled) {
@@ -2012,9 +2582,9 @@ var US_STATE_ALIASES = {
         log('当前流程：PayPal checkout 页面，准备填写表单');
         setTimeout(function() {
             var country = document.getElementById('country');
-            if (country && country.value !== 'US') {
-                ensureCountryUS('country');
-                log('当前：国家已切到 US，等待表单刷新');
+            if (country && String(country.value || '').toUpperCase() !== 'JP') {
+                ensureCountryJP('country');
+                log('当前：国家已切到 JP，等待表单刷新');
                 setTimeout(doFill, 3000);
             } else {
                 doFill();
@@ -2033,8 +2603,8 @@ var US_STATE_ALIASES = {
                 fill('cardExpiry', card.expiry);
                 fill('cardCvv', card.cvv);
                 fill('password', password);
-                fill('firstName', 'James');
-                fill('lastName', 'Smith');
+                fillJapaneseNames();
+                fillJapaneseBirthdate();
                 fillGoogleAddress('#billingLine1', '#billingCity', '#billingPostalCode', 'billingState', addr, function() {
                     fillPhoneWithLease(function(ok) {
                         if (!ok) {

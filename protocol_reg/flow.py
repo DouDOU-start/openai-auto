@@ -324,7 +324,7 @@ class RegisterFlow:
                     "Accept": "application/json",
                     "Origin": "https://chatgpt.com",
                     "Referer": "https://chatgpt.com/",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
                     "User-Agent": checkout_user_agent,
                 },
                 json=payload,

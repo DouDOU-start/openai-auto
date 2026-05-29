@@ -563,7 +563,7 @@ def _open_checkout_url(
     checkout_sms: dict[str, object] | None = None,
 ) -> None:
     print(f"[Plus] 正在使用全新浏览器环境打开支付长链接: {long_url}")
-    print("[Plus] 浏览器支付环境已设置 en-US；浏览器不会复用当前协议代理")
+    print("[Plus] 浏览器支付环境已设置 ja-JP / Asia/Tokyo；浏览器不会复用当前协议代理")
     try:
         result = open_url_in_fresh_browser(
             long_url,

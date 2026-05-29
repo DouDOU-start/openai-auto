@@ -6303,8 +6303,8 @@ HTML_PAGE = r"""
       const row = document.createElement('div');
       row.className = 'checkout-sms-row';
       row.innerHTML = `
-        <label class="auto-field">手机号<input data-checkout-sms-phone type="text" placeholder="5822599791" value="${escapeHtml(item.phone || '')}" /></label>
-        <label class="auto-field">收码 URL<input data-checkout-sms-url type="text" placeholder="http://a.62-us.com/api/get_sms?key=..." value="${escapeHtml(item.sms_url || item.smsUrl || '')}" /></label>
+        <label class="auto-field">手机号<input data-checkout-sms-phone type="text" placeholder="9012345678" value="${escapeHtml(item.phone || '')}" /></label>
+        <label class="auto-field">收码 URL<input data-checkout-sms-url type="text" placeholder="https://example.com/api/get_sms?key=..." value="${escapeHtml(item.sms_url || item.smsUrl || '')}" /></label>
         <label class="auto-field">备注<input data-checkout-sms-label type="text" placeholder="可选" value="${escapeHtml(item.label || '')}" /></label>
         <button class="ghost" type="button" data-checkout-sms-remove>删除</button>
       `;

@@ -74,7 +74,7 @@ uv run protocol-reg --mode register --proxy http://127.0.0.1:7897
 uv run protocol-reg --mode register --proxy http://127.0.0.1:7897 --open-checkout
 ```
 
-`--open-checkout` 会优先启动 Chrome/Edge/Brave/Chromium，并且每次都创建全新的独立浏览器 profile，默认保存在 `data/browser_profiles/checkout-*`。该环境不会复用系统浏览器的 cookie、localStorage、扩展或登录状态。浏览器会设置为 `en-US` / `America/New_York` 倾向，但不会复用当前协议代理；网站最终识别国家仍可能取决于本机出口 IP。打开时会默认注入内置 PayPal/OpenAI/Stripe 自动填表脚本。
+`--open-checkout` 会优先启动 Chrome/Edge/Brave/Chromium，并且每次都创建全新的独立浏览器 profile，默认保存在 `data/browser_profiles/checkout-*`。该环境不会复用系统浏览器的 cookie、localStorage、扩展或登录状态。浏览器会设置为 `ja-JP` / `Asia/Tokyo` 倾向，但不会复用当前协议代理；网站最终识别国家仍可能取决于本机出口 IP。打开时会默认注入内置 PayPal/OpenAI/Stripe 自动填表脚本。
 
 旧参数 `--incognito-checkout` 仍可兼容，但现在不再只是无痕窗口，而是同样使用全新独立 profile：
 
