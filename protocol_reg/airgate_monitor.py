@@ -96,6 +96,10 @@ class AirGateCoreClient:
         data = self._request("PUT", f"/admin/accounts/{int(account_id)}", json_body=payload)
         return data if isinstance(data, dict) else {}
 
+    def refresh_quota(self, account_id: int) -> dict[str, Any]:
+        data = self._request("POST", f"/admin/accounts/{int(account_id)}/refresh-quota")
+        return data if isinstance(data, dict) else {}
+
     def delete_account(self, account_id: int) -> None:
         self._request("DELETE", f"/admin/accounts/{int(account_id)}")
 
@@ -384,9 +388,28 @@ class AirGate401Monitor:
             session_data,
             auth_payload=token_data,
         )
+        core_account_id = int(core_account.get("id") or 0)
         client = AirGateCoreClient(config.core_url, config.admin_key, timeout=settings.timeout)
-        client.update_account(int(core_account.get("id") or 0), credentials=merged_credentials, state="active")
-        return f"{email} -> core#{core_account.get('id')}"
+        client.update_account(core_account_id, credentials=merged_credentials, state="active")
+
+        try:
+            refresh_result = client.refresh_quota(core_account_id)
+        except Exception as exc:
+            print(f"[AirGate] 已更新 RT，但刷新 core 账号失败: {email} (id={core_account_id}) -> {exc}")
+        else:
+            warning = _clean_text(refresh_result.get("reauth_warning"))
+            plan_type = _clean_text(refresh_result.get("plan_type"))
+            subscription_until = _clean_text(refresh_result.get("subscription_active_until"))
+            details = []
+            if plan_type:
+                details.append(f"plan={plan_type}")
+            if subscription_until:
+                details.append(f"until={subscription_until}")
+            if warning:
+                details.append(f"warning={warning}")
+            suffix = f" ({', '.join(details)})" if details else ""
+            print(f"[AirGate] 已更新 RT 并刷新 core 账号: {email} (id={core_account_id}){suffix}")
+        return f"{email} -> core#{core_account_id}"
 
     def _abandon_local_account(self, local_account: dict[str, Any]) -> None:
         account_id = int(local_account.get("id") or 0)
